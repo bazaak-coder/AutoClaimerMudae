@@ -21,8 +21,8 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install dependencies (locked)
-        run: uv sync --locked
+      - name: Install dependencies (locked, with dev/test extras)
+        run: uv sync --locked --all-extras
 
       - name: Ruff lint
         run: uv run ruff check .
