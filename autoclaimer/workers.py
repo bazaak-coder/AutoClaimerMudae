@@ -99,6 +99,13 @@ class RateLimitedAdapter:
         self._policy = policy
 
     async def _run(self, op_name: str, fn: Callable[[], Awaitable[_T]]) -> _T:
+        logger.debug(
+            "platform operation",
+            extra={
+                "account_id": self._account_id,
+                "operation": op_name,
+            },
+        )
         return await self._limiter.run(
             fn,
             account_id=self._account_id,
@@ -196,6 +203,7 @@ class WorkerManager:
             if self._enabled[account_id]:
                 await self._materialize(account_id)
                 self._spawn_worker(account_id)
+        logger.info("framework started")
 
     async def stop(self, *, timeout: float | None = None) -> None:
         """Graceful shutdown: drain workers, then close adapters.
@@ -203,7 +211,8 @@ class WorkerManager:
         In-flight operations get ``timeout`` (default:
         ``settings.shutdown_timeout_seconds``) to finish; afterwards workers
         are cancelled and their instances deliberately stay ``running``
-        (uncertain outcome; recovered on next start).
+        (uncertain outcome; recovered on next start). The manager can be
+        :meth:`start`\\ ed again afterwards (restartable).
         """
         if self._stopped:
             return
@@ -225,6 +234,13 @@ class WorkerManager:
         for adapter in self._adapters.values():
             await adapter.close()
         self._adapters.clear()
+        # Workers stay registered (their done tasks report STOPPED via
+        # status()); _spawn_worker replaces finished workers on restart.
+        # Reset lifecycle so the manager can be started again.
+        self._shutdown.clear()
+        self._stopped = False
+        self._started = False
+        logger.info("framework stopped")
 
     async def __aenter__(self) -> WorkerManager:
         await self.start()
@@ -339,6 +355,15 @@ class WorkerManager:
             try:
                 outcome = await self._registry.execute(context)
             except RetryLimitExceededError as exc:
+                logger.warning(
+                    "task execution exhausted retries",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "failed_permanent",
+                    },
+                )
                 await self._record(
                     record.id,
                     TaskOutcome(TaskStatus.FAILED_PERMANENT, message=str(exc)),
@@ -348,7 +373,15 @@ class WorkerManager:
             except asyncio.CancelledError:
                 raise  # uncertain outcome: instance stays running
             except Exception as exc:
-                logger.exception("Task handler crashed for instance %s", record.id)
+                logger.exception(
+                    "task handler crashed",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "failed_permanent",
+                    },
+                )
                 await self._record(
                     record.id,
                     TaskOutcome(
@@ -358,6 +391,15 @@ class WorkerManager:
                     retry_at=None,
                 )
                 return
+        logger.info(
+            "task execution finished",
+            extra={
+                "account_id": account_id,
+                "task_id": record.task_id,
+                "operation": "task.execute",
+                "outcome": outcome.status.value,
+            },
+        )
         if outcome.status is TaskStatus.SUCCEEDED:
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
@@ -396,6 +438,14 @@ class WorkerManager:
         return adapter
 
     # ----- account controls -----
+
+    def known_accounts(self) -> tuple[int, ...]:
+        """All account ids this manager knows from configuration."""
+        return tuple(self._enabled)
+
+    def account_enabled(self, account_id: int) -> bool:
+        """Whether *account_id* is currently enabled."""
+        return self._enabled.get(account_id, False)
 
     def set_account_enabled(self, account_id: int, enabled: bool) -> None:
         """Enable/disable an account. Disabling stops new work only."""
