@@ -18,6 +18,45 @@ SNOWFLAKE_A = 271485504361996288
 SNOWFLAKE_B = 380028190142042112
 
 
+def test_logging_block_defaults_and_override() -> None:
+    default_app = parse_app_config(base_app())
+    assert default_app.logging.log_file == "autoclaimer.log"
+    assert default_app.logging.max_bytes == 1_048_576
+    assert default_app.logging.backup_count == 3
+    assert default_app.logging.level == "INFO"
+
+    raw = base_app()
+    raw["logging"] = {
+        "log_file": "/tmp/ac.log",
+        "max_bytes": 2048,
+        "backup_count": 5,
+        "level": "debug",
+    }
+    settings = parse_app_config(raw).logging
+    assert settings.log_file == "/tmp/ac.log"
+    assert settings.max_bytes == 2048
+    assert settings.backup_count == 5
+    assert settings.level == "DEBUG"  # normalized uppercase
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"level": "LOUD"},
+        {"max_bytes": 512},
+        {"backup_count": 0},
+        {"log_file": "  "},
+        {"log_file": 42},
+        {"surprise": 1},
+    ],
+)
+def test_logging_invalid_values_are_rejected(bad: dict[str, Any]) -> None:
+    raw = base_app()
+    raw["logging"] = bad
+    with pytest.raises(ConfigValidationError):
+        parse_app_config(raw)
+
+
 def test_task_priority_defaults_and_parses() -> None:
     app = parse_app_config(base_app())
     assert app.tasks["claim_test"].priority == 0
