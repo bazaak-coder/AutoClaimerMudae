@@ -38,6 +38,16 @@ class RateLimitPolicy:
 
 
 @dataclass(frozen=True)
+class LoggingSettings:
+    """Rotating log file configuration (size limit + retention)."""
+
+    log_file: str = "autoclaimer.log"
+    max_bytes: int = 1_048_576
+    backup_count: int = 3
+    level: str = "INFO"
+
+
+@dataclass(frozen=True)
 class TaskDefaults:
     enabled: bool = True
     retry_limit: int = 3
@@ -78,6 +88,7 @@ class AppConfig:
     task_defaults: TaskDefaults
     tasks: dict[str, TaskDefinition]
     ratelimit: RateLimitPolicy = field(default_factory=RateLimitPolicy)
+    logging: LoggingSettings = field(default_factory=LoggingSettings)
 
 
 @dataclass(frozen=True)
