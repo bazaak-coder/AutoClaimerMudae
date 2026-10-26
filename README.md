@@ -52,6 +52,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/credentials.py` | implemented (interface only) | `CredentialProvider` protocol; secure backends provide implementations. |
 | `autoclaimer/registry.py` | implemented | Task type registry: stable ids, descriptions, config schemas, async handlers. |
 | `autoclaimer/adapters.py` | implemented | `PlatformAdapter` protocol, typed results, recoverable/permanent/cooldown errors. |
+| `autoclaimer/discord_adapter.py` | implemented | Concrete discord.py-self adapter (one client per account; verified against 2.1.0). |
 | `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
 | `autoclaimer/ratelimit.py` | implemented | Central async rate limiter: scopes, pacing, permits, cooldowns, retries. |
 | `autoclaimer/workers.py` | implemented | Worker manager: concurrent account workers, ordered scheduling, controls. |
@@ -234,7 +235,70 @@ it contains no evasion, probing, or rotation logic.
   authorization/token/password/secret values. CLI output is redacted with
   the same filter; authentication tokens are never printed.
 
-## Next milestone (Phase 7, not started)
+## Phase 7: discord.py-self adapter
+
+`autoclaimer/discord_adapter.py` implements the Phase 2 `PlatformAdapter`
+contract with one isolated `discord.Client` per account, verified against
+**discord.py-self 2.1.0** (installed source — no invented APIs):
+
+- Lifecycle: `Client.login(token)` → background `Client.connect(reconnect=True)`
+  → `wait_until_ready()`; operations lazily ensure readiness; `close()` is
+  idempotent and awaits task teardown; a dead connection task surfaces as a
+  recoverable error until restart.
+- Operations: `Messageable.send`, the fork's async-generator
+  `Messageable.history` (mapped to most-recent-last), the light
+  `http.add_reaction` route, and `Button.click()` for components
+  (`str` result = link button → `acknowledged=False`).
+- Pacing: a small random delay precedes every mutating action
+  (`jitter_range`, default 0.4–1.2s). This is conservative pacing for
+  personal, non-abusive use — **not** detection evasion.
+- Light endpoints only: channels resolve from the gateway cache; the one
+  moderate read is `get_message` (needed to obtain component objects).
+  Heavy endpoints (`fetch_user`, `fetch_channel`, …) are never called.
+- Error translation: `RateLimited`/HTTP 429 → `CooldownError(retry_after)`
+  (recorded and honored by the central limiter); `CaptchaRequired` →
+  permanent failure (CAPTCHAs are never bypassed); `Forbidden`/`NotFound`/
+  `LoginFailure` → permanent; 5xx, `ConnectionClosed`, `GatewayNotFound`,
+  `InvalidData` (uncertain interaction outcome) → recoverable.
+- No Discord objects leak past the adapter; tokens come from the
+  credential provider at login time and are never stored, logged, or
+  persisted.
+
+### Platform restrictions (read this)
+
+User-account automation may violate Discord's Terms of Service. This
+project is built for the owner's personal use without abusing the API: no
+anti-detection, CAPTCHA bypass, rate-limit evasion, enforcement probing,
+or account rotation is implemented; actual rate-limit responses are
+honored (stop/defer via the limiter). Unsupported: voice, heavy REST
+fetches, and any operation the library does not expose for user accounts.
+
+### Secure local development credentials
+
+Never put tokens in JSON files, CLI arguments, source, logs, or SQLite. A
+minimal local provider reads them from the environment:
+
+```python
+import os
+from autoclaimer.credentials import CredentialProvider
+
+class EnvironmentCredentials:
+    """Reads tokens from AUTOCLAIMER_TOKEN_<ACCOUNT_ID> env vars."""
+    def get_token(self, account_id: int) -> str:
+        token = os.environ.get(f"AUTOCLAIMER_TOKEN_{account_id}")
+        if not token:
+            raise RuntimeError(f"missing env var AUTOCLAIMER_TOKEN_{account_id}")
+        return token
+
+    def close(self) -> None:
+        return None
+```
+
+Set env vars in your shell profile or a secrets manager — never commit
+them. Opt-in live checks (`tests/integration/test_discord_live.py`) are
+skipped unless `AUTOCLAIMER_LIVE_DISCORD_TOKEN` is set explicitly.
+
+## Next milestone (Phase 8, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
