@@ -39,7 +39,12 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import TypeVar
 
-from .adapters import ChannelMessage, InteractionResult, PlatformAdapter, SentMessage
+from .adapters import (
+    EventConsumer,
+    InteractionResult,
+    PlatformAdapter,
+    SentMessage,
+)
 from .config import resolve_task_config
 from .credentials import CredentialProvider
 from .models import AccountProfile, AccountsConfig, AppConfig
@@ -118,14 +123,6 @@ class RateLimitedAdapter:
             "send_message", lambda: self._inner.send_message(channel_id, content)
         )
 
-    async def fetch_recent_messages(
-        self, channel_id: int, limit: int = 50
-    ) -> tuple[ChannelMessage, ...]:
-        return await self._run(
-            "fetch_recent_messages",
-            lambda: self._inner.fetch_recent_messages(channel_id, limit),
-        )
-
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
         await self._run(
             "add_reaction",
@@ -142,6 +139,10 @@ class RateLimitedAdapter:
 
     async def close(self) -> None:
         await self._inner.close()
+
+    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
+        """Inbound events are not rate-limited operations; pass through."""
+        return self._inner.subscribe(consumer)
 
 
 class _AccountWorker:
