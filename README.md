@@ -54,7 +54,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/adapters.py` | implemented | `PlatformAdapter` protocol, typed results, recoverable/permanent/cooldown errors. |
 | `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
 | `autoclaimer/ratelimit.py` | implemented | Central async rate limiter: scopes, pacing, permits, cooldowns, retries. |
-| `autoclaimer/workers.py` | planned | Worker orchestration across accounts. |
+| `autoclaimer/workers.py` | implemented | Worker manager: concurrent account workers, ordered scheduling, controls. |
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | planned | Command-line entry point. |
 
@@ -183,7 +183,34 @@ cooldowns. `limiter.status()` exposes read-only cooldown/permit/pacing
 snapshots. The limiter only responds conservatively to platform feedback;
 it contains no evasion, probing, or rotation logic.
 
-## Next milestone (Phase 5, not started)
+## Phase 5: worker manager and scheduler
+
+- **Execution model**: one worker loop per enabled account (bounded task
+  count, never one asyncio task per pending operation); tasks run
+  sequentially within an account; total concurrent executions bounded by
+  `settings.max_concurrent_accounts`.
+- **Scheduling**: deterministic order — highest task `priority` first
+  (configurable per task definition), then earliest retry time, then
+  instance id. `WorkerManager.start()` recovers interrupted rows and
+  materializes one instance per assigned (account, task) pair.
+- **Duplication**: the store's atomic `claim()` is the single authority;
+  an instance cannot execute twice in a running process.
+- **Uncertain shutdown outcome**: graceful stop drains workers within
+  `settings.shutdown_timeout_seconds`; hard-cancelled in-flight ops stay
+  `running` (claim committed, outcome unknown) and are re-run after
+  restart — at-least-once semantics; handlers must tolerate duplicate
+  side effects.
+- **Rate limiting**: `RateLimitedAdapter` routes every platform operation
+  through the central limiter (route scope per operation kind); cooldowns
+  and retries are handled there, keeping scheduling policy out of task
+  handlers.
+- **Controls**: `set_account_enabled`, `pause_account`/`resume_account`,
+  `pause_all`/`resume_all` (gate new claims only — in-flight work and
+  open transactions are never killed mid-flight), `queue(account)`,
+  `task_status(id)`, `status()` snapshots, and graceful `stop()` that
+  closes adapters.
+
+## Next milestone (Phase 6, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
