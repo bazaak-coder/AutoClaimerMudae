@@ -53,7 +53,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/registry.py` | implemented | Task type registry: stable ids, descriptions, config schemas, async handlers. |
 | `autoclaimer/adapters.py` | implemented | `PlatformAdapter` protocol, typed results, recoverable/permanent/cooldown errors. |
 | `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
-| `autoclaimer/ratelimit.py` | planned | Rate limiting / request pacing. |
+| `autoclaimer/ratelimit.py` | implemented | Central async rate limiter: scopes, pacing, permits, cooldowns, retries. |
 | `autoclaimer/workers.py` | planned | Worker orchestration across accounts. |
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | planned | Command-line entry point. |
@@ -152,7 +152,38 @@ hooks, or webhook URLs exist in this repository.
   are ever stored. Default rollback journal (WAL's shared memory is
   unreliable under PRoot).
 
-## Next milestone (Phase 4, not started)
+## Phase 4: central rate limiter
+
+`autoclaimer/ratelimit.py` coordinates concurrent workers with five
+distinct concepts (never one delay for everything):
+
+1. **Per-account pacing** — `min_interval_seconds` reserves spaced slots
+   atomically, so simultaneous workers queue deterministically.
+2. **Scope cooldowns** — explicit scope keys (`account:{snowflake}`,
+   `route:{name}`, `task:{id}`, `channel:{id}`, `global`); unrelated scopes
+   never block each other.
+3. **Concurrency caps** — `max_concurrency` semaphore permits per account,
+   released in `finally` so cancellation cannot leak them.
+4. **Server-directed cooldowns** — `CooldownError.retry_after_seconds`
+   recorded on configurable scope kinds, persisted via the state store's
+   `scope_cooldowns` table (UTC wall-clock; restart-safe). Deadlines only
+   extend and the server flag is sticky, so local settings can never
+   shorten a server-imposed cooldown.
+5. **Local pacing policies** — `RateLimitPolicy` parsed at three config
+   layers; field-wise precedence: account override → task policy → global
+   default → built-ins (server feedback outranks all of them).
+
+`limiter.operation(...)` is an async context manager (cooldown gate →
+permit → pacing slot); `limiter.run(...)` adds bounded retries with
+exponential backoff — cooldown/recoverable errors retry up to
+`retry_limit`, permanent errors fail immediately. All waits use
+`asyncio` sleeps with deadline re-checks (no busy-wait, no blocking),
+monotonic clock for in-process pacing, UTC wall-clock for persisted
+cooldowns. `limiter.status()` exposes read-only cooldown/permit/pacing
+snapshots. The limiter only responds conservatively to platform feedback;
+it contains no evasion, probing, or rotation logic.
+
+## Next milestone (Phase 5, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
