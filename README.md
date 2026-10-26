@@ -100,25 +100,11 @@ project ships no secret-management implementation by design.
 
 ## Discord notifications
 
-Commit messages, PRs, reviews, and comments are sent to a Discord webhook as
-`application/json`:
-
-- **GitHub events (pushes, PRs, comments):** a native repository webhook
-  (Settings → Webhooks) posts GitHub's payload to the Discord `/github`
-  endpoint, which renders it natively. Managed server-side; no workflow
-  files involved.
-- **Local commits:** `.githooks/post-commit` sends the commit message after
-  each commit. It reads the URL from `webhook.url` at the repo root
-  (gitignored — never commit it). Because the project lives on FUSE, which
-  cannot store the executable bit, activate the hook with an executable
-  copy outside the project tree after `git init`:
-
-  ```bash
-  git config core.hooksPath /workspace/autoclaimer-githooks
-  mkdir -p /workspace/autoclaimer-githooks
-  cp .githooks/post-commit /workspace/autoclaimer-githooks/post-commit
-  chmod +x /workspace/autoclaimer-githooks/post-commit
-  ```
+Commit messages, PRs, reviews, and comments are announced on Discord via a
+native repository webhook (Settings → Webhooks) that posts GitHub's event
+payload to the Discord `/github` endpoint as `application/json`. It is
+managed entirely in GitHub's server-side settings; no workflow files, local
+hooks, or webhook URLs exist in this repository.
 
 ## Phase 2: task registry and adapter contracts
 
