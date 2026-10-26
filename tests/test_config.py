@@ -12,10 +12,66 @@ from autoclaimer.config import (
     parse_app_config,
     resolve_task_config,
 )
-from autoclaimer.models import ConfigValidationError
+from autoclaimer.models import ConfigValidationError, RateLimitPolicy
 
 SNOWFLAKE_A = 271485504361996288
 SNOWFLAKE_B = 380028190142042112
+
+
+def test_ratelimit_global_defaults_are_optional() -> None:
+    app = parse_app_config(base_app())
+    assert app.ratelimit == RateLimitPolicy()
+
+
+def test_ratelimit_parses_at_all_three_layers() -> None:
+    raw = base_app()
+    raw["ratelimit"] = {"min_interval_seconds": 2, "max_concurrency": 5}
+    raw["tasks"]["claim_test"]["ratelimit"] = {"retry_limit": 1}
+    app = parse_app_config(raw)
+    accounts = parse_accounts_config(
+        {
+            "version": 1,
+            "accounts": [
+                {
+                    "id": SNOWFLAKE_A,
+                    "tasks": ["claim_test"],
+                    "ratelimit": {"min_interval_seconds": 0.5, "backoff_base_seconds": 1},
+                }
+            ],
+        },
+        app,
+    )
+    assert app.ratelimit == RateLimitPolicy(min_interval_seconds=2.0, max_concurrency=5)
+    assert app.tasks["claim_test"].ratelimit == RateLimitPolicy(retry_limit=1)
+    assert accounts.accounts[0].ratelimit == RateLimitPolicy(
+        min_interval_seconds=0.5, backoff_base_seconds=1.0
+    )
+
+
+def test_ratelimit_accepts_int_for_duration_fields() -> None:
+    raw = base_app()
+    raw["ratelimit"] = {"min_interval_seconds": 1, "backoff_cap_seconds": 30}
+    app = parse_app_config(raw)
+    assert app.ratelimit.min_interval_seconds == 1.0
+    assert app.ratelimit.backoff_cap_seconds == 30.0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"min_interval_seconds": -0.5},
+        {"min_interval_seconds": True},
+        {"max_concurrency": 0},
+        {"retry_limit": -1},
+        {"backoff_base_seconds": "soon"},
+        {"surprise_key": 1},
+    ],
+)
+def test_ratelimit_invalid_values_are_rejected(bad: dict[str, Any]) -> None:
+    raw = base_app()
+    raw["ratelimit"] = bad
+    with pytest.raises(ConfigValidationError):
+        parse_app_config(raw)
 
 
 def base_app() -> dict[str, Any]:
