@@ -529,7 +529,7 @@ Never claim that tests passed without executing them. Never describe an unreview
 - [ ] No secrets or unrelated changes are included.
 - [ ] The PR has been independently reviewed (applies to the PR workflow; owner-directed direct pushes still require the full local gate).
 - [ ] Confirmed defects and justified security findings have been addressed.
-- [ ] Required CI checks pass (CI workflow added 2026-10-26: `.github/workflows/ci.yml` — locked install, ruff, format, mypy, pytest; verify actual results with "gh run list" until a green run is confirmed on GitHub).
+- [ ] Required CI checks pass (CI: `.github/workflows/ci.yml` — locked install with extras, ruff, format, mypy, pytest; first green run 40393344534 confirmed 2026-10-26; check "gh run list" for the latest state).
 - [ ] No unresolved critical or high-severity findings remain.
 - [ ] Owner approval has been obtained for required remote operations and merging.
 - [ ] The final report accurately describes the verified state.
