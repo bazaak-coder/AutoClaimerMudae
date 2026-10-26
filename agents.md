@@ -6,7 +6,7 @@ This document defines the mandatory development, testing, security, documentatio
 
 AutoClaimer is a lightweight, standalone Python project for configurable multi-account Discord automation targeting Mudae. Keep its architecture independent of unrelated projects, with minimal unnecessary dependencies and resource overhead.
 
-Current status (update as phases complete): Phase 1 (typed configuration foundation, credential-provider interface, tooling), Phase 2 (task registry, platform adapter contracts, deterministic mock adapter), Phase 3 (async SQLite runtime persistence), Phase 4 (central rate limiter with scope cooldowns, pacing, permits, and bounded retries), Phase 5 (worker manager with concurrent account workers, deterministic priority scheduling, account controls, and graceful shutdown), and Phase 6 (interactive CLI with rotating, redacting, structured logging) are implemented and green. Runtime dependencies are still zero; discord.py-self is deliberately not integrated yet. The README package table is the authoritative module status. The next phase is real Discord adapter integration, not yet started.
+Current status (update as phases complete): Phase 1 (typed configuration foundation, credential-provider interface, tooling), Phase 2 (task registry, platform adapter contracts, deterministic mock adapter), Phase 3 (async SQLite runtime persistence), Phase 4 (central rate limiter with scope cooldowns, pacing, permits, and bounded retries), Phase 5 (worker manager with concurrent account workers, deterministic priority scheduling, account controls, and graceful shutdown), Phase 6 (interactive CLI with rotating, redacting, structured logging), and Phase 7 (discord.py-self adapter verified against 2.1.0, with error translation, conservative jitter pacing, and cache-only channel resolution) are implemented and green. The single runtime dependency is discord.py-self (owner-selected); Mudae-specific task handlers are not implemented yet. The README package table is the authoritative module status.
 
 Priority order:
 
@@ -548,6 +548,7 @@ Known constraints
 
 - The system Python is externally-managed (PEP 668); never pip-install into it and never pass "--break-system-packages".
 - Bare "pytest"/"ruff"/"mypy"/"uv" on PATH run against the system interpreter and cannot import the project; always use the venv binaries (section 10).
+- "uv lock" fails on this machine with hardlink "Operation not permitted" errors; prefix it with "UV_LINK_MODE=copy".
 - FUSE cannot store executable bits or symlinks: venvs and git hooks must live under "/workspace"; in-tree hook scripts are non-executable.
 - FUSE has silently dropped a tracked file once (".githooks/post-commit"); on any unexpected worktree deletion, restore from HEAD, verify, and record the incident in the knowledgebase.
 - Prefer "/tmp/opencode" for throwaway artifacts and "/workspace" for anything needing exec bits or symlinks.
