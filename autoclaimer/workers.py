@@ -258,7 +258,20 @@ class WorkerManager:
         worker.task = asyncio.create_task(
             self._worker_loop(worker), name=f"autoclaimer-worker-{account_id}"
         )
+        worker.task.add_done_callback(self._worker_finished)
         self._workers[account_id] = worker
+
+    def _worker_finished(self, task: asyncio.Task[None]) -> None:
+        """Fatal safety net: a dead worker task must never pass silently."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "account worker task died: %s",
+                exc,
+                extra={"operation": "worker.task", "outcome": "worker_died"},
+            )
 
     async def _materialize(self, account_id: int) -> None:
         profile = self._profile(account_id)
@@ -274,21 +287,43 @@ class WorkerManager:
 
     async def _worker_loop(self, worker: _AccountWorker) -> None:
         while not self._shutdown.is_set():
-            gated = (
-                self._globally_paused
-                or not self._enabled.get(worker.account_id, False)
-                or worker.account_id in self._paused
-            )
-            if gated or self._shutdown.is_set():
+            try:
+                await self._worker_iteration(worker)
+            except asyncio.CancelledError:
+                raise  # shutdown: propagate immediately
+            except Exception:
+                # A transient store/limiter failure must not silently kill
+                # the account worker; log with context and back off one
+                # idle interval before retrying (no busy-spin).
+                logger.exception(
+                    "worker loop iteration failed",
+                    extra={
+                        "account_id": worker.account_id,
+                        "operation": "worker.loop",
+                        "outcome": "iteration_error",
+                    },
+                )
                 worker.wake.clear()
-                await self._wait_for_wake(worker, None)
-                continue
-            record = await self._next_due(worker.account_id)
-            if record is None:
-                worker.wake.clear()
-                await self._wait_for_wake(worker, await self._soon_delay(worker.account_id))
-                continue
-            await self._execute(record)
+                await self._wait_for_wake(worker, self._idle_interval)
+
+    async def _worker_iteration(self, worker: _AccountWorker) -> None:
+        if self._shutdown.is_set():
+            return
+        gated = (
+            self._globally_paused
+            or not self._enabled.get(worker.account_id, False)
+            or worker.account_id in self._paused
+        )
+        if gated or self._shutdown.is_set():
+            worker.wake.clear()
+            await self._wait_for_wake(worker, None)
+            return
+        record = await self._next_due(worker.account_id)
+        if record is None:
+            worker.wake.clear()
+            await self._wait_for_wake(worker, await self._soon_delay(worker.account_id))
+            return
+        await self._execute(record)
 
     async def _wait_for_wake(self, worker: _AccountWorker, timeout: float | None) -> None:
         if self._shutdown.is_set():
@@ -440,10 +475,6 @@ class WorkerManager:
 
     # ----- account controls -----
 
-    def known_accounts(self) -> tuple[int, ...]:
-        """All account ids this manager knows from configuration."""
-        return tuple(self._enabled)
-
     def account_enabled(self, account_id: int) -> bool:
         """Whether *account_id* is currently enabled."""
         return self._enabled.get(account_id, False)
@@ -451,18 +482,37 @@ class WorkerManager:
     def set_account_enabled(self, account_id: int, enabled: bool) -> None:
         """Enable/disable an account. Disabling stops new work only."""
         self._enabled[account_id] = enabled
-        if enabled and account_id not in self._workers and not self._stopped:
-            # Materialize instances and spawn the worker for this account.
+        if enabled and self._started and not self._stopped and account_id not in self._workers:
+            # Runtime enable on a RUNNING manager: materialize + spawn.
+            # A stopped/never-started manager defers to start(), which
+            # spawns workers for every enabled account (audit fix: a
+            # detached spawn after stop() would leak a worker task
+            # against a possibly-closed store).
             self._spawn_worker_enabled(account_id)
         worker = self._workers.get(account_id)
         if worker is not None:
             worker.nudge()
 
     def _spawn_worker_enabled(self, account_id: int) -> None:
-        asyncio.get_running_loop().create_task(self._enable_account(account_id))
+        task = asyncio.get_running_loop().create_task(self._enable_account(account_id))
+        task.add_done_callback(self._detached_task_finished)
+
+    def _detached_task_finished(self, task: asyncio.Task[None]) -> None:
+        """Detached tasks must never fail silently (audit fix)."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "background account-enable failed: %s",
+                exc,
+                extra={"operation": "worker.enable", "outcome": "enable_failed"},
+            )
 
     async def _enable_account(self, account_id: int) -> None:
         await self._materialize(account_id)
+        if self._stopped or not self._started:
+            return  # start() will spawn workers for enabled accounts
         self._spawn_worker(account_id)
 
     def pause_account(self, account_id: int) -> None:
