@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": 271485504361996288,
+      "enabled": true,
+      "tasks": ["example_check"],
+      "overrides": {}
+    },
+    {
+      "id": 380028190142042112,
+      "enabled": true,
+      "tasks": ["example_check"],
+      "overrides": {
+        "example_check": {
+          "enabled": false
+        }
+      }
+    }
+  ]
+}

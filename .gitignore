@@ -1,0 +1,12 @@
+# Append-only agent knowledgebase is intentionally not tracked
+knowledgebase/
+
+# Discord webhook secret — never commit
+webhook.url
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/

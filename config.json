@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "settings": {
+    "log_level": "INFO",
+    "max_concurrent_accounts": 3,
+    "shutdown_timeout_seconds": 15
+  },
+  "task_defaults": {
+    "enabled": true,
+    "retry_limit": 3
+  },
+  "tasks": {
+    "example_check": {
+      "enabled": true,
+      "retry_limit": 2,
+      "parameters": {
+        "simulation": true
+      }
+    }
+  }
+}

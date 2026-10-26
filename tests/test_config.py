@@ -1,0 +1,223 @@
+"""Tests for configuration parsing, validation, precedence, and loading."""
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from autoclaimer.config import (
+    load_config,
+    parse_accounts_config,
+    parse_app_config,
+    resolve_task_config,
+)
+from autoclaimer.models import ConfigValidationError
+
+SNOWFLAKE_A = 271485504361996288
+SNOWFLAKE_B = 380028190142042112
+
+
+def base_app() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "settings": {"log_level": "INFO", "max_concurrent_accounts": 2},
+        "task_defaults": {"enabled": True, "retry_limit": 4},
+        "tasks": {
+            "claim_test": {
+                "enabled": True,
+                "retry_limit": 2,
+                "parameters": {"mode": "safe", "limit": 10},
+            }
+        },
+    }
+
+
+def base_accounts() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "accounts": [
+            {
+                "id": SNOWFLAKE_A,
+                "enabled": True,
+                "tasks": ["claim_test"],
+                "overrides": {"claim_test": {"enabled": False, "parameters": {"limit": 5}}},
+            }
+        ],
+    }
+
+
+# --- Precedence: global defaults -> task definition -> account override ---
+
+
+def test_parses_and_resolves_account_overrides() -> None:
+    app = parse_app_config(base_app())
+    accounts = parse_accounts_config(base_accounts(), app)
+    resolved = resolve_task_config(app, accounts.accounts[0], "claim_test")
+    assert resolved.enabled is False
+    assert resolved.retry_limit == 2
+    assert resolved.parameters == {"mode": "safe", "limit": 5}
+
+
+def test_task_definition_wins_over_global_defaults() -> None:
+    raw = base_app()
+    del raw["tasks"]["claim_test"]["enabled"]
+    del raw["tasks"]["claim_test"]["retry_limit"]
+    app = parse_app_config(raw)
+    task = app.tasks["claim_test"]
+    assert task.enabled is True  # from task_defaults
+    assert task.retry_limit == 4  # from task_defaults
+
+
+def test_built_in_defaults_used_when_layers_omitted() -> None:
+    raw = base_app()
+    del raw["task_defaults"]
+    raw["tasks"]["claim_test"] = {"parameters": {"mode": "safe"}}
+    app = parse_app_config(raw)
+    task = app.tasks["claim_test"]
+    assert task.enabled is True
+    assert task.retry_limit == 3
+
+
+def test_retry_limit_override_wins_over_task_definition() -> None:
+    raw = base_accounts()
+    raw["accounts"][0]["overrides"]["claim_test"]["retry_limit"] = 9
+    app = parse_app_config(base_app())
+    accounts = parse_accounts_config(raw, app)
+    resolved = resolve_task_config(app, accounts.accounts[0], "claim_test")
+    assert resolved.retry_limit == 9
+
+
+def test_override_parameters_merge_shallow_over_definition() -> None:
+    app = parse_app_config(base_app())
+    accounts = parse_accounts_config(base_accounts(), app)
+    resolved = resolve_task_config(app, accounts.accounts[0], "claim_test")
+    assert resolved.parameters["mode"] == "safe"  # kept from definition
+    assert resolved.parameters["limit"] == 5  # replaced by override
+
+
+# --- Validation: IDs, references, duplicates, types, unknown keys ---
+
+
+def test_unknown_task_reference_is_rejected() -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"][0]["tasks"] = ["missing_task"]
+    with pytest.raises(ConfigValidationError, match="unknown task"):
+        parse_accounts_config(raw, app)
+
+
+def test_unknown_task_override_reference_is_rejected() -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"][0]["overrides"]["missing_task"] = {"enabled": False}
+    with pytest.raises(ConfigValidationError, match="unknown task"):
+        parse_accounts_config(raw, app)
+
+
+def test_duplicate_account_ids_are_rejected() -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"].append(dict(raw["accounts"][0]))
+    with pytest.raises(ConfigValidationError, match="Duplicate account id"):
+        parse_accounts_config(raw, app)
+
+
+def test_duplicate_task_ids_on_one_account_are_rejected() -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"][0]["tasks"] = ["claim_test", "claim_test"]
+    with pytest.raises(ConfigValidationError, match="duplicate task IDs"):
+        parse_accounts_config(raw, app)
+
+
+def test_boolean_is_not_accepted_as_integer() -> None:
+    raw = base_app()
+    raw["settings"]["max_concurrent_accounts"] = True
+    with pytest.raises(ConfigValidationError, match="integer"):
+        parse_app_config(raw)
+
+
+def test_unknown_keys_are_rejected() -> None:
+    raw = base_app()
+    raw["settings"]["surprise"] = 1
+    with pytest.raises(ConfigValidationError, match="unknown key"):
+        parse_app_config(raw)
+
+
+@pytest.mark.parametrize("bad_id", [True, 0, -5, "12345", 2**63, 1.5])
+def test_account_id_must_be_positive_integer_snowflake(bad_id: object) -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"][0]["id"] = bad_id
+    with pytest.raises(ConfigValidationError, match="snowflake"):
+        parse_accounts_config(raw, app)
+
+
+def test_unsupported_version_is_rejected() -> None:
+    raw = base_app()
+    raw["version"] = 2
+    with pytest.raises(ConfigValidationError, match="Unsupported config.version"):
+        parse_app_config(raw)
+
+
+def test_resolve_task_config_rejects_unassigned_task() -> None:
+    app = parse_app_config(base_app())
+    accounts = parse_accounts_config(base_accounts(), app)
+    with pytest.raises(ConfigValidationError, match="not assigned"):
+        resolve_task_config(app, accounts.accounts[0], "other_task")
+
+
+# --- Credential policy: no plaintext credentials in configuration ---
+
+
+@pytest.mark.parametrize("bad_key", ["token", "user_password", "api_key", "botToken"])
+def test_credential_like_task_parameters_are_rejected(bad_key: str) -> None:
+    raw = base_app()
+    raw["tasks"]["claim_test"]["parameters"] = {bad_key: "super-secret"}
+    with pytest.raises(ConfigValidationError, match="credential-like key"):
+        parse_app_config(raw)
+
+
+def test_credential_like_override_parameters_are_rejected() -> None:
+    app = parse_app_config(base_app())
+    raw = base_accounts()
+    raw["accounts"][0]["overrides"]["claim_test"] = {"parameters": {"secret": "leak"}}
+    with pytest.raises(ConfigValidationError, match="credential-like key"):
+        parse_accounts_config(raw, app)
+
+
+# --- JSON loading error reporting ---
+
+
+def test_json_files_load_from_disk(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    accounts_path = tmp_path / "accounts.json"
+    config_path.write_text(json.dumps(base_app()), encoding="utf-8")
+    accounts_path.write_text(json.dumps(base_accounts()), encoding="utf-8")
+    app, accounts = load_config(config_path, accounts_path)
+    assert app.version == 1
+    assert accounts.accounts[0].id == SNOWFLAKE_A
+
+
+def test_missing_file_is_reported(tmp_path: Path) -> None:
+    with pytest.raises(ConfigValidationError, match="not found"):
+        load_config(tmp_path / "absent.json", tmp_path / "accounts.json")
+
+
+def test_malformed_json_reports_position(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    accounts_path = tmp_path / "accounts.json"
+    config_path.write_text('{"version": 1,\n  "settings": }', encoding="utf-8")
+    accounts_path.write_text(json.dumps(base_accounts()), encoding="utf-8")
+    with pytest.raises(ConfigValidationError, match="line 2, column 15"):
+        load_config(config_path, accounts_path)
+
+
+def test_non_object_json_root_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    accounts_path = tmp_path / "accounts.json"
+    config_path.write_text("[]", encoding="utf-8")
+    accounts_path.write_text(json.dumps(base_accounts()), encoding="utf-8")
+    with pytest.raises(ConfigValidationError, match="must be a JSON object"):
+        load_config(config_path, accounts_path)
