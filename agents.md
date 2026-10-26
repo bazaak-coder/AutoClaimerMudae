@@ -341,6 +341,13 @@ Validate YAML syntax and workflow logic using available tools. Do not claim that
 
 Commit changes only when authorized by the task and the repository's existing workflow.
 
+Granular commit rule (mandatory): one commit per file or tightly-coupled
+logical change, as the work happens — never batch unrelated changes into a
+single large commit. Each commit's message must be short and state what was
+edited (and why when it is not obvious), for example
+"docs(readme): document venv setup for FUSE workspaces". Use the message
+body only when the subject line cannot carry the context.
+
 Use detailed, descriptive commit messages that explain both the change and its purpose.
 
 Example:
