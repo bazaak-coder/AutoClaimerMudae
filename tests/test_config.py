@@ -18,6 +18,22 @@ SNOWFLAKE_A = 271485504361996288
 SNOWFLAKE_B = 380028190142042112
 
 
+def test_task_priority_defaults_and_parses() -> None:
+    app = parse_app_config(base_app())
+    assert app.tasks["claim_test"].priority == 0
+    raw = base_app()
+    raw["tasks"]["claim_test"]["priority"] = 10
+    assert parse_app_config(raw).tasks["claim_test"].priority == 10
+
+
+@pytest.mark.parametrize("bad_priority", [True, -1, 1.5, "high"])
+def test_task_priority_invalid_values_are_rejected(bad_priority: object) -> None:
+    raw = base_app()
+    raw["tasks"]["claim_test"]["priority"] = bad_priority
+    with pytest.raises(ConfigValidationError, match="priority"):
+        parse_app_config(raw)
+
+
 def test_ratelimit_global_defaults_are_optional() -> None:
     app = parse_app_config(base_app())
     assert app.ratelimit == RateLimitPolicy()
