@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 1
+        assert version_row[0] == s.schema_version == 2
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -94,6 +94,70 @@ async def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
     future = TaskStateStore(path)
     with pytest.raises(UnsupportedSchemaVersionError, match="99"):
         await future.open()
+
+
+# --- scope cooldowns (migration v2, rate-limiter persistence) ---
+
+
+async def test_v1_database_is_migrated_to_v2(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    s = await make_store(path)
+    await s.close()
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE scope_cooldowns")
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+    migrated = await make_store(path)
+    try:
+        rows = await migrated._run(
+            migrated._fetchall_sync,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scope_cooldowns'",
+            (),
+        )
+        assert len(rows) == 1
+        version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
+        assert version_row is not None
+        assert version_row[0] == 2
+    finally:
+        await migrated.close()
+
+
+async def test_scope_cooldown_upsert_only_extends(tmp_path: Path) -> None:
+    clock = FakeClock()
+    s = await make_store(tmp_path / "state.db", clock=clock)
+    try:
+        await s.set_scope_cooldown(
+            "route:claim", clock() + timedelta(seconds=30), server_directed=True
+        )
+        await s.set_scope_cooldown(
+            "route:claim", clock() + timedelta(seconds=5), server_directed=False
+        )
+        active = await s.active_scope_cooldowns()
+        deadline, server_directed = active["route:claim"]
+        assert deadline == clock() + timedelta(seconds=30)
+        assert server_directed is True  # sticky
+        await s.set_scope_cooldown(
+            "route:claim", clock() + timedelta(seconds=60), server_directed=False
+        )
+        deadline, server_directed = (await s.active_scope_cooldowns())["route:claim"]
+        assert deadline == clock() + timedelta(seconds=60)
+        assert server_directed is True
+    finally:
+        await s.close()
+
+
+async def test_scope_cooldown_expired_entries_are_not_returned(tmp_path: Path) -> None:
+    clock = FakeClock()
+    s = await make_store(tmp_path / "state.db", clock=clock)
+    try:
+        await s.set_scope_cooldown(
+            "route:claim", clock() + timedelta(seconds=10), server_directed=True
+        )
+        clock.advance(11)
+        assert await s.active_scope_cooldowns() == {}
+    finally:
+        await s.close()
 
 
 # --- creation, identity, idempotency ---
