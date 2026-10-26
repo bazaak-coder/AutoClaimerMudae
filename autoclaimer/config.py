@@ -117,6 +117,11 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     return dict(_object(data, str(file_path)))
 
 
+def valid_task_id(value: object) -> bool:
+    """Public predicate: whether *value* is a well-formed task identifier."""
+    return isinstance(value, str) and _ID_PATTERN.fullmatch(value) is not None
+
+
 def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     data = _object(dict(raw), "config")
     _only_keys(data, {"version", "settings", "task_defaults", "tasks"}, "config")
