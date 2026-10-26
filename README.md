@@ -55,7 +55,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
 | `autoclaimer/ratelimit.py` | planned | Rate limiting / request pacing. |
 | `autoclaimer/workers.py` | planned | Worker orchestration across accounts. |
-| `autoclaimer/persistence.py` | planned | SQLite state store and migrations. |
+| `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | planned | Command-line entry point. |
 
 Planned boundaries are documented, not implemented; no stub modules exist to
@@ -127,7 +127,32 @@ hooks, or webhook URLs exist in this repository.
   operation (FIFO), simulated latency, seeded channel state, and full call
   recording as structured test data.
 
-## Next milestone (Phase 3, not started)
+## Phase 3: SQLite runtime persistence
+
+- **Stdlib-only async**: `sqlite3` dispatched via `asyncio.to_thread` —
+  no aiosqlite dependency (it is itself a thread wrapper; the project stays
+  zero-runtime-dependency). One connection, serialized by an asyncio lock;
+  task-scoped transactions via a ContextVar let nested store calls join the
+  enclosing transaction without letting concurrent coroutines bypass the lock.
+- **States**: `pending`, `running`, `waiting`, `succeeded`, `failed`,
+  `cancelled`. `pending`/`waiting` resume as-is after restart; `running`
+  rows are recovered to `pending` (attempt counts preserved) by
+  `recover_interrupted()`; the rest are terminal.
+- **Persisted per instance**: identity (account snowflake + task id,
+  unique), status, attempt count, UTC created/updated timestamps, last
+  outcome (status + message only), retry time (`next_attempt_at`), and
+  cooldown deadline + scope. Parameterized SQL everywhere; guarded
+  transitions refuse illegal state changes and make terminal records
+  idempotent; migrations run transactionally with `PRAGMA user_version`.
+- **Clocks**: all timestamps and deadlines are timezone-aware UTC strings;
+  remaining cooldown = deadline − now(UTC), so deadlines survive restarts
+  (no persisted monotonic values).
+- **Errors**: `sqlite3` faults map to `PersistenceError` /
+  `DatabaseBusyError` (busy timeout) with causes preserved. No credentials
+  are ever stored. Default rollback journal (WAL's shared memory is
+  unreliable under PRoot).
+
+## Next milestone (Phase 4, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
