@@ -3,20 +3,40 @@
 Verified against discord.py-self 2.1.0 source (installed package):
 
 - ``Client.login(token)`` / ``Client.connect(*, reconnect=True)`` /
-  ``Client.close()`` / ``Client.wait_until_ready()`` / ``Client.get_channel(id)``
-- ``Messageable.send(...)``, ``Messageable.fetch_message(id)``, and
-  ``Messageable.history(*, limit=100, ...)``, which is a plain async
-  generator in this fork (no ``.flatten()``).
-- ``Message.id/content/author/components``, ``Message.add_reaction(emoji)``.
+  ``Client.close()`` / ``Client.wait_until_ready()`` / ``Client.get_channel(id)``.
+- ``Client.event(coro)`` registers a single ``on_<name>`` handler via
+  ``setattr``; ``Client.dispatch`` schedules it with one task per event.
+  This fork has **no** ``add_listener``/``remove_listener``.
+- ``Messageable.send(...)``, ``Messageable.fetch_message(id)``.
+- ``Message.id/content/author/components/created_at``.
 - Components: ``ActionRow.children`` and ``Button.custom_id/.url/.message``
   with ``Button.click() -> str | Interaction`` (a ``str`` means the button
   is just a link and no API call was made).
 - ``discord.http`` routes ``add_reaction(channel_id, message_id, emoji)`` and
   ``get_message(channel_id, message_id)``.
+- Inbound events (state.py dispatch sites): ``on_message(message)``;
+  ``on_reaction_add(reaction, user)`` — fired **only when the message is in
+  the gateway cache** (``Reaction.message/emoji/count``);
+  ``on_raw_reaction_add(raw)`` — fired for **every** reaction
+  (``RawReactionActionEvent.message_id/user_id/channel_id/emoji/
+  message_author_id``), dispatched before the cached rich event;
+  ``on_raw_message_edit(raw)`` — fired for **every** edit
+  (``RawMessageUpdateEvent.message`` + ``.cached_message | None``). The
+  fork passes the same updated-message object to raw and rich edit
+  events, so the raw bridge fully replaces ``on_message_edit``: one
+  delivery per edit with ``before`` from the cache when available.
 - Exceptions: ``HTTPException`` (``.status``), ``RateLimited``
   (``.retry_after``; *not* an ``HTTPException`` subclass in this fork),
   ``Forbidden``, ``NotFound``, ``DiscordServerError``, ``CaptchaRequired``,
   ``LoginFailure``, ``ConnectionClosed``, ``GatewayNotFound``, ``InvalidData``.
+
+Event model: inbound events are normalized to framework types
+(:class:`~autoclaimer.adapters.MessageCreatedEvent`,
+``ReactionAddedEvent``, ``MessageEditedEvent`) and fan out through a
+bounded :class:`~autoclaimer.adapters.EventDispatcher` (per-subscriber
+queue + pump, drop-oldest backpressure, consumer exception isolation).
+The runtime performs **no history polling**: ``Messageable.history`` is
+never called and the adapter does not implement historical retrieval.
 
 Behavioural rules:
 
@@ -48,6 +68,7 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import discord
@@ -56,8 +77,14 @@ from .adapters import (
     AdapterError,
     ChannelMessage,
     CooldownError,
+    EventConsumer,
+    EventDispatcher,
     InteractionResult,
+    MessageCreatedEvent,
+    MessageEditedEvent,
     PermanentAdapterError,
+    RawReactionAddedEvent,
+    ReactionAddedEvent,
     RecoverableAdapterError,
     SentMessage,
 )
@@ -86,6 +113,7 @@ class DiscordAdapter:
         jitter_range: tuple[float, float] = _DEFAULT_JITTER_RANGE,
         jitter: Callable[[float, float], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        event_queue_size: int = 64,
     ) -> None:
         self._account_id = account_id
         self._credentials = credentials
@@ -97,7 +125,20 @@ class DiscordAdapter:
         self._connect_task: asyncio.Task[None] | None = None
         self._connect_error: BaseException | None = None
         self._started = False
+        self._bridges_registered = False
         self._closed = False
+        self._events = EventDispatcher(queue_size=event_queue_size, name=f"discord-{account_id}")
+
+    # ----- event subscription -----
+
+    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
+        """Subscribe to normalized inbound events for THIS account.
+
+        Subscribers may register before ``start()``; events only flow once
+        the gateway connection delivers them, so nothing is lost between
+        subscription and startup.
+        """
+        return self._events.subscribe(consumer)
 
     # ----- lifecycle -----
 
@@ -108,6 +149,7 @@ class DiscordAdapter:
                 raise AdapterError("adapter is closed")
             if self._started:
                 return
+            self._register_bridges()
             token = self._credentials.get_token(self._account_id)
             try:
                 await self._client.login(token)
@@ -127,6 +169,23 @@ class DiscordAdapter:
                 },
             )
         await self._client.wait_until_ready()
+
+    def _register_bridges(self) -> None:
+        """Attach inbound-event bridges once; reconnects never duplicate."""
+        if self._bridges_registered:
+            return
+        # The fork registers a single on_<name> handler per event via
+        # Client.event(), which uses the coroutine's __name__. The adapter
+        # owns its client, so no other consumer is displaced; the client
+        # object persists across reconnects, keeping registration one-time.
+        for event_name, handler in (
+            ("on_message", self._on_message),
+            ("on_reaction_add", self._on_reaction_add),
+            ("on_raw_reaction_add", self._on_raw_reaction_add),
+            ("on_raw_message_edit", self._on_raw_message_edit),
+        ):
+            self._client.event(_named_bridge(event_name, handler))
+        self._bridges_registered = True
 
     def _connect_finished(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and task.exception() is not None:
@@ -154,23 +213,26 @@ class DiscordAdapter:
             await self._client.wait_until_ready()
 
     async def close(self) -> None:
-        """Close the client and await the connection task; idempotent."""
+        """Close the client, stop event delivery, and await tasks; idempotent."""
         if self._closed:
             return
         self._closed = True
         try:
-            await self._client.close()
+            await self._events.stop()
         finally:
-            task = self._connect_task
-            if task is not None and not task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-                except (TimeoutError, asyncio.CancelledError):
-                    task.cancel()
+            try:
+                await self._client.close()
+            finally:
+                task = self._connect_task
+                if task is not None and not task.done():
                     try:
-                        await task
-                    except (asyncio.CancelledError, discord.DiscordException):
-                        pass
+                        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                    except (TimeoutError, asyncio.CancelledError):
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, discord.DiscordException):
+                            pass
         logger.info(
             "discord client closed",
             extra={"account_id": self._account_id, "operation": "discord.close"},
@@ -215,28 +277,6 @@ class DiscordAdapter:
         )
         return SentMessage(channel_id=channel_id, message_id=message.id, content=content)
 
-    async def fetch_recent_messages(
-        self, channel_id: int, limit: int = 50
-    ) -> tuple[ChannelMessage, ...]:
-        await self._ensure_ready()
-        channel = self._channel(channel_id)
-        try:
-            messages = [message async for message in channel.history(limit=limit)]
-        except discord.DiscordException as exc:
-            raise _translate(exc) from exc
-        # history() yields newest first; our contract is most recent last.
-        messages.reverse()
-        return tuple(
-            ChannelMessage(
-                id=message.id,
-                channel_id=channel_id,
-                author_id=message.author.id if message.author is not None else 0,
-                content=message.content or "",
-                has_components=bool(message.components),
-            )
-            for message in messages
-        )
-
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
         await self._ensure_ready()
         await self._pace()
@@ -269,6 +309,145 @@ class DiscordAdapter:
             component_id=component_id,
             acknowledged=acknowledged,
         )
+
+    # ----- inbound event bridges -----
+
+    async def _on_message(self, message: Any) -> None:
+        """Bridge: ``on_message`` -> normalized MessageCreatedEvent."""
+        try:
+            await self._events.dispatch(
+                MessageCreatedEvent(
+                    account_id=self._account_id,
+                    received_at=datetime.now(UTC),
+                    message=_to_channel_message(message),
+                )
+            )
+        except Exception:
+            # A malformed event must never break delivery to subscribers.
+            logger.exception(
+                "failed to normalize message event",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.on_message",
+                    "outcome": "dropped",
+                },
+            )
+
+    async def _on_reaction_add(self, reaction: Any, user: Any) -> None:
+        """Bridge: ``on_reaction_add`` (cached messages only in this fork)."""
+        try:
+            message_obj = getattr(reaction, "message", None)
+            await self._events.dispatch(
+                ReactionAddedEvent(
+                    account_id=self._account_id,
+                    received_at=datetime.now(UTC),
+                    channel_id=message_obj.channel.id if message_obj is not None else 0,
+                    message_id=message_obj.id if message_obj is not None else 0,
+                    user_id=getattr(user, "id", 0),
+                    emoji=_emoji_name(getattr(reaction, "emoji", "")),
+                    message=(_to_channel_message(message_obj) if message_obj is not None else None),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to normalize reaction event",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.on_reaction_add",
+                    "outcome": "dropped",
+                },
+            )
+
+    async def _on_raw_reaction_add(self, payload: Any) -> None:
+        """Bridge: ``on_raw_reaction_add`` — fires for EVERY reaction.
+
+        Complements the cached-only rich event; the fork dispatches raw
+        before rich, so a cached reaction reaches consumers twice (raw
+        then rich) unless they subscribe selectively.
+        """
+        try:
+            await self._events.dispatch(
+                RawReactionAddedEvent(
+                    account_id=self._account_id,
+                    received_at=datetime.now(UTC),
+                    channel_id=payload.channel_id,
+                    message_id=payload.message_id,
+                    user_id=payload.user_id,
+                    emoji=_emoji_name(payload.emoji),
+                    message_author_id=getattr(payload, "message_author_id", None),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to normalize raw reaction event",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.on_raw_reaction_add",
+                    "outcome": "dropped",
+                },
+            )
+
+    async def _on_raw_message_edit(self, payload: Any) -> None:
+        """Bridge: ``on_raw_message_edit`` — covers cached AND uncached edits.
+
+        The fork constructs the updated message once and passes it to both
+        the raw and rich events, so this bridge fully replaces
+        ``on_message_edit``: ``before`` comes from ``cached_message``
+        (None when uncached), ``after`` from ``message``. Exactly one
+        delivery per edit, no duplicates.
+        """
+        try:
+            cached = getattr(payload, "cached_message", None)
+            await self._events.dispatch(
+                MessageEditedEvent(
+                    account_id=self._account_id,
+                    received_at=datetime.now(UTC),
+                    before=_to_channel_message(cached) if cached is not None else None,
+                    after=_to_channel_message(payload.message),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to normalize message-edit event",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.on_raw_message_edit",
+                    "outcome": "dropped",
+                },
+            )
+
+
+def _named_bridge(event_name: str, handler: Callable[..., Awaitable[None]]) -> Any:
+    """Wrap *handler* in a coroutine whose __name__ matches the event.
+
+    The fork's ``Client.event()`` stores handlers by ``coro.__name__``,
+    so the wrapper must be named exactly like the event.
+    """
+
+    async def bridge(*args: Any) -> None:
+        await handler(*args)
+
+    bridge.__name__ = event_name
+    return bridge
+
+
+def _to_channel_message(message: Any) -> ChannelMessage:
+    author = getattr(message, "author", None)
+    return ChannelMessage(
+        id=message.id,
+        channel_id=getattr(getattr(message, "channel", None), "id", 0),
+        author_id=author.id if author is not None else 0,
+        content=message.content or "",
+        has_components=bool(getattr(message, "components", None)),
+        created_at=getattr(message, "created_at", None),
+    )
+
+
+def _emoji_name(emoji: Any) -> str:
+    """Normalize unicode/custom emoji objects to their string form."""
+    if isinstance(emoji, str):
+        return emoji
+    return str(emoji)
 
 
 def _find_button(message: Any, component_id: str) -> Any:
