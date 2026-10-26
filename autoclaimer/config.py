@@ -14,6 +14,7 @@ from .models import (
     AppConfig,
     AppSettings,
     ConfigValidationError,
+    RateLimitPolicy,
     ResolvedTaskConfig,
     TaskDefaults,
     TaskDefinition,
@@ -101,6 +102,52 @@ def _parameters(value: Any, where: str) -> dict[str, Any]:
     return dict(obj)
 
 
+_RATELIMIT_KEYS = {
+    "min_interval_seconds",
+    "max_concurrency",
+    "retry_limit",
+    "backoff_base_seconds",
+    "backoff_cap_seconds",
+}
+
+
+def _duration(value: Any, where: str, *, minimum: float = 0.0) -> float:
+    # bool is a subclass of int, so explicitly reject it; accept int or float.
+    if type(value) not in (int, float) or value < minimum:
+        raise ConfigValidationError(f"{where} must be a number >= {minimum}.")
+    return float(value)
+
+
+def _parse_ratelimit(raw: Any, where: str) -> RateLimitPolicy:
+    obj = _object(raw, where)
+    _only_keys(obj, _RATELIMIT_KEYS, where)
+    max_concurrency = None
+    if "max_concurrency" in obj:
+        max_concurrency = _int(obj["max_concurrency"], f"{where}.max_concurrency", minimum=1)
+    retry_limit = None
+    if "retry_limit" in obj:
+        retry_limit = _int(obj["retry_limit"], f"{where}.retry_limit")
+    return RateLimitPolicy(
+        min_interval_seconds=(
+            _duration(obj["min_interval_seconds"], f"{where}.min_interval_seconds")
+            if "min_interval_seconds" in obj
+            else None
+        ),
+        max_concurrency=max_concurrency,
+        retry_limit=retry_limit,
+        backoff_base_seconds=(
+            _duration(obj["backoff_base_seconds"], f"{where}.backoff_base_seconds")
+            if "backoff_base_seconds" in obj
+            else None
+        ),
+        backoff_cap_seconds=(
+            _duration(obj["backoff_cap_seconds"], f"{where}.backoff_cap_seconds")
+            if "backoff_cap_seconds" in obj
+            else None
+        ),
+    )
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     file_path = Path(path)
     try:
@@ -124,7 +171,7 @@ def valid_task_id(value: object) -> bool:
 
 def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     data = _object(dict(raw), "config")
-    _only_keys(data, {"version", "settings", "task_defaults", "tasks"}, "config")
+    _only_keys(data, {"version", "settings", "task_defaults", "tasks", "ratelimit"}, "config")
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
     if version != 1:
         raise ConfigValidationError(
@@ -166,7 +213,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     for raw_id, raw_definition in raw_tasks.items():
         task_id = _id(raw_id, f"config.tasks key {raw_id!r}")
         t = _object(raw_definition, f"config.tasks.{task_id}")
-        _only_keys(t, {"enabled", "retry_limit", "parameters"}, f"config.tasks.{task_id}")
+        _only_keys(
+            t, {"enabled", "retry_limit", "parameters", "ratelimit"}, f"config.tasks.{task_id}"
+        )
         tasks[task_id] = TaskDefinition(
             id=task_id,
             enabled=_bool(t.get("enabled", defaults.enabled), f"config.tasks.{task_id}.enabled"),
@@ -174,6 +223,11 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
                 t.get("retry_limit", defaults.retry_limit), f"config.tasks.{task_id}.retry_limit"
             ),
             parameters=_parameters(t.get("parameters", {}), f"config.tasks.{task_id}.parameters"),
+            ratelimit=(
+                _parse_ratelimit(t["ratelimit"], f"config.tasks.{task_id}.ratelimit")
+                if "ratelimit" in t
+                else None
+            ),
         )
 
     return AppConfig(
@@ -181,6 +235,11 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         settings=settings,
         task_defaults=defaults,
         tasks=tasks,
+        ratelimit=(
+            _parse_ratelimit(data["ratelimit"], "config.ratelimit")
+            if "ratelimit" in data
+            else RateLimitPolicy()
+        ),
     )
 
 
@@ -201,7 +260,7 @@ def parse_accounts_config(raw: Mapping[str, Any], app_config: AppConfig) -> Acco
     for index, raw_profile in enumerate(raw_accounts):
         where = f"accounts.accounts[{index}]"
         p = _object(raw_profile, where)
-        _only_keys(p, {"id", "enabled", "tasks", "overrides"}, where)
+        _only_keys(p, {"id", "enabled", "tasks", "overrides", "ratelimit"}, where)
         profile_id = _snowflake(_required(p, "id", where), f"{where}.id")
         if profile_id in seen:
             raise ConfigValidationError(f"Duplicate account id '{profile_id}'.")
@@ -246,6 +305,11 @@ def parse_accounts_config(raw: Mapping[str, Any], app_config: AppConfig) -> Acco
                 enabled=enabled,
                 tasks=tuple(raw_task_ids),
                 overrides=overrides,
+                ratelimit=(
+                    _parse_ratelimit(p["ratelimit"], f"{where}.ratelimit")
+                    if "ratelimit" in p
+                    else None
+                ),
             )
         )
 
