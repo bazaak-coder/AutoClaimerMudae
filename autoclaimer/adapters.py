@@ -13,8 +13,15 @@ without parsing platform payloads.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 
 class AdapterError(Exception):
@@ -50,23 +57,186 @@ class SentMessage:
 
 
 @dataclass(frozen=True)
-class ChannelMessage:
-    """A message observed in a channel."""
-
-    id: int
-    channel_id: int
-    author_id: int
-    content: str
-    has_components: bool = False
-
-
-@dataclass(frozen=True)
 class InteractionResult:
     """Outcome of pressing a message component (for example a button)."""
 
     message_id: int
     component_id: str
     acknowledged: bool
+
+
+@dataclass(frozen=True)
+class ChannelMessage:
+    """A message observed on the platform."""
+
+    id: int
+    channel_id: int
+    author_id: int
+    content: str
+    has_components: bool = False
+    created_at: datetime | None = None
+
+
+# ----- normalized inbound events -----
+
+
+@dataclass(frozen=True)
+class AccountEvent:
+    """Base class for events delivered from one account's client."""
+
+    account_id: int
+    received_at: datetime  # timezone-aware UTC
+
+
+@dataclass(frozen=True)
+class MessageCreatedEvent(AccountEvent):
+    """A new message was received."""
+
+    message: ChannelMessage
+
+
+@dataclass(frozen=True)
+class ReactionAddedEvent(AccountEvent):
+    """A reaction was added to a (cached) message."""
+
+    channel_id: int
+    message_id: int
+    user_id: int
+    emoji: str
+    #: Cached message context; absent when the platform does not provide it.
+    message: ChannelMessage | None = None
+
+
+@dataclass(frozen=True)
+class MessageEditedEvent(AccountEvent):
+    """A message was edited (delivered via the platform's raw edit event).
+
+    ``before`` is the cached pre-edit snapshot when available; uncached
+    edits still deliver with ``before=None``.
+    """
+
+    before: ChannelMessage | None
+    after: ChannelMessage
+
+
+@dataclass(frozen=True)
+class RawReactionAddedEvent(AccountEvent):
+    """A reaction was added (raw event: no cache requirement).
+
+    Fires for EVERY reaction, including reactions to uncached messages,
+    carrying only identifiers and the emoji. When the message IS cached
+    the adapter additionally emits :class:`ReactionAddedEvent` afterwards
+    (platform dispatch order: raw first, rich second) with full message
+    context — consumers should subscribe to one or the other, not both,
+    unless double delivery is desired.
+    """
+
+    channel_id: int
+    message_id: int
+    user_id: int
+    emoji: str
+    #: Author of the reacted-to message when the platform provides it.
+    message_author_id: int | None = None
+
+
+AccountEventPayload = (
+    MessageCreatedEvent | ReactionAddedEvent | MessageEditedEvent | RawReactionAddedEvent
+)
+#: Consumers may be sync (e.g. ``list.append``) or async callables.
+EventConsumer = Callable[[AccountEventPayload], Awaitable[None] | None]
+
+
+class EventDispatcher:
+    """Fan-out inbound events to subscribers with isolation and bounds.
+
+    Each subscriber gets its own bounded queue and one pump task: a slow
+    or failing consumer never blocks or breaks the others. When a queue is
+    full the OLDEST event is dropped (fresh state wins) and the drop is
+    counted and logged. Per-subscriber delivery is FIFO in the order the
+    adapter dispatched the events.
+    """
+
+    def __init__(self, *, queue_size: int = 64, name: str = "events") -> None:
+        self._queue_size = queue_size
+        self._name = name
+        self._subscribers: dict[int, _Subscription] = {}
+        self._next_id = 0
+        self.dropped = 0
+
+    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
+        """Register *consumer*; returns an unsubscribe callable."""
+        self._next_id += 1
+        handle = self._next_id
+        subscription = _Subscription(consumer, asyncio.Queue(self._queue_size))
+        subscription.pump = asyncio.get_running_loop().create_task(
+            self._pump(subscription), name=f"{self._name}-pump-{handle}"
+        )
+        self._subscribers[handle] = subscription
+
+        def unsubscribe() -> None:
+            removed = self._subscribers.pop(handle, None)
+            if removed is not None and removed.pump is not None:
+                removed.pump.cancel()
+
+        return unsubscribe
+
+    async def dispatch(self, event: AccountEventPayload) -> None:
+        """Deliver *event* to every subscriber (drop-oldest on overflow)."""
+        for subscription in list(self._subscribers.values()):
+            queue = subscription.queue
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - raced with pump
+                    pass
+                self.dropped += 1
+                logger.warning(
+                    "event queue full; dropped oldest event",
+                    extra={
+                        "account_id": event.account_id,
+                        "operation": f"{self._name}.dispatch",
+                        "outcome": "dropped",
+                    },
+                )
+            queue.put_nowait(event)
+
+    async def _pump(self, subscription: _Subscription) -> None:
+        while True:
+            event = await subscription.queue.get()
+            try:
+                result = subscription.consumer(event)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "event consumer failed; continuing",
+                    extra={
+                        "account_id": event.account_id,
+                        "operation": f"{self._name}.consumer",
+                        "outcome": "consumer_error",
+                    },
+                )
+
+    async def stop(self) -> None:
+        """Cancel and await all pump tasks (shutdown)."""
+        pumps = [s.pump for s in self._subscribers.values() if s.pump is not None]
+        self._subscribers.clear()
+        for pump in pumps:
+            pump.cancel()
+        for pump in pumps:
+            try:
+                await pump
+            except asyncio.CancelledError:
+                pass
+
+
+@dataclass
+class _Subscription:
+    consumer: EventConsumer
+    queue: asyncio.Queue[AccountEventPayload]
+    pump: asyncio.Task[None] | None = None
 
 
 @runtime_checkable
@@ -77,12 +247,6 @@ class PlatformAdapter(Protocol):
         """Send *content* to *channel_id* and return the sent message."""
         ...
 
-    async def fetch_recent_messages(
-        self, channel_id: int, limit: int = 50
-    ) -> tuple[ChannelMessage, ...]:
-        """Return up to *limit* recent messages, most recent last."""
-        ...
-
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
         """React to a message with *emoji*."""
         ...
@@ -91,6 +255,10 @@ class PlatformAdapter(Protocol):
         self, channel_id: int, message_id: int, component_id: str
     ) -> InteractionResult:
         """Press a component (button) attached to a message."""
+        ...
+
+    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
+        """Subscribe to normalized inbound events; returns unsubscribe."""
         ...
 
     async def close(self) -> None:
