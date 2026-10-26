@@ -22,6 +22,22 @@ class AppSettings:
 
 
 @dataclass(frozen=True)
+class RateLimitPolicy:
+    """Local pacing policy; ``None`` fields inherit from the next outer layer.
+
+    Layer precedence (field-wise): per-account override -> task policy ->
+    global default -> built-in defaults. Server-directed cooldowns always
+    take precedence over these local settings.
+    """
+
+    min_interval_seconds: float | None = None
+    max_concurrency: int | None = None
+    retry_limit: int | None = None
+    backoff_base_seconds: float | None = None
+    backoff_cap_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class TaskDefaults:
     enabled: bool = True
     retry_limit: int = 3
@@ -33,6 +49,7 @@ class TaskDefinition:
     enabled: bool = True
     retry_limit: int = 3
     parameters: dict[str, Any] = field(default_factory=dict)
+    ratelimit: RateLimitPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +67,7 @@ class AccountProfile:
     enabled: bool = True
     tasks: tuple[str, ...] = ()
     overrides: dict[str, TaskOverride] = field(default_factory=dict)
+    ratelimit: RateLimitPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +76,7 @@ class AppConfig:
     settings: AppSettings
     task_defaults: TaskDefaults
     tasks: dict[str, TaskDefinition]
+    ratelimit: RateLimitPolicy = field(default_factory=RateLimitPolicy)
 
 
 @dataclass(frozen=True)
