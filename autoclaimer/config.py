@@ -14,6 +14,7 @@ from .models import (
     AppConfig,
     AppSettings,
     ConfigValidationError,
+    LoggingSettings,
     RateLimitPolicy,
     ResolvedTaskConfig,
     TaskDefaults,
@@ -148,6 +149,25 @@ def _parse_ratelimit(raw: Any, where: str) -> RateLimitPolicy:
     )
 
 
+def _parse_logging(raw: Any, where: str) -> LoggingSettings:
+    obj = _object(raw, where)
+    _only_keys(obj, {"log_file", "max_bytes", "backup_count", "level"}, where)
+    log_file = obj.get("log_file", "autoclaimer.log")
+    if not isinstance(log_file, str) or not log_file.strip():
+        raise ConfigValidationError(f"{where}.log_file must be a non-empty string.")
+    level = obj.get("level", "INFO")
+    if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
+        raise ConfigValidationError(
+            f"{where}.level must be one of {', '.join(sorted(_LOG_LEVELS))}."
+        )
+    return LoggingSettings(
+        log_file=log_file,
+        max_bytes=_int(obj.get("max_bytes", 1_048_576), f"{where}.max_bytes", minimum=1024),
+        backup_count=_int(obj.get("backup_count", 3), f"{where}.backup_count", minimum=1),
+        level=level.upper(),
+    )
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     file_path = Path(path)
     try:
@@ -171,7 +191,11 @@ def valid_task_id(value: object) -> bool:
 
 def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     data = _object(dict(raw), "config")
-    _only_keys(data, {"version", "settings", "task_defaults", "tasks", "ratelimit"}, "config")
+    _only_keys(
+        data,
+        {"version", "settings", "task_defaults", "tasks", "ratelimit", "logging"},
+        "config",
+    )
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
     if version != 1:
         raise ConfigValidationError(
@@ -242,6 +266,11 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             _parse_ratelimit(data["ratelimit"], "config.ratelimit")
             if "ratelimit" in data
             else RateLimitPolicy()
+        ),
+        logging=(
+            _parse_logging(data["logging"], "config.logging")
+            if "logging" in data
+            else LoggingSettings()
         ),
     )
 
