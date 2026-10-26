@@ -335,6 +335,24 @@ class TaskStateStore:
             )
         return tuple(_row_to_record(row) for row in rows)
 
+    async def list_instances_by_account(
+        self, account_id: int, status: TaskInstanceState | None = None
+    ) -> tuple[TaskInstanceRecord, ...]:
+        """Instances for one account, optionally filtered by status."""
+        if status is None:
+            rows = await self._run(
+                self._fetchall_sync,
+                "SELECT * FROM task_instances WHERE account_id = ?",
+                (account_id,),
+            )
+        else:
+            rows = await self._run(
+                self._fetchall_sync,
+                "SELECT * FROM task_instances WHERE account_id = ? AND status = ?",
+                (account_id, status.value),
+            )
+        return tuple(_row_to_record(row) for row in rows)
+
     async def due_instances(self) -> tuple[TaskInstanceRecord, ...]:
         """Claimable instances whose retry time (if any) has passed."""
         now = _format_ts(self._clock())
