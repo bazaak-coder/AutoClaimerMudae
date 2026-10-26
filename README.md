@@ -120,13 +120,13 @@ hooks, or webhook URLs exist in this repository.
   (`succeeded` / `failed_recoverable` / `failed_permanent`); adapter and
   handler exceptions propagate to the caller.
 - **Adapters** (`adapters.PlatformAdapter`) expose the minimum async
-  operations (send message, fetch recent messages, react, press component,
+  operations (send message, react, press component, subscribe to events,
   close) with explicit results and an error hierarchy:
   `RecoverableAdapterError`, `PermanentAdapterError`, `CooldownError`
   (carries `retry_after_seconds`). Concrete adapters own client lifecycle.
 - **Mock adapter** (`mock_adapter.MockAdapter`) is deterministic and fully
   test-controlled: scripted return values or exception instances per
-  operation (FIFO), simulated latency, seeded channel state, and full call
+  operation (FIFO), simulated latency, synthetic event emission, and full call
   recording as structured test data.
 
 ## Phase 3: SQLite runtime persistence
@@ -235,20 +235,48 @@ it contains no evasion, probing, or rotation logic.
   authorization/token/password/secret values. CLI output is redacted with
   the same filter; authentication tokens are never printed.
 
-## Phase 7: discord.py-self adapter
+## Phase 7: discord.py-self adapter (event-driven)
 
 `autoclaimer/discord_adapter.py` implements the Phase 2 `PlatformAdapter`
 contract with one isolated `discord.Client` per account, verified against
-**discord.py-self 2.1.0** (installed source — no invented APIs):
+**discord.py-self 2.1.0** (installed source — no invented APIs). The
+runtime is **event-driven: no history polling** — `Messageable.history` is
+never called and historical retrieval is not part of the contract.
 
 - Lifecycle: `Client.login(token)` → background `Client.connect(reconnect=True)`
   → `wait_until_ready()`; operations lazily ensure readiness; `close()` is
-  idempotent and awaits task teardown; a dead connection task surfaces as a
-  recoverable error until restart.
-- Operations: `Messageable.send`, the fork's async-generator
-  `Messageable.history` (mapped to most-recent-last), the light
+  idempotent (stops event delivery, closes the client, awaits tasks); a
+  dead connection task surfaces as a recoverable error until restart.
+- Outbound operations: `Messageable.send`, the light
   `http.add_reaction` route, and `Button.click()` for components
   (`str` result = link button → `acknowledged=False`).
+- Inbound events: the fork's single-handler `Client.event()` registration
+  (by coroutine name) hosts the adapter's bridges for `on_message`,
+  `on_reaction_add(reaction, user)`, `on_raw_reaction_add(raw)`, and
+  `on_raw_message_edit(raw)`. Events normalize to framework types —
+  `MessageCreatedEvent`, `ReactionAddedEvent` (cached message context
+  included when present), `RawReactionAddedEvent` (fires for **every**
+  reaction — including uncached messages — carrying identifiers, emoji,
+  and the reacted-to author id when provided), and `MessageEditedEvent`
+  (pre/post snapshots; served from the raw edit event so uncached edits
+  deliver too, with `before=None` when not cached) — carrying identifiers,
+  content, and UTC timestamps; no library objects cross the boundary.
+  **Cache/ordering semantics verified in the fork**: the rich
+  `reaction_add` fires only for gateway-cached messages; raw reaction
+  dispatch precedes the rich event, so a cached reaction reaches
+  consumers twice (raw then rich) unless they subscribe selectively;
+  edit events deliver exactly once (the raw bridge replaces
+  `on_message_edit`; the fork passes the same updated-message object to
+  both).
+- Dispatching: a shared `EventDispatcher` gives each subscriber its own
+  bounded queue (default 64) and pump task — consumer exceptions are
+  isolated and logged, one slow consumer never blocks others, overflow
+  drops the OLDEST event (counted + logged; fresh state wins).
+  Per-subscriber delivery is FIFO in dispatch order; cross-event-type
+  ordering follows the library's task-per-event scheduling. Subscribers
+  register before `start()` (no startup-loss window); reconnects never
+  duplicate handlers (one-time registration on the persistent client);
+  `close()` stops all pumps — stragglers are delivered to no one.
 - Pacing: a small random delay precedes every mutating action
   (`jitter_range`, default 0.4–1.2s). This is conservative pacing for
   personal, non-abusive use — **not** detection evasion.
