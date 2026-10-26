@@ -50,6 +50,7 @@ class TaskDefinition:
     retry_limit: int = 3
     parameters: dict[str, Any] = field(default_factory=dict)
     ratelimit: RateLimitPolicy | None = None
+    priority: int = 0
 
 
 @dataclass(frozen=True)
