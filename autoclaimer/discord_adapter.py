@@ -95,12 +95,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_JITTER_RANGE = (0.4, 1.2)
 
 
-def _fake_response(status: int, reason: str = "") -> Any:
-    from types import SimpleNamespace
-
-    return SimpleNamespace(status=status, reason=reason)
-
-
 class DiscordAdapter:
     """One account's Discord client wrapped behind :class:`PlatformAdapter`."""
 
