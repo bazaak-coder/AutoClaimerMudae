@@ -50,8 +50,9 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/models.py` | implemented | Typed, frozen dataclass models and `ConfigValidationError`. |
 | `autoclaimer/config.py` | implemented | JSON loading, structural validation, cross-file checks, precedence resolution. |
 | `autoclaimer/credentials.py` | implemented (interface only) | `CredentialProvider` protocol; secure backends provide implementations. |
-| `autoclaimer/registry.py` | planned | Task registry mapping task IDs to implementations. |
-| `autoclaimer/adapters.py` | planned | Adapter interfaces between the framework and Discord. |
+| `autoclaimer/registry.py` | implemented | Task type registry: stable ids, descriptions, config schemas, async handlers. |
+| `autoclaimer/adapters.py` | implemented | `PlatformAdapter` protocol, typed results, recoverable/permanent/cooldown errors. |
+| `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
 | `autoclaimer/ratelimit.py` | planned | Rate limiting / request pacing. |
 | `autoclaimer/workers.py` | planned | Worker orchestration across accounts. |
 | `autoclaimer/persistence.py` | planned | SQLite state store and migrations. |
@@ -119,7 +120,28 @@ Commit messages, PRs, reviews, and comments are sent to a Discord webhook as
   chmod +x /workspace/autoclaimer-githooks/post-commit
   ```
 
-## Next milestone (Phase 2, not started)
+## Phase 2: task registry and adapter contracts
+
+- **Task types** (`registry.TaskType`) combine a stable id, description,
+  config validator, and async handler; they are registered in a
+  `TaskRegistry` — behaviour is never hard-coded into central conditionals.
+- **Task instances** are per-account: `registry.TaskContext` carries the
+  account id, task id, validated config, adapter, and optional credential
+  provider. `TaskRegistry.execute` validates config, then awaits the
+  handler and returns a structured `TaskOutcome`
+  (`succeeded` / `failed_recoverable` / `failed_permanent`); adapter and
+  handler exceptions propagate to the caller.
+- **Adapters** (`adapters.PlatformAdapter`) expose the minimum async
+  operations (send message, fetch recent messages, react, press component,
+  close) with explicit results and an error hierarchy:
+  `RecoverableAdapterError`, `PermanentAdapterError`, `CooldownError`
+  (carries `retry_after_seconds`). Concrete adapters own client lifecycle.
+- **Mock adapter** (`mock_adapter.MockAdapter`) is deterministic and fully
+  test-controlled: scripted return values or exception instances per
+  operation (FIFO), simulated latency, seeded channel state, and full call
+  recording as structured test data.
+
+## Next milestone (Phase 3, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
