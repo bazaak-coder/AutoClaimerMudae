@@ -6,6 +6,8 @@ This document defines the mandatory development, testing, security, documentatio
 
 AutoClaimer is a lightweight, standalone Python project for configurable multi-account Discord automation targeting Mudae. Keep its architecture independent of unrelated projects, with minimal unnecessary dependencies and resource overhead.
 
+Current status (update as phases complete): Phase 1 (typed configuration foundation, credential-provider interface, tooling) and Phase 2 (task registry, platform adapter contracts, deterministic mock adapter) are implemented and green. Runtime dependencies are still zero; discord.py-self is deliberately not integrated yet. The README package table is the authoritative module status. The next phase is worker orchestration/rate limiting/persistence, not yet started.
+
 Priority order:
 
 1. The owner's explicit instructions.
@@ -25,7 +27,8 @@ Before implementing a change:
 4. Identify existing uncommitted changes, untracked files, and other agents' work.
 5. Check Python, operating system, installed tools, dependencies, and environment compatibility.
 6. Inspect relevant entries in the append-only knowledgebase.
-7. Understand existing behavior and identify the tests needed to verify the change.
+7. Verify the workspace environment (see section 16): the git pointer file, the external git directory, the virtualenv, and which tool invocations actually work on this machine.
+8. Understand existing behavior and identify the tests needed to verify the change.
 
 Do not assume functionality is missing merely because it is not immediately apparent.
 
@@ -84,6 +87,8 @@ Every implementation session that changes project files must add an informative 
 
 Use the existing knowledgebase if present. Otherwise, establish "knowledgebase/" with a clear index and suitable sections, such as:
 
+In this repository the knowledgebase is gitignored by owner instruction: entries are local workspace documentation and must never be committed, pushed, or rewritten. Keep "knowledgebase/README.md" as the append-only index.
+
 knowledgebase/
 ├── README.md
 ├── decisions/
@@ -120,6 +125,8 @@ A change is not fully documented until its knowledgebase entry is saved. If docu
 5. Developer Tools and Dependency Management
 
 Use "uv" where compatible with the project for Python dependency and environment management.
+
+Workspace reality (this machine): the system Python is an externally-managed (PEP 668) Alpine 3.14-series interpreter; do not install into it. All quality tooling lives in the virtualenv at "/workspace/autoclaimer-venv" (see section 16). The bare "pytest"/"ruff"/"mypy" on PATH belong to the system interpreter and cannot import the project — always invoke the venv binaries. "uv.lock" is maintained by running "uv lock" from the venv; there is no project-local .venv (FUSE cannot hold one).
 
 Use Ruff, mypy, and pytest as the primary development quality tools.
 
@@ -202,6 +209,8 @@ gh repo view
 
 Verify the repository, branch, and remote before operating. If "gh" is unavailable or unauthenticated, report the limitation and use other permitted local checks where possible.
 
+Workspace git topology (this machine): git metadata lives in "/workspace/autoclaimer.git" because the project tree sits on FUSE, which cannot host git object storage. The project root contains a ".git" *pointer file* ("gitdir: /workspace/autoclaimer.git") so plain git commands work in place; git hard-ignores the pointer, and it must never be committed or deleted. Never delete "/workspace/autoclaimer.git" — it is the repository. FUSE occasionally drops worktree files (observed once); if a tracked file vanishes, restore it from HEAD and note the incident. Commit identity is configured repo-locally (libosterelezent / noreply address) and "gh auth setup-git" provides the HTTPS credential helper.
+
 During changes
 
 - Keep changes focused and reviewable.
@@ -233,6 +242,8 @@ All changes intended for the remote repository must go through a pull request (P
 Do not push directly to the protected default branch or bypass the PR process.
 
 The owner's existing restriction on remote operations remains in force: no remote push, PR creation, merge, release, or other remote mutation is permitted until explicitly authorized. Once the owner authorizes the remote workflow, follow these phases.
+
+Established practice to date (owner-directed): commits land on "main" directly, granularly per section 7.4, and pushes happen only on an explicit per-batch "push" instruction from the owner. That practice satisfies section 7.5's authorization requirement; the PR workflow below applies when the owner requests it (for example for externally reviewed or multi-contributor changes).
 
 Phase A — Prepare the change
 
@@ -411,12 +422,16 @@ Local YAML validation is not equivalent to a successful GitHub Actions run.
 
 Before declaring a change ready for review, run all applicable checks.
 
-uv sync --locked
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy .
-uv run pytest
+On this machine (authoritative):
+
+V=/workspace/autoclaimer-venv/bin
+$V/ruff check .
+$V/ruff format --check .
+$V/mypy .
+$V/pytest
 git diff --check
+
+Portable equivalent (uv-managed environments): "uv sync --locked", then prefix each tool with "uv run".
 
 Adapt commands to the actual project configuration. If a lockfile has not yet been established, document and perform the initial dependency setup rather than claiming locked installation succeeded.
 
@@ -512,11 +527,33 @@ Never claim that tests passed without executing them. Never describe an unreview
 - [ ] Knowledgebase documentation is appended.
 - [ ] Dependencies and lockfiles are consistent.
 - [ ] No secrets or unrelated changes are included.
-- [ ] The PR has been independently reviewed.
+- [ ] The PR has been independently reviewed (applies to the PR workflow; owner-directed direct pushes still require the full local gate).
 - [ ] Confirmed defects and justified security findings have been addressed.
-- [ ] Required CI checks pass.
+- [ ] Required CI checks pass (no CI is configured in this repository yet — the local gate in section 10 is authoritative until CI exists).
 - [ ] No unresolved critical or high-severity findings remain.
 - [ ] Owner approval has been obtained for required remote operations and merging.
 - [ ] The final report accurately describes the verified state.
+
+16. Workspace Environment (Android/PRoot)
+
+This project is developed on an Android device inside a PRoot Alpine guest. Treat the following as stable facts until corrected by the owner:
+
+Paths
+
+- Project tree: "/sdcard/Download/AutoClaimer" (FUSE: no exec bits, no symlinks, git cannot write objects there).
+- Git metadata: "/workspace/autoclaimer.git" (ext4). The in-tree ".git" pointer file links them.
+- Virtualenv: "/workspace/autoclaimer-venv" (ext4; holds ruff, mypy, pytest, pytest-asyncio, uv, and the editable project install).
+
+Known constraints
+
+- The system Python is externally-managed (PEP 668); never pip-install into it and never pass "--break-system-packages".
+- Bare "pytest"/"ruff"/"mypy"/"uv" on PATH run against the system interpreter and cannot import the project; always use the venv binaries (section 10).
+- FUSE cannot store executable bits or symlinks: venvs and git hooks must live under "/workspace"; in-tree hook scripts are non-executable.
+- FUSE has silently dropped a tracked file once (".githooks/post-commit"); on any unexpected worktree deletion, restore from HEAD, verify, and record the incident in the knowledgebase.
+- Prefer "/tmp/opencode" for throwaway artifacts and "/workspace" for anything needing exec bits or symlinks.
+
+Remote
+
+- Repository: "libosterelezent/AutoClaimerMudae" (private). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
 
 Final principle: Correctness, security, reproducibility, traceability, and owner control take precedence over speed. A passing test suite is necessary but not sufficient: independent review must examine the implementation's logic, security boundaries, and fragile areas before a change can be merged.
