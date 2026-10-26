@@ -1,7 +1,6 @@
 """Unit tests for the discord.py-self adapter (fake client; no credentials)."""
 
 import asyncio
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,7 +9,6 @@ import pytest
 
 from autoclaimer.adapters import (
     AdapterError,
-    ChannelMessage,
     CooldownError,
     InteractionResult,
     PermanentAdapterError,
@@ -92,11 +90,6 @@ class FakeChannel:
                 return message
         raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown Message")
 
-    async def history(self, *, limit: int = 100, **_: Any) -> AsyncIterator[FakeMessage]:
-        # Newest first, like the real async generator.
-        for message in reversed(self._messages[-limit:]):
-            yield message
-
 
 class FakeHttp:
     def __init__(self) -> None:
@@ -121,6 +114,18 @@ class FakeClient:
         self.connect_stopped = asyncio.Event()
         self.http = FakeHttp()
         self.closed_flag = False
+        self.registered_events: list[str] = []
+        self.history_accessed = 0
+
+    def event(self, coro: Any) -> Any:
+        """Mimics the fork's Client.event: setattr by coroutine name."""
+        setattr(self, coro.__name__, coro)
+        self.registered_events.append(coro.__name__)
+        return coro
+
+    async def history_trap(self) -> None:
+        self.history_accessed += 1
+        raise AssertionError("history() must never be called")
 
     async def login(self, token: str) -> None:
         self.login_calls.append(token)
@@ -234,23 +239,32 @@ async def test_login_failure_is_permanent_and_token_never_leaks() -> None:
 # ----- pacing -----
 
 
-async def test_random_delay_precedes_mutating_actions_not_reads() -> None:
-    # _messages is chronological (oldest first): "a" then "b".
-    messages = [FakeMessage(1, "a"), FakeMessage(2, "b")]
-    channel = FakeChannel(CHANNEL, messages)
+async def test_random_delay_precedes_mutating_actions_not_inbound_events() -> None:
+    from datetime import UTC, datetime
+
+    from autoclaimer.adapters import MessageCreatedEvent
+
+    channel = FakeChannel(CHANNEL, [])
     client = FakeClient(channel)
     adapter = make_adapter(client)
-    fetched = await adapter.fetch_recent_messages(CHANNEL)  # read: no jitter
+    received: list[object] = []
+    adapter.subscribe(received.append)
+    now = datetime.now(UTC)
+    await adapter._on_message(
+        SimpleNamespace(
+            id=1,
+            content="hi",
+            author=SimpleNamespace(id=1),
+            channel=SimpleNamespace(id=CHANNEL),
+            components=[],
+            created_at=now,
+        )
+    )  # inbound event: no jitter
+    await asyncio.sleep(0.01)  # let the pump deliver
+    assert len(received) == 1
+    assert isinstance(received[0], MessageCreatedEvent)
     assert adapter.test_sleeps == []  # type: ignore[attr-defined]
-    assert fetched == (
-        ChannelMessage(
-            id=1, channel_id=CHANNEL, author_id=111222333, content="a", has_components=False
-        ),
-        ChannelMessage(
-            id=2, channel_id=CHANNEL, author_id=111222333, content="b", has_components=False
-        ),
-    )
-    await adapter.send_message(CHANNEL, "hi")  # action: jitter applied
+    await adapter.send_message(CHANNEL, "hi")  # mutating action: jitter applied
     assert adapter.test_sleeps == [0.05]  # type: ignore[attr-defined]
     client.connect_stopped.set()
     await adapter.close()
@@ -283,18 +297,6 @@ async def test_unknown_channel_is_permanent_without_heavy_fetches() -> None:
     adapter = make_adapter(client)
     with pytest.raises(PermanentAdapterError, match="gateway cache"):
         await adapter.send_message(12345, "x")
-    client.connect_stopped.set()
-    await adapter.close()
-
-
-async def test_history_maps_components_flag() -> None:
-    row = SimpleNamespace(children=[FakeButton("claim")])
-    messages = [FakeMessage(1, "plain"), FakeMessage(2, "with buttons", components=[row])]
-    channel = FakeChannel(CHANNEL, messages)
-    client = FakeClient(channel)
-    adapter = make_adapter(client)
-    fetched = await adapter.fetch_recent_messages(CHANNEL)
-    assert [m.has_components for m in fetched] == [False, True]
     client.connect_stopped.set()
     await adapter.close()
 
