@@ -45,16 +45,27 @@ async def test_message_ids_are_deterministic_across_instances() -> None:
     assert first.message_id == 900000000000000001
 
 
-async def test_fetch_defaults_to_empty_and_seeded_channel_state() -> None:
+async def test_mock_emits_normalized_events_to_subscribers() -> None:
+    from datetime import UTC, datetime
+
+    from autoclaimer.adapters import MessageCreatedEvent
+
     adapter = MockAdapter()
-    assert await adapter.fetch_recent_messages(5) == ()
-    adapter.set_channel_messages(5, [make_message(1, "a"), make_message(2, "b")])
-    assert await adapter.fetch_recent_messages(5) == (
-        make_message(1, "a"),
-        make_message(2, "b"),
+    received: list[object] = []
+    adapter.subscribe(received.append)
+    await adapter.emit(
+        MessageCreatedEvent(
+            account_id=1,
+            received_at=datetime.now(UTC),
+            message=ChannelMessage(
+                id=1, channel_id=2, author_id=3, content="roll", has_components=True
+            ),
+        )
     )
-    assert await adapter.fetch_recent_messages(5, limit=1) == (make_message(2, "b"),)
-    assert await adapter.fetch_recent_messages(5, limit=0) == ()
+    await asyncio.sleep(0.01)  # pump delivery
+    assert len(received) == 1
+    await adapter.close()
+    assert adapter.closed is True
 
 
 async def test_press_component_default_is_acknowledged() -> None:
