@@ -7,7 +7,8 @@ behaviour per operation:
 - ``script(operation, *outcomes)`` queues return values or exception
   instances (recoverable, permanent, cooldown) that are consumed FIFO.
 - ``delay_seconds`` simulates latency before every operation.
-- ``set_channel_messages`` seeds observable channel state.
+- ``emit(event)`` injects normalized inbound events to subscribers
+  (deterministic event-driven testing; no history polling exists).
 - Unscripted calls fall back to deterministic defaults (incrementing ids).
 - Every call is recorded in ``calls`` as structured test data, and each
   operation also records its domain results (``sent_messages``,
@@ -18,11 +19,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .adapters import ChannelMessage, InteractionResult, SentMessage
+from .adapters import (
+    AccountEventPayload,
+    EventConsumer,
+    EventDispatcher,
+    InteractionResult,
+    SentMessage,
+)
 
 _FIRST_ID = 900000000000000000
 
@@ -39,17 +45,17 @@ class MockCall:
 class MockAdapter:
     """In-memory adapter whose behaviour is fully test-controlled."""
 
-    def __init__(self, *, delay_seconds: float = 0.0) -> None:
+    def __init__(self, *, delay_seconds: float = 0.0, event_queue_size: int = 64) -> None:
         self.delay_seconds = delay_seconds
         self.calls: list[MockCall] = []
         self.sent_messages: list[SentMessage] = []
         self.reactions: list[tuple[int, int, str]] = []
         self.interactions: list[InteractionResult] = []
-        self.channel_messages: dict[int, tuple[ChannelMessage, ...]] = {}
         self.closed = False
         self._scripts: dict[str, deque[Any]] = {}
         self._sequence = 0
         self._next_id = _FIRST_ID
+        self._events = EventDispatcher(queue_size=event_queue_size, name="mock")
 
     # ----- test control -----
 
@@ -57,9 +63,13 @@ class MockAdapter:
         """Queue outcomes (values or ``BaseException`` instances) for an operation."""
         self._scripts.setdefault(operation, deque()).extend(outcomes)
 
-    def set_channel_messages(self, channel_id: int, messages: Iterable[ChannelMessage]) -> None:
-        """Seed the messages observable via ``fetch_recent_messages``."""
-        self.channel_messages[channel_id] = tuple(messages)
+    async def emit(self, event: AccountEventPayload) -> None:
+        """Deliver a synthetic normalized event to subscribers."""
+        await self._events.dispatch(event)
+
+    def subscribe(self, consumer: EventConsumer) -> Any:
+        """Subscribe to synthetic events; returns an unsubscribe callable."""
+        return self._events.subscribe(consumer)
 
     # ----- internals -----
 
@@ -97,16 +107,6 @@ class MockAdapter:
         self.sent_messages.append(sent)
         return sent
 
-    async def fetch_recent_messages(
-        self, channel_id: int, limit: int = 50
-    ) -> tuple[ChannelMessage, ...]:
-        self._record("fetch_recent_messages", {"channel_id": channel_id, "limit": limit})
-        outcome = await self._next_outcome("fetch_recent_messages")
-        if outcome is not None:
-            return tuple(outcome)
-        messages = self.channel_messages.get(channel_id, ())
-        return messages[-limit:] if limit > 0 else ()
-
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
         self._record(
             "add_reaction",
@@ -135,4 +135,5 @@ class MockAdapter:
 
     async def close(self) -> None:
         self._record("close", {})
+        await self._events.stop()
         self.closed = True
