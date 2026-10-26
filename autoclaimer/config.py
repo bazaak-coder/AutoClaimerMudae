@@ -214,7 +214,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         task_id = _id(raw_id, f"config.tasks key {raw_id!r}")
         t = _object(raw_definition, f"config.tasks.{task_id}")
         _only_keys(
-            t, {"enabled", "retry_limit", "parameters", "ratelimit"}, f"config.tasks.{task_id}"
+            t,
+            {"enabled", "retry_limit", "parameters", "ratelimit", "priority"},
+            f"config.tasks.{task_id}",
         )
         tasks[task_id] = TaskDefinition(
             id=task_id,
@@ -228,6 +230,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
                 if "ratelimit" in t
                 else None
             ),
+            priority=_int(t.get("priority", 0), f"config.tasks.{task_id}.priority"),
         )
 
     return AppConfig(
