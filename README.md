@@ -282,8 +282,10 @@ minimal local provider reads them from the environment:
 import os
 from autoclaimer.credentials import CredentialProvider
 
+
 class EnvironmentCredentials:
     """Reads tokens from AUTOCLAIMER_TOKEN_<ACCOUNT_ID> env vars."""
+
     def get_token(self, account_id: int) -> str:
         token = os.environ.get(f"AUTOCLAIMER_TOKEN_{account_id}")
         if not token:
