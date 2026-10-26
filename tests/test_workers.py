@@ -468,6 +468,23 @@ async def test_orphaned_running_rows_recovered_on_start(tmp_path: Path) -> None:
     await h2.store.close()
 
 
+async def test_manager_is_restartable(tmp_path: Path) -> None:
+    h = await build_harness(
+        tmp_path,
+        tasks_raw={"job": task("block")},
+        accounts_raw=[{"id": ACCOUNT, "tasks": ["job"]}],
+    )
+    event = block_event(h, ACCOUNT, "job")
+    await h.manager.start()
+    await wait_for_status(h.store, ACCOUNT, "job", TaskInstanceState.RUNNING)
+    await h.manager.stop(timeout=0.05)  # hard-cancel mid-operation
+    assert (await h.store.get_instance_by_ids(ACCOUNT, "job")).status is (TaskInstanceState.RUNNING)
+    event.set()  # the restarted attempt may proceed immediately
+    await h.manager.start()  # same manager instance starts again
+    await wait_for_status(h.store, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+    await h.manager.stop()
+
+
 async def test_store_closes_cleanly_after_manager_stop(tmp_path: Path) -> None:
     h = await build_harness(
         tmp_path,
