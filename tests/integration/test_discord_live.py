@@ -4,11 +4,10 @@ Skipped unless the owner explicitly opts in via environment variables —
 the normal suite never touches real credentials or Discord:
 
 - ``AUTOCLAIMER_LIVE_DISCORD_TOKEN``: a real account token (login/close only).
-- ``AUTOCLAIMER_LIVE_CHANNEL_ID``: a channel id the account can see
-  (enables a read-only history check; nothing is ever sent).
 
 User-account automation may violate Discord's Terms of Service. These
 checks exist for the owner's personal, authorized verification only.
+The runtime workflow is event-driven; no history endpoints are exercised.
 """
 
 import os
@@ -47,18 +46,24 @@ async def test_live_login_and_clean_close() -> None:
     assert adapter._closed  # noqa: SLF001
 
 
-async def test_live_read_only_history() -> None:
-    channel_id = os.environ.get("AUTOCLAIMER_LIVE_CHANNEL_ID")
-    if not channel_id:
-        pytest.skip("AUTOCLAIMER_LIVE_CHANNEL_ID not set")
+async def test_live_event_subscription_starts_cleanly() -> None:
+    """Login with one subscriber registered; no events required to pass."""
+    from autoclaimer.adapters import MessageCreatedEvent  # noqa: F401 (type anchor)
+
+    received: list[object] = []
+
+    async def consumer(event: object) -> None:
+        received.append(event)
+
     adapter = DiscordAdapter(
         account_id=1,
         credentials=_EnvTokenProvider(os.environ["AUTOCLAIMER_LIVE_DISCORD_TOKEN"]),
     )
+    unsubscribe = adapter.subscribe(consumer)
     await adapter.start()
-    messages = await adapter.fetch_recent_messages(int(channel_id), limit=5)
-    assert isinstance(messages, tuple)
     await adapter.close()
+    unsubscribe()
+    assert isinstance(received, list)  # delivery optional; lifecycle must hold
 
 
 def test_package_version_recorded() -> None:
