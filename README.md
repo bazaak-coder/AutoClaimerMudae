@@ -56,7 +56,8 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/ratelimit.py` | implemented | Central async rate limiter: scopes, pacing, permits, cooldowns, retries. |
 | `autoclaimer/workers.py` | implemented | Worker manager: concurrent account workers, ordered scheduling, controls. |
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
-| `autoclaimer/cli.py` | planned | Command-line entry point. |
+| `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
+| `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
 
 Planned boundaries are documented, not implemented; no stub modules exist to
 avoid speculative code.
@@ -210,7 +211,30 @@ it contains no evasion, probing, or rotation logic.
   `task_status(id)`, `status()` snapshots, and graceful `stop()` that
   closes adapters.
 
-## Next milestone (Phase 6, not started)
+## Phase 6: interactive CLI and logging
+
+- **CLI** (`python -m autoclaimer`, mock-adapter demo): a command loop
+  (`start/stop`, `pause/resume` globally or per account,
+  `enable/disable <account>`, `accounts`, `tasks [state]`, `queue
+  [account]`, `cooldowns`, `errors`, `status`, `help`, `quit`). The
+  controller owns components and delegates every action to the worker
+  manager, store, and limiter — no orchestration logic in the CLI. Input
+  is validated (snowflake ids, known accounts, task states, argument
+  counts, shell-style quoting); EOF, Ctrl+C, and `quit` all drain workers
+  gracefully and close the store; shutdown while workers are active
+  cancels them after `shutdown_timeout_seconds` (uncertain instances stay
+  `running` and recover on restart — the manager is restartable).
+- **Logging**: `logging_setup.setup_logging` configures a
+  `RotatingFileHandler` (size + retention from the optional `logging`
+  config block: `log_file`, `max_bytes`, `backup_count`, `level`) plus an
+  optional stderr mirror. The formatter appends structured context
+  (`account_id`, `task_id`, `operation`, `outcome`, `scope`) and then
+  redacts the *entire* formatted line — including exception tracebacks —
+  scrubbing Discord-shaped tokens, webhook URLs, and
+  authorization/token/password/secret values. CLI output is redacted with
+  the same filter; authentication tokens are never printed.
+
+## Next milestone (Phase 7, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
