@@ -328,7 +328,45 @@ Set env vars in your shell profile or a secrets manager — never commit
 them. Opt-in live checks (`tests/integration/test_discord_live.py`) are
 skipped unless `AUTOCLAIMER_LIVE_DISCORD_TOKEN` is set explicitly.
 
-## Next milestone (Phase 8, not started)
+## Phase 8: integration and release audit
+
+End-to-end lifecycle verified against the real components (mock adapters):
+config load/validate → credential resolution (provider contract; tokens
+never logged) → SQLite open + interrupted-work recovery → adapter/scheduler
+init → concurrent workers → sequential per-account execution →
+limiter-honored server cooldowns (retried inside `limiter.run`) →
+persisted outcomes, retry schedules, and scope cooldowns → pause/resume/
+disable/queue controls → clean shutdown → restart recovery. See
+`tests/integration/test_lifecycle.py`.
+
+### Reliability findings (fixed, with regression tests)
+
+- Worker tasks had no exception observation: a transient store failure
+  silently killed the account worker while `status()` reported RUNNING.
+  Now each loop iteration is guarded (logged with account context, one
+  idle-interval back-off) and task death is logged by a done-callback.
+- Runtime `set_account_enabled(True)` used a detached spawn that could
+  race with shutdown and leak a worker task against a closed store;
+  enables now bootstrap only on a running manager, and detached tasks
+  are observed.
+
+### Supported versions and recovery behaviour
+
+- Python ≥ 3.11 (developed and CI-tested on 3.14); discord.py-self 2.1.x
+  (pinned `>=2.1.0,<2.2`; the adapter is verified against 2.1.0 source).
+- Recovery: `pending`/`waiting` instances resume as-is; `running`
+  instances (uncertain outcome after a crash or hard shutdown) are reset
+  to `pending` at startup with attempt counts preserved — at-least-once
+  semantics; task handlers must tolerate duplicate side effects.
+  Persisted UTC cooldowns survive restarts (remaining = deadline − now).
+- Known limitations: per-account concurrency permits only; limiter
+  default policy governs adapter operations (per-task policies not yet
+  wired per-operation); `reaction_add` rich events fire only for cached
+  messages (raw events cover the rest); no CAPTCHA handling (permanent
+  failure, never bypassed); user-account automation may violate
+  Discord's ToS (see platform restrictions above).
+
+## Next milestone (Mudae task handlers, not started)
 
 SQLite state-store interface and migrations, then the task registry, mock
 adapter, and concurrent worker manager.
