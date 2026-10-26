@@ -50,7 +50,7 @@ from .registry import TaskOutcome, TaskStatus
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5000
 
 _MIGRATIONS: dict[int, str] = {
@@ -70,6 +70,13 @@ _MIGRATIONS: dict[int, str] = {
         cooldown_until TEXT,
         cooldown_scope TEXT,
         UNIQUE (account_id, task_id)
+    );
+    """,
+    2: """
+    CREATE TABLE IF NOT EXISTS scope_cooldowns (
+        scope TEXT PRIMARY KEY,
+        deadline TEXT NOT NULL,
+        server_directed INTEGER NOT NULL
     );
     """,
 }
@@ -429,6 +436,35 @@ class TaskStateStore:
             (_format_ts(self._clock()),),
         )
         return changed
+
+    # ----- scope cooldowns (rate limiter persistence) -----
+
+    async def set_scope_cooldown(
+        self, scope: str, deadline: datetime, *, server_directed: bool
+    ) -> None:
+        """Upsert a scope cooldown; only ever extends (max) and keeps the
+        server-directed flag sticky once set."""
+        await self._run(
+            self._update_sync,
+            "INSERT INTO scope_cooldowns (scope, deadline, server_directed) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT (scope) DO UPDATE SET "
+            "deadline = MAX(scope_cooldowns.deadline, excluded.deadline), "
+            "server_directed = MAX(scope_cooldowns.server_directed, excluded.server_directed)",
+            (scope, _format_ts(deadline), int(server_directed)),
+        )
+
+    async def active_scope_cooldowns(self) -> dict[str, tuple[datetime, bool]]:
+        """Return unexpired scope cooldowns as {scope: (deadline, server_directed)}."""
+        now = _format_ts(self._clock())
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT scope, deadline, server_directed FROM scope_cooldowns WHERE deadline > ?",
+            (now,),
+        )
+        return {
+            row["scope"]: (_parse_ts(row["deadline"]), bool(row["server_directed"])) for row in rows
+        }
 
     # ----- internals -----
 
