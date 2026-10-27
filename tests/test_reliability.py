@@ -31,13 +31,13 @@ class FlakyStoreWrapper:
         self.due_calls = 0
         self.raised = 0
 
-    async def due_instances(self) -> Any:
+    async def due_instances(self, account_id: int | None = None) -> Any:
         self.due_calls += 1
         if self._failures > 0:
             self._failures -= 1
             self.raised += 1
             raise DatabaseBusyError("simulated transient lock")
-        return await self._inner.due_instances()
+        return await self._inner.due_instances(account_id)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

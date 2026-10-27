@@ -150,11 +150,12 @@ async def test_cooldown_recorded_during_permit_wait_gates_operation() -> None:
 
     limiter = RateLimiter(default_policy=EffectivePolicy(max_concurrency=1))
 
-    async def first_op() -> None:
+    async def first_op() -> str:
         async with limiter.operation(account_id=ACCOUNT):
             await asyncio.Event().wait()  # hold the only permit
+            return "held"
 
-    async def second_op() -> None:
+    async def second_op() -> str:
         async with limiter.operation(account_id=ACCOUNT):
             return "ran"
 
