@@ -380,7 +380,7 @@ class WorkerManager:
             if profile is None:
                 return
             resolved = resolve_task_config(self._app_config, profile, record.task_id)
-            adapter = self._adapter_for(account_id)
+            adapter = await self._adapter_for(account_id)
             context = TaskContext(
                 account_id=account_id,
                 task_id=record.task_id,
@@ -457,13 +457,21 @@ class WorkerManager:
         base = policy.backoff_base_seconds * (2 ** max(0, attempts - 1))
         return float(min(base, policy.backoff_cap_seconds))
 
-    def _adapter_for(self, account_id: int) -> RateLimitedAdapter:
+    async def _adapter_for(self, account_id: int) -> RateLimitedAdapter:
         """Per-account rate-limited adapter.
 
         The limiter's default policy governs operations; per-task policy
-        resolution at the operation level is a future refinement.
+        resolution at the operation level is a future refinement. The
+        factory contract: each call must return a usable, unclosed adapter
+        (evicted adapters are rebuilt through it).
         """
         adapter = self._adapters.get(account_id)
+        if adapter is not None and not getattr(adapter._inner, "is_healthy", True):
+            # Belt-and-braces: evict terminal adapters (the Discord adapter
+            # also self-heals; this covers non-healing implementations).
+            self._adapters.pop(account_id, None)
+            await adapter.close()
+            adapter = None
         if adapter is None:
             adapter = RateLimitedAdapter(
                 self._adapter_factory(account_id),
