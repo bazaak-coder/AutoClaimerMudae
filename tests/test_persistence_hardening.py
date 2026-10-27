@@ -25,6 +25,9 @@ async def open_store(tmp_path: Path) -> TaskStateStore:
 
 def inject_sql_failure(store: TaskStateStore, keyword: str) -> None:
     """Make statements starting with *keyword* fail inside the worker thread."""
+    from collections.abc import Callable
+    from typing import Any, cast
+
     original = store._call_threaded  # noqa: SLF001
 
     def bomb(*args: object) -> object:
@@ -33,9 +36,10 @@ def inject_sql_failure(store: TaskStateStore, keyword: str) -> None:
     async def injected(fn: object, *args: object) -> object:
         if args and str(args[0]).startswith(keyword):
             return await original(bomb, *args)
-        return await original(fn, *args)
+        callable_fn = cast("Callable[..., Any]", fn)
+        return await original(callable_fn, *args)
 
-    store._call_threaded = injected  # type: ignore[method-assign]
+    store._call_threaded = injected  # type: ignore[assignment,method-assign]
 
 
 # C1: failed BEGIN must not leak the transaction-owner flag
