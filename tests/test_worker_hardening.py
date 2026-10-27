@@ -25,9 +25,9 @@ class ClaimFlakyStore:
         self.due_calls = 0
         self.claim_calls = 0
 
-    async def due_instances(self) -> Any:
+    async def due_instances(self, account_id: int | None = None) -> Any:
         self.due_calls += 1
-        return await self._inner.due_instances()
+        return await self._inner.due_instances(account_id)
 
     async def claim(self, instance_id: int) -> Any:
         self.claim_calls += 1
@@ -69,16 +69,24 @@ async def build_manager(
     )
     real_store = TaskStateStore(tmp_path / "state.db")
     await real_store.open()
+    created: list[MockAdapter] = []
+
+    def factory(account_id: int) -> MockAdapter:
+        adapter = MockAdapter()
+        created.append(adapter)
+        return adapter
+
     manager = WorkerManager(
         registry=registry,
         store=store if store is not None else real_store,
         limiter=RateLimiter(store=real_store),
         app_config=app,
         accounts=accounts,
-        adapter_factory=lambda account_id: MockAdapter(),
+        adapter_factory=factory,
         idle_interval_seconds=0.05,
     )
     manager.test_block_events = block_events  # type: ignore[attr-defined]
+    manager.test_adapters = created  # type: ignore[attr-defined]
     return manager, real_store, registry
 
 
@@ -182,6 +190,11 @@ async def test_cancelled_stop_still_completes_teardown_and_allows_restart(
     stop_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await stop_task
+    # N1: the finally still closed every adapter despite cancellation.
+    created: list[MockAdapter] = manager.test_adapters  # type: ignore[attr-defined]
+    assert created, "no adapter was ever built"
+    assert all(a.closed for a in created)
+    assert manager._adapters == {}  # noqa: SLF001
     # The finally-block completed teardown: a second stop returns cleanly
     # and a restart works.
     await manager.stop()
@@ -202,6 +215,7 @@ async def test_persistent_claim_failure_backs_off(tmp_path: Path) -> None:
     await asyncio.sleep(0.5)  # several idle intervals elapse
     await manager.stop()
     # idle 0.05s -> at most ~10 claim attempts in 0.5s (hot-spin: hundreds).
+    assert flaky.claim_calls >= 1, "claim path never exercised (vacuous test)"
     assert flaky.claim_calls <= 12, f"hot-spin: {flaky.claim_calls} claims in 0.5s"
     await store.close()
 
