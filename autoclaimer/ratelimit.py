@@ -359,7 +359,8 @@ class RateLimiter:
         CooldownError: records server-directed cooldowns on the configured
         scope kinds (persisted when a store is attached) and retries while
         attempts remain. Other recoverable errors back off exponentially.
-        Permanent errors propagate immediately.
+        Permanent errors and UncertainOutcomeError propagate immediately —
+        possibly-applied mutations are never blindly repeated.
         """
         effective = self._policy(policy)
         attempts_allowed = effective.retry_limit + 1

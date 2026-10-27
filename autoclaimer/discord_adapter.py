@@ -87,6 +87,7 @@ from .adapters import (
     ReactionAddedEvent,
     RecoverableAdapterError,
     SentMessage,
+    UncertainOutcomeError,
 )
 from .credentials import CredentialProvider
 
@@ -622,8 +623,9 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
         return PermanentAdapterError(f"HTTP {exc.status}: {exc}")
     if isinstance(exc, discord.InvalidData):
         # The library raised InvalidData when a button click got no response,
-        # which does NOT mean the interaction failed: outcome uncertain.
-        return RecoverableAdapterError(f"uncertain interaction outcome: {exc}")
+        # which does NOT mean the interaction failed: the action may have
+        # been applied. Never auto-retry (uncertain outcome policy).
+        return UncertainOutcomeError(f"uncertain interaction outcome: {exc}")
     if isinstance(exc, (discord.ConnectionClosed, discord.GatewayNotFound)):
         return RecoverableAdapterError(f"connection problem: {exc}")
     # Unknown library errors are treated as recoverable so bounded retries

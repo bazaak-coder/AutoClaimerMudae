@@ -36,6 +36,14 @@ class PermanentAdapterError(AdapterError):
     """Non-retryable failure (bad request, forbidden, missing target, ...)."""
 
 
+class UncertainOutcomeError(AdapterError):
+    """The platform may have applied the action but the response was lost.
+
+    Never auto-retried: the framework records the uncertainty instead of
+    blindly repeating a possibly-applied mutation (PR #1 finding 3).
+    """
+
+
 class CooldownError(RecoverableAdapterError):
     """Server-directed cooldown; the operation must not be retried before
     ``retry_after_seconds`` has elapsed."""
