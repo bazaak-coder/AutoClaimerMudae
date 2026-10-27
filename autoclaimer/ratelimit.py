@@ -296,6 +296,18 @@ class RateLimiter:
 
     # ----- public API -----
 
+    async def wait_scopes(self, account_id: int, route: str | None = None) -> None:
+        """Wait out active cooldowns for an account's scopes, holding nothing.
+
+        Schedulers call this BEFORE acquiring execution capacity so that
+        accounts parked on long server cooldowns do not starve unrelated
+        accounts (the in-``operation`` gate still re-checks afterwards).
+        """
+        scopes = [account_scope(account_id), GLOBAL_SCOPE]
+        if route is not None:
+            scopes.append(route_scope(route))
+        await self._wait_for_cooldowns(scopes)
+
     @asynccontextmanager
     async def operation(
         self,

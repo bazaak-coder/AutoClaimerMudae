@@ -47,7 +47,7 @@ from .adapters import (
 )
 from .config import resolve_task_config
 from .credentials import CredentialProvider
-from .models import AccountProfile, AccountsConfig, AppConfig
+from .models import AccountProfile, AccountsConfig, AppConfig, ConfigValidationError
 from .persistence import (
     PersistenceError,
     StateTransitionError,
@@ -213,7 +213,9 @@ class WorkerManager:
         ``settings.shutdown_timeout_seconds``) to finish; afterwards workers
         are cancelled and their instances deliberately stay ``running``
         (uncertain outcome; recovered on next start). The manager can be
-        :meth:`start`\\ ed again afterwards (restartable).
+        :meth:`start`\\ ed again afterwards (restartable). Cancellation of
+        ``stop()`` itself completes the teardown and re-raises, so the
+        manager is never left half-stopped (audit B2/B3).
         """
         if self._stopped:
             return
@@ -222,26 +224,31 @@ class WorkerManager:
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
         self._shutdown.set()
-        for worker in self._workers.values():
-            worker.nudge()
-        tasks = [w.task for w in self._workers.values() if w.task is not None]
-        if tasks:
-            try:
-                await asyncio.wait_for(asyncio.gather(*tasks), timeout=effective_timeout)
-            except TimeoutError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        for adapter in self._adapters.values():
-            await adapter.close()
-        self._adapters.clear()
-        # Workers stay registered (their done tasks report STOPPED via
-        # status()); _spawn_worker replaces finished workers on restart.
-        # Reset lifecycle so the manager can be started again.
-        self._shutdown.clear()
-        self._stopped = False
-        self._started = False
-        logger.info("framework stopped")
+        try:
+            for worker in self._workers.values():
+                worker.nudge()
+            tasks = [w.task for w in self._workers.values() if w.task is not None]
+            if tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=effective_timeout,
+                    )
+                except TimeoutError:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            for adapter in self._adapters.values():
+                await adapter.close()
+        finally:
+            self._adapters.clear()
+            # Workers stay registered (their done tasks report STOPPED via
+            # status()); _spawn_worker replaces finished workers on restart.
+            # Reset lifecycle so the manager can be started again.
+            self._shutdown.clear()
+            self._stopped = False
+            self._started = False
+            logger.info("framework stopped")
 
     async def __aenter__(self) -> WorkerManager:
         await self.start()
@@ -366,6 +373,23 @@ class WorkerManager:
 
     async def _execute(self, record: TaskInstanceRecord) -> None:
         account_id = record.account_id
+        # Resolve configuration BEFORE claiming: a validation failure must
+        # not strand a claimed (running) row forever (audit B1).
+        profile = self._profile(account_id)
+        if profile is None or record.task_id not in profile.tasks:
+            await self._terminal_without_claim(
+                record, "task not assigned to this account in current config"
+            )
+            return
+        try:
+            resolved = resolve_task_config(self._app_config, profile, record.task_id)
+        except ConfigValidationError as exc:
+            await self._terminal_without_claim(record, f"invalid task config: {exc}")
+            return
+        adapter = await self._adapter_for(account_id)
+        # Wait out account cooldowns BEFORE taking a global execution slot
+        # so parked accounts cannot starve others (audit B6).
+        await self._limiter.wait_scopes(account_id)
         async with self._execution_slots:
             if self._shutdown.is_set():
                 return  # not claimed yet: instance stays pending
@@ -374,13 +398,9 @@ class WorkerManager:
             except StateTransitionError:
                 return  # already claimed or terminal: never execute twice
             except PersistenceError:
-                logger.exception("Store error while claiming instance %s", record.id)
-                return
-            profile = self._profile(account_id)
-            if profile is None:
-                return
-            resolved = resolve_task_config(self._app_config, profile, record.task_id)
-            adapter = await self._adapter_for(account_id)
+                # Re-raise: the worker loop backs off one idle interval
+                # instead of hot-spinning on the next poll (audit B4).
+                raise
             context = TaskContext(
                 account_id=account_id,
                 task_id=record.task_id,
@@ -439,6 +459,19 @@ class WorkerManager:
         if outcome.status is TaskStatus.SUCCEEDED:
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
+            # Worker-level retries are bounded by the resolved policy's
+            # retry_limit; beyond it the instance fails permanently (audit B8).
+            policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
+            if claimed.attempt_count >= policy.retry_limit + 1:
+                await self._record(
+                    record.id,
+                    TaskOutcome(
+                        TaskStatus.FAILED_PERMANENT,
+                        message=f"worker retry limit ({policy.retry_limit}) exhausted",
+                    ),
+                    retry_at=None,
+                )
+                return
             delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
             await self._record(record.id, outcome, retry_at=self._wall() + timedelta(seconds=delay))
         else:
@@ -454,8 +487,26 @@ class WorkerManager:
 
     def _retry_delay(self, attempts: int, account_id: int, task_id: str) -> float:
         policy = policy_for(self._app_config, self._accounts, account_id, task_id)
-        base = policy.backoff_base_seconds * (2 ** max(0, attempts - 1))
+        # Clamp the exponent: 2**1024 overflows float beyond ~1025 attempts.
+        exponent = min(max(0, attempts - 1), 62)
+        base = policy.backoff_base_seconds * (2**exponent)
         return float(min(base, policy.backoff_cap_seconds))
+
+    async def _terminal_without_claim(self, record: TaskInstanceRecord, reason: str) -> None:
+        """Fail a never-claimed instance terminally (invalid config etc.)."""
+        logger.warning(
+            "task instance failed validation before execution",
+            extra={
+                "account_id": record.account_id,
+                "task_id": record.task_id,
+                "operation": "task.validate",
+                "outcome": "failed_permanent",
+            },
+        )
+        try:
+            await self._store.record_abandoned(record.id, reason)
+        except PersistenceError:
+            logger.exception("could not record abandonment for instance %s", record.id)
 
     async def _adapter_for(self, account_id: int) -> RateLimitedAdapter:
         """Per-account rate-limited adapter.
@@ -496,6 +547,8 @@ class WorkerManager:
         but finished task is replaced (PR #1 finding 6). A stopped or
         never-started manager defers spawning to ``start()``.
         """
+        if account_id not in self._enabled:
+            raise ValueError(f"unknown account {account_id}; not present in configuration")
         self._enabled[account_id] = enabled
         if enabled and self._started and not self._stopped:
             worker = self._workers.get(account_id)

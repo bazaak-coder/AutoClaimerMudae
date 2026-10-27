@@ -455,6 +455,25 @@ class TaskStateStore:
         )
         return changed
 
+    async def record_abandoned(self, instance_id: int, message: str) -> TaskInstanceRecord:
+        """pending|waiting -> failed without ever claiming (invalid config etc.)."""
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'failed', last_outcome = ?, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status IN ('pending', 'waiting')",
+            (_outcome_json(TaskOutcome(TaskStatus.FAILED_PERMANENT, message)), now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            if current.status.value != "failed":
+                raise StateTransitionError(
+                    f"Cannot abandon task instance {instance_id} from state "
+                    f"'{current.status.value}'."
+                )
+        return await self.get_instance(instance_id)
+
     # ----- scope cooldowns (rate limiter persistence) -----
 
     async def set_scope_cooldown(
