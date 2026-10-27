@@ -509,9 +509,15 @@ async def test_enable_replaces_dead_worker_and_resumes_pending_work(
 
     h.manager.set_account_enabled(ACCOUNT, False)
     h.manager.set_account_enabled(ACCOUNT, True)  # revive
-    await asyncio.sleep(0.05)
-    new_task = h.manager._workers[ACCOUNT].task  # noqa: SLF001
-    assert new_task is not None
+    # Poll (no fixed sleep): the detached enable must spawn a replacement.
+    deadline = asyncio.get_running_loop().time() + 3.0
+    new_task = old_task
+    while new_task is old_task and asyncio.get_running_loop().time() < deadline:
+        candidate = h.manager._workers[ACCOUNT].task  # noqa: SLF001
+        if candidate is not None and candidate is not old_task:
+            new_task = candidate
+            break
+        await asyncio.sleep(0.01)
     assert new_task is not old_task
     assert not new_task.done()
     await wait_for_status(h.store, ACCOUNT, "queued", TaskInstanceState.SUCCEEDED)
