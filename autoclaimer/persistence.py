@@ -378,15 +378,28 @@ class TaskStateStore:
             )
         return _safe_records(rows)
 
-    async def due_instances(self) -> tuple[TaskInstanceRecord, ...]:
-        """Claimable instances whose retry time (if any) has passed."""
+    async def due_instances(self, account_id: int | None = None) -> tuple[TaskInstanceRecord, ...]:
+        """Claimable instances whose retry time (if any) has passed.
+
+        ``account_id`` scopes the query in SQL so per-account worker
+        loops stop scanning every account's rows (audit perf batch 6).
+        """
         now = _format_ts(self._clock())
-        rows = await self._run(
-            self._fetchall_sync,
-            "SELECT * FROM task_instances WHERE status IN ('pending', 'waiting') "
-            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
-            (now,),
-        )
+        if account_id is None:
+            rows = await self._run(
+                self._fetchall_sync,
+                "SELECT * FROM task_instances WHERE status IN ('pending', 'waiting') "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+                (now,),
+            )
+        else:
+            rows = await self._run(
+                self._fetchall_sync,
+                "SELECT * FROM task_instances WHERE account_id = ? "
+                "AND status IN ('pending', 'waiting') "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+                (account_id, now),
+            )
         return _safe_records(rows)
 
     # ----- state changes -----
@@ -506,6 +519,13 @@ class TaskStateStore:
     ) -> None:
         """Upsert a scope cooldown; only ever extends (max) and keeps the
         server-directed flag sticky once set."""
+        now = _format_ts(self._clock())
+        # Opportunistic retention: expired rows never accumulate.
+        await self._run(
+            self._update_sync,
+            "DELETE FROM scope_cooldowns WHERE deadline <= ?",
+            (now,),
+        )
         await self._run(
             self._update_sync,
             "INSERT INTO scope_cooldowns (scope, deadline, server_directed) "

@@ -352,9 +352,9 @@ class WorkerManager:
         return (-self._priority(record.task_id), due_at.isoformat(), record.id)
 
     async def _next_due(self, account_id: int) -> TaskInstanceRecord | None:
-        records = await self._store.due_instances()
-        candidates = [r for r in records if r.account_id == account_id]
-        candidates.sort(key=self._order)
+        # SQL-side account filter: no more full-table scans per account.
+        records = await self._store.due_instances(account_id)
+        candidates = sorted(records, key=self._order)
         return candidates[0] if candidates else None
 
     async def _soon_delay(self, account_id: int) -> float:
