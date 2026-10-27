@@ -485,6 +485,42 @@ async def test_manager_is_restartable(tmp_path: Path) -> None:
     await h.manager.stop()
 
 
+async def test_enable_replaces_dead_worker_and_resumes_pending_work(
+    tmp_path: Path,
+) -> None:
+    """PR #1 finding 6: re-enabling must replace a registered dead worker."""
+    h = await build_harness(
+        tmp_path,
+        tasks_raw={
+            "stuck": task("block", priority=10),  # in-flight when worker dies
+            "queued": task("noop"),
+        },
+        accounts_raw=[{"id": ACCOUNT, "tasks": ["stuck", "queued"]}],
+    )
+    await h.manager.start()
+    await wait_for_status(h.store, ACCOUNT, "stuck", TaskInstanceState.RUNNING)
+    old_task = h.manager._workers[ACCOUNT].task  # noqa: SLF001
+    assert old_task is not None
+    old_task.cancel()  # simulate an unrecoverable worker death
+    await asyncio.sleep(0)
+    assert old_task.done()
+    status = await h.manager.status()
+    assert status.workers[0].state is WorkerState.STOPPED  # observable, no auto-restart
+
+    h.manager.set_account_enabled(ACCOUNT, False)
+    h.manager.set_account_enabled(ACCOUNT, True)  # revive
+    await asyncio.sleep(0.05)
+    new_task = h.manager._workers[ACCOUNT].task  # noqa: SLF001
+    assert new_task is not None
+    assert new_task is not old_task
+    assert not new_task.done()
+    await wait_for_status(h.store, ACCOUNT, "queued", TaskInstanceState.SUCCEEDED)
+    stuck = await h.store.get_instance_by_ids(ACCOUNT, "stuck")
+    assert stuck.status is TaskInstanceState.RUNNING  # uncertain outcome preserved
+    block_event(h, ACCOUNT, "stuck").set()
+    await h.manager.stop()
+
+
 async def test_store_closes_cleanly_after_manager_stop(tmp_path: Path) -> None:
     h = await build_harness(
         tmp_path,
