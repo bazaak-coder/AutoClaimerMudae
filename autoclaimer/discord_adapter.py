@@ -104,6 +104,7 @@ class DiscordAdapter:
         account_id: int,
         credentials: CredentialProvider,
         client: discord.Client | None = None,
+        client_factory: Callable[[], Any] | None = None,
         jitter_range: tuple[float, float] = _DEFAULT_JITTER_RANGE,
         jitter: Callable[[float, float], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
@@ -112,7 +113,11 @@ class DiscordAdapter:
     ) -> None:
         self._account_id = account_id
         self._credentials = credentials
-        self._client = client if client is not None else discord.Client()
+        # The library's Client is terminal after close(): a restart needs a
+        # fresh instance. An injected client is consumed by the first start;
+        # client_factory (or the default) supplies replacements afterwards.
+        self._client_factory = client_factory or (lambda: discord.Client())
+        self._client = client if client is not None else self._client_factory()
         self._jitter_range = jitter_range
         self._jitter = jitter or (lambda low, high: random.uniform(low, high))
         self._sleep = sleep or asyncio.sleep
@@ -124,6 +129,28 @@ class DiscordAdapter:
         self._closed = False
         self._startup_timeout = startup_timeout
         self._events = EventDispatcher(queue_size=event_queue_size, name=f"discord-{account_id}")
+
+    @property
+    def is_healthy(self) -> bool:
+        """True when the adapter is usable: not closed and connected.
+
+        A started adapter whose connection task has died is unhealthy until
+        it restarts (``start()`` / any operation triggers recovery).
+        """
+        if self._closed:
+            return False
+        if not self._started:
+            return True
+        task = self._connect_task
+        return task is not None and not task.done()
+
+    def _reset_for_restart(self) -> None:
+        """Discard the terminal client and lifecycle state for a retry."""
+        self._client = self._client_factory()
+        self._connect_task = None
+        self._connect_error = None
+        self._started = False
+        self._bridges_registered = False
 
     # ----- event subscription -----
 
@@ -139,18 +166,24 @@ class DiscordAdapter:
     # ----- lifecycle -----
 
     async def start(self) -> None:
-        """Log in and connect; idempotent; never hangs on early failure.
+        """Log in and connect; never hangs on early failure; restarts.
 
         Readiness races the connection task and a startup timeout: if the
         connection dies (or ends) before READY, its error surfaces as a
         typed adapter error; on timeout everything is cleaned up. Failed
-        startups are retryable.
+        startups are retryable, and a ``start()`` on an adapter whose
+        connection died after READY performs a full restart with a fresh
+        client (the library's client is terminal after close()).
         """
         async with self._start_lock:
             if self._closed:
                 raise AdapterError("adapter is closed")
             if self._started:
-                return
+                task = self._connect_task
+                if task is not None and not task.done():
+                    return  # healthy and running
+                # Fatal disconnect after READY: rebuild and reconnect.
+                self._reset_for_restart()
             self._register_bridges()
             token = self._credentials.get_token(self._account_id)
             try:
@@ -163,6 +196,9 @@ class DiscordAdapter:
                 name=f"autoclaimer-discord-{self._account_id}",
             )
             self._connect_task.add_done_callback(self._connect_finished)
+            if self._closed:  # close() raced us: abort inline
+                await self._abort_startup(None)
+                raise AdapterError("adapter closed during startup")
             self._started = True
             logger.info(
                 "discord client connecting",
@@ -210,9 +246,10 @@ class DiscordAdapter:
         await self._abort_startup(ready_task)
         raise AdapterError(f"discord startup timed out after {self._startup_timeout:.1f}s")
 
-    async def _abort_startup(self, ready_task: asyncio.Task[None]) -> None:
+    async def _abort_startup(self, ready_task: asyncio.Task[None] | None) -> None:
         """Tear down a failed startup so ``start()`` can be retried."""
-        ready_task.cancel()
+        if ready_task is not None:
+            ready_task.cancel()
         connect_task = self._connect_task
         self._connect_task = None
         self._started = False
@@ -227,6 +264,10 @@ class DiscordAdapter:
             await self._client.close()
         except discord.DiscordException:
             pass
+        # The library client is terminal after close(): discard it so the
+        # next start() builds a fresh one via the factory.
+        self._client = self._client_factory()
+        self._bridges_registered = False
         logger.warning(
             "discord startup aborted; retryable",
             extra={
@@ -268,21 +309,30 @@ class DiscordAdapter:
     async def _ensure_ready(self) -> None:
         if self._closed:
             raise AdapterError("adapter is closed")
-        if self._connect_error is not None:
-            raise RecoverableAdapterError(
-                f"discord connection lost; restart the adapter "
-                f"({type(self._connect_error).__name__})"
-            )
-        if not self._started:
+        if not self._started or self._connect_task is None or self._connect_task.done():
+            # Not started, or the connection died: (re)start with a fresh
+            # client — bounded by the startup race, never a bare wait.
             await self.start()
-        else:
-            await self._client.wait_until_ready()
+            return
+        try:
+            await asyncio.wait_for(self._client.wait_until_ready(), timeout=self._startup_timeout)
+        except TimeoutError as exc:
+            raise RecoverableAdapterError(
+                f"discord gateway not ready within {self._startup_timeout:.1f}s"
+            ) from exc
+        if self._closed:
+            raise AdapterError("adapter is closed")
 
     async def close(self) -> None:
-        """Close the client, stop event delivery, and await tasks; idempotent."""
+        """Close the client, stop event delivery, and await tasks; idempotent.
+
+        Outer cancellation during teardown completes the synchronous cleanup
+        first and then re-raises, so teardown is never abandoned halfway.
+        """
         if self._closed:
             return
         self._closed = True
+        cancelled = False
         try:
             await self._events.stop()
         finally:
@@ -293,7 +343,14 @@ class DiscordAdapter:
                 if task is not None and not task.done():
                     try:
                         await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-                    except (TimeoutError, asyncio.CancelledError):
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        task.cancel()
+                        try:
+                            await asyncio.shield(task)
+                        except (asyncio.CancelledError, discord.DiscordException):
+                            pass
+                    except TimeoutError:
                         task.cancel()
                         try:
                             await task
@@ -303,6 +360,8 @@ class DiscordAdapter:
             "discord client closed",
             extra={"account_id": self._account_id, "operation": "discord.close"},
         )
+        if cancelled:
+            raise asyncio.CancelledError
 
     # ----- helpers -----
 
