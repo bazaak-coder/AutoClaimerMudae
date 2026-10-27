@@ -5,7 +5,8 @@ dispatched through ``asyncio.to_thread`` instead of adding ``aiosqlite``.
 aiosqlite is itself a thread wrapper over ``sqlite3``; staying stdlib-only
 honors the project's zero-runtime-dependency policy while keeping database
 work off the event loop. All statements run on worker threads serialized by
-an asyncio lock; task-scoped transactions (ContextVar flag) let nested store
+an asyncio lock; task-scoped transactions (ContextVar holding the owning
+task) let nested store
 calls share one critical section without letting concurrent coroutines
 bypass the lock.
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -47,6 +49,8 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from .registry import TaskOutcome, TaskStatus
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -177,7 +181,9 @@ class TaskStateStore:
         self._lock = asyncio.Lock()
         # Task-scoped transaction flag: re-entrancy must never let a second
         # coroutine bypass the lock while another holds it.
-        self._in_transaction: ContextVar[bool] = ContextVar("autoclaimer_txn", default=False)
+        self._txn_owner: ContextVar[object | None] = ContextVar(
+            "autoclaimer_txn_owner", default=None
+        )
 
     # ----- lifecycle -----
 
@@ -198,11 +204,13 @@ class TaskStateStore:
             try:
                 self._conn = await asyncio.to_thread(_connect)
                 await asyncio.to_thread(self._migrate_sync, self._conn)
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, PersistenceError) as exc:
                 if self._conn is not None:
                     await asyncio.to_thread(self._conn.close)
                     self._conn = None
-                raise _map_sqlite_error(exc) from exc
+                if isinstance(exc, sqlite3.Error):
+                    raise _map_sqlite_error(exc) from exc
+                raise
 
     async def close(self) -> None:
         """Close the connection; safe to call more than once."""
@@ -254,7 +262,7 @@ class TaskStateStore:
 
     async def _run(self, fn: Callable[..., _T], *args: Any) -> _T:
         """Run one database call; inside a transaction the caller's lock covers us."""
-        if self._in_transaction.get():
+        if self._txn_owner.get() is asyncio.current_task():
             return await self._call_threaded(fn, *args)
         async with self._lock:
             return await self._call_threaded(fn, *args)
@@ -284,21 +292,38 @@ class TaskStateStore:
         Re-entrant within the same task (nested ``transaction()`` blocks join
         the outermost one). Other tasks block on the store lock until the
         transaction finishes, keeping the single connection serialized.
+        Child asyncio tasks created inside the body do NOT join: they
+        block on the store lock like any other task, so do not await
+        store-using child tasks inside a transaction body (self-deadlock).
         """
-        if self._in_transaction.get():
+        if self._txn_owner.get() is not None:
             yield
             return
         async with self._lock:
-            token = self._in_transaction.set(True)
-            await asyncio.to_thread(self._connection().execute, "BEGIN IMMEDIATE")
+            token = self._txn_owner.set(asyncio.current_task())
+            try:
+                await self._call_threaded(self._connection().execute, "BEGIN IMMEDIATE")
+            except BaseException:
+                self._txn_owner.reset(token)
+                raise
             try:
                 yield
             except BaseException:
-                self._in_transaction.reset(token)
-                await asyncio.to_thread(self._connection().execute, "ROLLBACK")
+                self._txn_owner.reset(token)
+                try:
+                    await self._call_threaded(self._connection().execute, "ROLLBACK")
+                except sqlite3.Error:
+                    logger.exception("rollback after transaction failure also failed")
                 raise
-            self._in_transaction.reset(token)
-            await asyncio.to_thread(self._connection().execute, "COMMIT")
+            self._txn_owner.reset(token)
+            try:
+                await self._call_threaded(self._connection().execute, "COMMIT")
+            except BaseException:
+                try:
+                    await self._call_threaded(self._connection().execute, "ROLLBACK")
+                except sqlite3.Error:
+                    logger.exception("rollback after failed commit also failed")
+                raise
 
     # ----- queries -----
 
@@ -333,7 +358,7 @@ class TaskStateStore:
                 "SELECT * FROM task_instances WHERE status = ?",
                 (status.value,),
             )
-        return tuple(_row_to_record(row) for row in rows)
+        return _safe_records(rows)
 
     async def list_instances_by_account(
         self, account_id: int, status: TaskInstanceState | None = None
@@ -351,7 +376,7 @@ class TaskStateStore:
                 "SELECT * FROM task_instances WHERE account_id = ? AND status = ?",
                 (account_id, status.value),
             )
-        return tuple(_row_to_record(row) for row in rows)
+        return _safe_records(rows)
 
     async def due_instances(self) -> tuple[TaskInstanceRecord, ...]:
         """Claimable instances whose retry time (if any) has passed."""
@@ -362,7 +387,7 @@ class TaskStateStore:
             "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
             (now,),
         )
-        return tuple(_row_to_record(row) for row in rows)
+        return _safe_records(rows)
 
     # ----- state changes -----
 
@@ -549,7 +574,32 @@ def _outcome_json(outcome: TaskOutcome) -> str:
     return json.dumps({"status": outcome.status.value, "message": outcome.message})
 
 
+def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]:
+    """Decode rows, skipping (with an error log) corrupt ones.
+
+    One bad row must not break every account's scheduling scan (audit C4).
+    """
+    decoded: list[TaskInstanceRecord] = []
+    for row in rows:
+        try:
+            decoded.append(_row_to_record(row))
+        except PersistenceError:
+            logger.exception("skipping corrupt task_instances row")
+    return tuple(decoded)
+
+
 def _row_to_record(row: sqlite3.Row) -> TaskInstanceRecord:
+    try:
+        return _decode_row(row)
+    except (ValueError, KeyError, TypeError) as exc:
+        # Corrupt row (bad JSON / timestamp / enum): a typed error carrying
+        # the row id so callers can quarantine instead of crashing raw.
+        raise PersistenceError(
+            f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
     outcome_raw = row["last_outcome"]
     outcome: TaskOutcome | None = None
     if outcome_raw is not None:
