@@ -108,6 +108,7 @@ class DiscordAdapter:
         jitter: Callable[[float, float], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         event_queue_size: int = 64,
+        startup_timeout: float = 60.0,
     ) -> None:
         self._account_id = account_id
         self._credentials = credentials
@@ -121,6 +122,7 @@ class DiscordAdapter:
         self._started = False
         self._bridges_registered = False
         self._closed = False
+        self._startup_timeout = startup_timeout
         self._events = EventDispatcher(queue_size=event_queue_size, name=f"discord-{account_id}")
 
     # ----- event subscription -----
@@ -137,7 +139,13 @@ class DiscordAdapter:
     # ----- lifecycle -----
 
     async def start(self) -> None:
-        """Log in and connect; idempotent."""
+        """Log in and connect; idempotent; never hangs on early failure.
+
+        Readiness races the connection task and a startup timeout: if the
+        connection dies (or ends) before READY, its error surfaces as a
+        typed adapter error; on timeout everything is cleaned up. Failed
+        startups are retryable.
+        """
         async with self._start_lock:
             if self._closed:
                 raise AdapterError("adapter is closed")
@@ -149,6 +157,7 @@ class DiscordAdapter:
                 await self._client.login(token)
             except discord.DiscordException as exc:
                 raise _translate(exc) from exc
+            self._connect_error = None
             self._connect_task = asyncio.create_task(
                 self._client.connect(reconnect=True),
                 name=f"autoclaimer-discord-{self._account_id}",
@@ -162,7 +171,70 @@ class DiscordAdapter:
                     "operation": "discord.start",
                 },
             )
-        await self._client.wait_until_ready()
+        await self._await_ready()
+
+    async def _await_ready(self) -> None:
+        """Race readiness against connection death and the startup timeout."""
+        assert self._connect_task is not None
+        ready_task = asyncio.create_task(self._client.wait_until_ready())
+        try:
+            done, _pending = await asyncio.wait(
+                {ready_task, self._connect_task},
+                timeout=self._startup_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            ready_task.cancel()
+            raise
+        if ready_task in done:
+            ready_error = ready_task.exception()
+            if ready_error is not None:
+                await self._abort_startup(ready_task)
+                raise _translate_error(ready_error)
+            if self._closed:
+                await self._abort_startup(ready_task)
+                raise AdapterError("adapter closed during startup")
+            return  # ready: connection task keeps running in the background
+        if self._connect_task in done:
+            # Connection ended before readiness (crash or early return).
+            # Capture the error BEFORE _abort_startup resets it.
+            connect_error = self._connect_error
+            error: BaseException = (
+                connect_error
+                if connect_error is not None
+                else _UncleanExit("connection ended before the gateway reached READY")
+            )
+            await self._abort_startup(ready_task)
+            raise _translate_error(error)
+        # Timeout: neither readiness nor failure — abort cleanly.
+        await self._abort_startup(ready_task)
+        raise AdapterError(f"discord startup timed out after {self._startup_timeout:.1f}s")
+
+    async def _abort_startup(self, ready_task: asyncio.Task[None]) -> None:
+        """Tear down a failed startup so ``start()`` can be retried."""
+        ready_task.cancel()
+        connect_task = self._connect_task
+        self._connect_task = None
+        self._started = False
+        self._connect_error = None
+        if connect_task is not None and not connect_task.done():
+            connect_task.cancel()
+            try:
+                await connect_task
+            except (asyncio.CancelledError, discord.DiscordException):
+                pass
+        try:
+            await self._client.close()
+        except discord.DiscordException:
+            pass
+        logger.warning(
+            "discord startup aborted; retryable",
+            extra={
+                "account_id": self._account_id,
+                "operation": "discord.start",
+                "outcome": "startup_aborted",
+            },
+        )
 
     def _register_bridges(self) -> None:
         """Attach inbound-event bridges once; reconnects never duplicate."""
@@ -409,6 +481,17 @@ class DiscordAdapter:
                     "outcome": "dropped",
                 },
             )
+
+
+class _UncleanExit(Exception):
+    """Internal marker: the connection task ended without a library error."""
+
+
+def _translate_error(error: BaseException) -> AdapterError:
+    """Translate any startup failure into a typed adapter error."""
+    if isinstance(error, discord.DiscordException):
+        return _translate(error)
+    return RecoverableAdapterError(f"discord startup failed: {type(error).__name__}: {error}")
 
 
 def _named_bridge(event_name: str, handler: Callable[..., Awaitable[None]]) -> Any:
