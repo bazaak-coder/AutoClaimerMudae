@@ -10,16 +10,20 @@ permissions:
 
 jobs:
   quality:
-    name: Lint, type-check, test
+    name: Lint, type-check, test (py${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
 
-      - name: Install uv (with Python 3.14)
+      - name: Install uv (with Python ${{ matrix.python-version }})
         uses: astral-sh/setup-uv@v6.4.0
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies (locked, with dev/test extras)
         run: uv sync --locked --all-extras
