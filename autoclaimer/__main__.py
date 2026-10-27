@@ -42,7 +42,9 @@ def build_demo_registry() -> TaskRegistry:
 async def async_main(config_path: str, accounts_path: str) -> int:
     app, accounts = load_config(config_path, accounts_path)
     logger = setup_logging(app.logging)
-    store = TaskStateStore(Path(app.logging.log_file).parent / "state.db")
+    # State DB lives next to the config (decoupled from log_file so a log
+    # path can never relocate or name the database).
+    store = TaskStateStore(Path(config_path).resolve().parent / "state.db")
     await store.open()
     limiter = RateLimiter(default_policy=resolve_policy(app.ratelimit), store=store)
     controller = AutoClaimerController(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -63,10 +64,12 @@ def _bool(value: Any, where: str) -> bool:
     return value
 
 
-def _int(value: Any, where: str, *, minimum: int = 0) -> int:
+def _int(value: Any, where: str, *, minimum: int = 0, maximum: int | None = None) -> int:
     # bool is a subclass of int, so explicitly reject it.
     if type(value) is not int or value < minimum:
         raise ConfigValidationError(f"{where} must be an integer >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise ConfigValidationError(f"{where} must be an integer <= {maximum}.")
     return value
 
 
@@ -95,9 +98,12 @@ def _parameters(value: Any, where: str) -> dict[str, Any]:
                 "must be supplied by a secure credential provider and never "
                 "stored in plaintext JSON configuration."
             )
-    # Ensure values can be represented as JSON and don't contain NaN/Infinity.
+    # Ensure values can be represented as JSON, don't contain NaN/Infinity,
+    # and stay bounded (64 KiB) so configs cannot balloon memory.
     try:
-        json.dumps(obj, allow_nan=False)
+        encoded = json.dumps(obj, allow_nan=False)
+        if len(encoded) > 65536:
+            raise ConfigValidationError(f"{where} exceeds the 64 KiB size limit.")
     except (TypeError, ValueError) as exc:
         raise ConfigValidationError(f"{where} must contain JSON-compatible values: {exc}") from exc
     return dict(obj)
@@ -113,9 +119,10 @@ _RATELIMIT_KEYS = {
 
 
 def _duration(value: Any, where: str, *, minimum: float = 0.0) -> float:
-    # bool is a subclass of int, so explicitly reject it; accept int or float.
-    if type(value) not in (int, float) or value < minimum:
-        raise ConfigValidationError(f"{where} must be a number >= {minimum}.")
+    # bool is a subclass of int, so explicitly reject it; accept int or
+    # float — but never NaN/Infinity (JSON parsers accept both).
+    if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
+        raise ConfigValidationError(f"{where} must be a finite number >= {minimum}.")
     return float(value)
 
 
@@ -127,7 +134,7 @@ def _parse_ratelimit(raw: Any, where: str) -> RateLimitPolicy:
         max_concurrency = _int(obj["max_concurrency"], f"{where}.max_concurrency", minimum=1)
     retry_limit = None
     if "retry_limit" in obj:
-        retry_limit = _int(obj["retry_limit"], f"{where}.retry_limit")
+        retry_limit = _int(obj["retry_limit"], f"{where}.retry_limit", maximum=100)
     return RateLimitPolicy(
         min_interval_seconds=(
             _duration(obj["min_interval_seconds"], f"{where}.min_interval_seconds")
@@ -155,6 +162,12 @@ def _parse_logging(raw: Any, where: str) -> LoggingSettings:
     log_file = obj.get("log_file", "autoclaimer.log")
     if not isinstance(log_file, str) or not log_file.strip():
         raise ConfigValidationError(f"{where}.log_file must be a non-empty string.")
+    if ".." in Path(log_file).parts or ".." in {
+        seg for seg in log_file.replace(chr(92), "/").split("/")
+    }:
+        raise ConfigValidationError(
+            f"{where}.log_file must not traverse out of its directory ('..' rejected)."
+        )
     level = obj.get("level", "INFO")
     if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
         raise ConfigValidationError(
@@ -162,8 +175,18 @@ def _parse_logging(raw: Any, where: str) -> LoggingSettings:
         )
     return LoggingSettings(
         log_file=log_file,
-        max_bytes=_int(obj.get("max_bytes", 1_048_576), f"{where}.max_bytes", minimum=1024),
-        backup_count=_int(obj.get("backup_count", 3), f"{where}.backup_count", minimum=1),
+        max_bytes=_int(
+            obj.get("max_bytes", 1_048_576),
+            f"{where}.max_bytes",
+            minimum=1024,
+            maximum=1_073_741_824,
+        ),
+        backup_count=_int(
+            obj.get("backup_count", 3),
+            f"{where}.backup_count",
+            minimum=1,
+            maximum=100,
+        ),
         level=level.upper(),
     )
 
@@ -217,11 +240,13 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             s.get("max_concurrent_accounts", 3),
             "config.settings.max_concurrent_accounts",
             minimum=1,
+            maximum=64,
         ),
         shutdown_timeout_seconds=_int(
             s.get("shutdown_timeout_seconds", 15),
             "config.settings.shutdown_timeout_seconds",
             minimum=1,
+            maximum=600,
         ),
     )
 

@@ -27,10 +27,12 @@ _REDACTED_TOKEN = "[REDACTED-TOKEN]"
 _REDACTED_VALUE = "[REDACTED]"
 
 _WEBHOOK_RE = re.compile(r"https?://discord(?:app)?\.com/api/webhooks/\S+")
-# Discord-style token shape: three dot-separated base64url segments.
-_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{20,}\b")
+# Discord-style token shape: three dot-separated base64url segments
+# (short user-ID segments included — the 20-char floor missed short IDs).
+_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{20,}\b")
 _KEY_VALUE_RE = re.compile(
-    r"(?i)\b(authorization|token|password|secret|api_key)\b['\"]?\s*[:=]\s*\S+"
+    r"(?i)\b(authorization|token|password|passwd|secret|cookie|session"
+    r"|session_id|api_key|apikey|client_secret|credential)\b['\"]?\s*[:=]\s*\S+"
 )
 
 _STRUCTURED_FIELDS = ("account_id", "task_id", "operation", "outcome", "scope")
@@ -99,4 +101,10 @@ def setup_logging(
         logger.addHandler(stream_handler)
 
     logger.propagate = False
+
+    # Third-party library logs (discord.*) must pass the same redaction;
+    # route them through this logger instead of the unredacted root.
+    discord_logger = logging.getLogger("discord")
+    discord_logger.handlers = list(logger.handlers)
+    discord_logger.propagate = False
     return logger

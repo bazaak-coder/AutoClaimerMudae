@@ -29,12 +29,12 @@ import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .adapters import PlatformAdapter
+from .adapters import AdapterError, PlatformAdapter
 from .credentials import CredentialProvider
 from .logging_setup import redact_text
 from .models import AccountsConfig, AppConfig
-from .persistence import TaskInstanceState, TaskStateStore
-from .ratelimit import RateLimiter
+from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
+from .ratelimit import RateLimiter, RateLimitError
 from .registry import TaskRegistry
 from .workers import WorkerManager
 
@@ -227,19 +227,22 @@ class CliSession:
     async def run(self) -> None:
         """Read commands until quit/EOF/Ctrl+C, then shut down gracefully."""
         self._emit("AutoClaimer CLI — type 'help' for commands")
-        while True:
-            try:
-                line = await self._read_line("autoclaimer> ")
-            except (EOFError, StopAsyncIteration):
-                self._emit("EOF — shutting down")
-                break
-            except KeyboardInterrupt:
-                self._emit("interrupted — shutting down")
-                break
-            if not await self.run_once(line):
-                break
-        await self._controller.shutdown()
-        self._emit("shutdown complete")
+        try:
+            while True:
+                try:
+                    line = await self._read_line("autoclaimer> ")
+                except (EOFError, StopAsyncIteration):
+                    self._emit("EOF — shutting down")
+                    break
+                except KeyboardInterrupt:
+                    self._emit("interrupted — shutting down")
+                    break
+                if not await self.run_once(line):
+                    break
+        finally:
+            # Shutdown always runs, even if a command escaped error handling.
+            await self._controller.shutdown()
+            self._emit("shutdown complete")
 
     async def run_once(self, line: str) -> bool:
         """Parse and execute one command; False means exit the loop."""
@@ -268,6 +271,10 @@ class CliSession:
                 self._emit(result)
         except ValueError as exc:
             self._emit(f"error: {exc}")
+        except (PersistenceError, RateLimitError, AdapterError) as exc:
+            # Transient store/limiter/adapter problems must not kill the
+            # REPL or skip the graceful shutdown path.
+            self._emit(f"error: {type(exc).__name__}: {exc}")
         return True
 
     # ----- command handlers (validated) -----
