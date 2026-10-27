@@ -480,15 +480,23 @@ class WorkerManager:
         return self._enabled.get(account_id, False)
 
     def set_account_enabled(self, account_id: int, enabled: bool) -> None:
-        """Enable/disable an account. Disabling stops new work only."""
+        """Enable/disable an account. Disabling stops new work only.
+
+        Policy: an unexpectedly dead worker is reported STOPPED by
+        ``status()`` and is NOT auto-restarted; enabling (or
+        disable-then-enable) always yields a live worker — a registered
+        but finished task is replaced (PR #1 finding 6). A stopped or
+        never-started manager defers spawning to ``start()``.
+        """
         self._enabled[account_id] = enabled
-        if enabled and self._started and not self._stopped and account_id not in self._workers:
-            # Runtime enable on a RUNNING manager: materialize + spawn.
-            # A stopped/never-started manager defers to start(), which
-            # spawns workers for every enabled account (audit fix: a
-            # detached spawn after stop() would leak a worker task
-            # against a possibly-closed store).
-            self._spawn_worker_enabled(account_id)
+        if enabled and self._started and not self._stopped:
+            worker = self._workers.get(account_id)
+            dead = worker is None or worker.task is None or worker.task.done()
+            if dead:
+                # Runtime enable on a RUNNING manager: materialize + spawn
+                # a replacement (also revives registered-but-dead workers).
+                self._spawn_worker_enabled(account_id)
+                return  # the fresh worker starts work on its own
         worker = self._workers.get(account_id)
         if worker is not None:
             worker.nudge()
