@@ -140,18 +140,18 @@ async def test_cli_survives_store_error_and_shuts_down(tmp_path: Path) -> None:
     )
 
     class BusyStore(TaskStateStore):
-        async def list_instances(self, status: Any = None) -> tuple:  # type: ignore[override]
+        async def list_instances(self, status: Any = None) -> tuple[Any, ...]:
             raise DatabaseBusyError("locked")
 
         async def close(self) -> None:
             if not getattr(self, "_closed_once", False):
-                self._closed_once = True  # type: ignore[attr-defined]
+                self._closed_once = True
 
     store = BusyStore(tmp_path / "unused.db")  # never opened; overridden methods
     controller = AutoClaimerController(
         app_config=app,
         accounts=accounts,
-        store=store,  # type: ignore[arg-type]
+        store=store,
         limiter=RateLimiter(),
         registry=registry,
         adapter_factory=lambda account_id: MockAdapter(),
