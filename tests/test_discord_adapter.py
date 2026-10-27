@@ -14,6 +14,7 @@ from autoclaimer.adapters import (
     PermanentAdapterError,
     RecoverableAdapterError,
     SentMessage,
+    UncertainOutcomeError,
 )
 from autoclaimer.credentials import CredentialProviderError
 from autoclaimer.discord_adapter import DiscordAdapter
@@ -480,12 +481,12 @@ async def test_press_missing_component_is_permanent() -> None:
     await adapter.close()
 
 
-async def test_button_click_without_response_is_recoverable_uncertain() -> None:
+async def test_button_click_without_response_is_uncertain_never_retried() -> None:
     button = FakeButton("claim", error=discord.InvalidData("no response received"))
     channel = FakeChannel(CHANNEL, [button_message(button, message_id=55)])
     client = FakeClient(channel)
     adapter = make_adapter(client)
-    with pytest.raises(RecoverableAdapterError, match="uncertain"):
+    with pytest.raises(UncertainOutcomeError, match="uncertain"):
         await adapter.press_component(CHANNEL, 55, "claim")
     client.connect_stopped.set()
     await adapter.close()

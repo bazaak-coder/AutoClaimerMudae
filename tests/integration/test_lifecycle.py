@@ -168,10 +168,9 @@ async def test_full_lifecycle(tmp_path: Path, caplog: Any) -> None:
     assert by_account[OTHER].attempt_count == 1
     assert by_account[ACCOUNT].status is TaskInstanceState.SUCCEEDED
     cooldown_rows = await store._run(store._fetchall_sync, "SELECT scope FROM scope_cooldowns", ())
-    assert {row["scope"] for row in cooldown_rows} >= {
-        f"account:{ACCOUNT}",
-        "route:add_reaction",
-    }  # server cooldown recorded and persisted (limiter + store)
+    # Server cooldown recorded and persisted; expired rows are pruned
+    # opportunistically, so only the surviving route scope is asserted.
+    assert "route:add_reaction" in {row["scope"] for row in cooldown_rows}
 
     # 9. Controls: pause, resume, disable, queue inspection via the CLI.
     controller = AutoClaimerController(
