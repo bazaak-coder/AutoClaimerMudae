@@ -167,7 +167,8 @@ class EventDispatcher:
         """Register *consumer*; returns an unsubscribe callable."""
         self._next_id += 1
         handle = self._next_id
-        subscription = _Subscription(consumer, asyncio.Queue(self._queue_size))
+        name = getattr(consumer, "__name__", f"consumer-{handle}")
+        subscription = _Subscription(consumer, asyncio.Queue(self._queue_size), name=name)
         subscription.pump = asyncio.get_running_loop().create_task(
             self._pump(subscription), name=f"{self._name}-pump-{handle}"
         )
@@ -190,12 +191,14 @@ class EventDispatcher:
                 except asyncio.QueueEmpty:  # pragma: no cover - raced with pump
                     pass
                 self.dropped += 1
+                subscription.dropped += 1
                 logger.warning(
                     "event queue full; dropped oldest event",
                     extra={
                         "account_id": event.account_id,
                         "operation": f"{self._name}.dispatch",
                         "outcome": "dropped",
+                        "scope": subscription.name,
                     },
                 )
             queue.put_nowait(event)
@@ -219,23 +222,37 @@ class EventDispatcher:
                     },
                 )
 
-    async def stop(self) -> None:
-        """Cancel and await all pump tasks (shutdown)."""
-        pumps = [s.pump for s in self._subscribers.values() if s.pump is not None]
+    async def stop(self, *, pump_timeout: float = 5.0) -> None:
+        """Cancel and await all pump tasks (shutdown).
+
+        Bounded: a consumer that suppresses cancellation cannot hang
+        shutdown forever (survivors are logged and abandoned). Safe to
+        call from inside a consumer (the calling pump is skipped).
+        """
+        current = asyncio.current_task()
+        pumps = [
+            s.pump
+            for s in self._subscribers.values()
+            if s.pump is not None and s.pump is not current
+        ]
         self._subscribers.clear()
         for pump in pumps:
             pump.cancel()
         for pump in pumps:
             try:
-                await pump
-            except asyncio.CancelledError:
+                await asyncio.wait_for(asyncio.shield(pump), timeout=pump_timeout)
+            except (asyncio.CancelledError, TimeoutError):
                 pass
+            except Exception:
+                logger.exception("event pump failed to stop cleanly")
 
 
 @dataclass
 class _Subscription:
     consumer: EventConsumer
     queue: asyncio.Queue[AccountEventPayload]
+    name: str = "consumer"
+    dropped: int = 0
     pump: asyncio.Task[None] | None = None
 
 

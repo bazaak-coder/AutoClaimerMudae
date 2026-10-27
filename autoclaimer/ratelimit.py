@@ -207,6 +207,8 @@ class RateLimiter:
         if until is not None:
             if retry_after_seconds is not None:
                 raise ValueError("Provide exactly one of retry_after_seconds or until.")
+            if until.tzinfo is None:
+                raise ValueError("until must be a timezone-aware datetime")
             deadline = until
         elif retry_after_seconds is not None:
             deadline = self._wall() + timedelta(seconds=retry_after_seconds)
@@ -235,7 +237,10 @@ class RateLimiter:
         entry = self._cooldowns.get(scope)
         if entry is None:
             return None
-        return entry.deadline if entry.deadline > self._wall() else None
+        if entry.deadline <= self._wall():
+            self._cooldowns.pop(scope, None)  # prune expired (bounded memory)
+            return None
+        return entry.deadline
 
     async def _wait_for_cooldowns(self, scopes: Sequence[str]) -> None:
         for scope in sorted(set(scopes)):
@@ -328,6 +333,9 @@ class RateLimiter:
         permit_scope = account
         acquired = await self._acquire_permit(permit_scope, effective.max_concurrency)
         try:
+            # A cooldown recorded while we waited for the permit must
+            # still gate the operation (no bypass via queue position).
+            await self._wait_for_cooldowns(scopes)
             await self._pace(account, effective.min_interval_seconds)
             yield OperationLease(scopes=tuple(sorted(set(scopes))), policy=effective)
         finally:
