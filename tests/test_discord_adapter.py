@@ -361,11 +361,11 @@ async def _no_sleep_async(seconds: float) -> None:
 
 async def test_early_connect_failure_fails_promptly_and_is_retryable() -> None:
     client = StartupFakeClient(connect_error=make_gateway_not_found())
-    adapter = startup_adapter(client)
+    adapter = startup_adapter(client, client_factory=lambda: client)
     with pytest.raises(RecoverableAdapterError, match="GatewayNotFound|connection"):
         await adapter.start()  # pre-fix: hung forever
     assert client.closed is True  # cleanup happened
-    # Retry with a now-working connection succeeds.
+    # Retry with a now-working connection succeeds (fresh client via factory).
     client.connect_error = None
     client.ready.set()
     await adapter.start()
@@ -536,16 +536,32 @@ async def test_captcha_never_bypassed_message_is_explicit() -> None:
     assert "never bypassed" in str(translated)
 
 
-async def test_connection_task_failure_surfaces_recoverably() -> None:
+async def test_connection_death_triggers_restart_and_recovery() -> None:
+    """Post-READY fatal disconnect: the next operation self-heals."""
     channel = FakeChannel(CHANNEL, [])
     client = FakeClient(channel)
-    adapter = make_adapter(client)
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]
+        jitter=lambda low, high: 0.0,
+        sleep=_no_sleep_async,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
     await adapter.start()
-    # Simulate the background connect task dying (callback stores the error).
-    adapter._connect_error = discord.ConnectionClosed(None)  # noqa: SLF001
-    with pytest.raises(RecoverableAdapterError, match="connection lost"):
-        await adapter.send_message(CHANNEL, "x")
+    assert adapter.is_healthy is True
+    # Simulate the gateway dying: connect task completes with an error.
     client.connect_stopped.set()
+    adapter._connect_error = discord.ConnectionClosed(None)  # noqa: SLF001
+    task = adapter._connect_task  # noqa: SLF001
+    assert task is not None
+    await asyncio.sleep(0)  # let the task observe the stop event
+    assert adapter.is_healthy is False
+    client.connect_stopped.clear()  # the restart blocks again on connect
+    client.ready.set()
+    sent = await adapter.send_message(CHANNEL, "after recovery")  # self-heals
+    assert sent.content == "after recovery"
+    assert adapter.is_healthy is True
     await adapter.close()
 
 
