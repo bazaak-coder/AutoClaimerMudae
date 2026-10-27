@@ -546,7 +546,7 @@ async def test_connection_death_triggers_restart_and_recovery() -> None:
         client=client,  # type: ignore[arg-type]
         jitter=lambda low, high: 0.0,
         sleep=_no_sleep_async,
-        client_factory=lambda: client,  # type: ignore[arg-type]
+        client_factory=lambda: client,
     )
     await adapter.start()
     assert adapter.is_healthy is True
