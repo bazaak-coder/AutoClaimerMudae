@@ -301,6 +301,128 @@ async def test_unknown_channel_is_permanent_without_heavy_fetches() -> None:
     await adapter.close()
 
 
+# ----- startup reliability (PR #1 finding 1 regression tests) -----
+
+
+class StartupFakeClient:
+    """Controllable startup surface: ready is set explicitly by tests."""
+
+    def __init__(self, *, connect_error: Exception | None = None) -> None:
+        self.ready = asyncio.Event()
+        self.connect_error = connect_error
+        self.connect_runs = 0
+        self.closed = False
+        self.registered: list[str] = []
+        self._stop = asyncio.Event()
+
+    def event(self, coro: Any) -> Any:
+        setattr(self, coro.__name__, coro)
+        self.registered.append(coro.__name__)
+        return coro
+
+    async def login(self, token: str) -> None:
+        return None
+
+    async def connect(self, *, reconnect: bool = True) -> None:
+        self.connect_runs += 1
+        if self.connect_error is not None:
+            raise self.connect_error
+        await self._stop.wait()
+
+    async def wait_until_ready(self) -> None:
+        await self.ready.wait()
+
+    async def close(self) -> None:
+        self.closed = True
+        self._stop.set()
+
+    def get_channel(self, channel_id: int) -> None:
+        return None
+
+
+def make_gateway_not_found() -> discord.GatewayNotFound:
+    return discord.GatewayNotFound()  # type: ignore[no-untyped-call]  # untyped ctor
+
+
+def startup_adapter(client: StartupFakeClient, **kwargs: Any) -> DiscordAdapter:
+    return DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]
+        jitter=lambda low, high: 0.0,
+        sleep=_no_sleep_async,
+        **kwargs,
+    )
+
+
+async def _no_sleep_async(seconds: float) -> None:
+    return None
+
+
+async def test_early_connect_failure_fails_promptly_and_is_retryable() -> None:
+    client = StartupFakeClient(connect_error=make_gateway_not_found())
+    adapter = startup_adapter(client)
+    with pytest.raises(RecoverableAdapterError, match="GatewayNotFound|connection"):
+        await adapter.start()  # pre-fix: hung forever
+    assert client.closed is True  # cleanup happened
+    # Retry with a now-working connection succeeds.
+    client.connect_error = None
+    client.ready.set()
+    await adapter.start()
+    client._stop.set()  # noqa: SLF001
+    await adapter.close()
+
+
+async def test_startup_timeout_cleans_up_without_leaks() -> None:
+    client = StartupFakeClient()  # neither ready nor failure
+    adapter = startup_adapter(client, startup_timeout=0.05)
+    with pytest.raises(AdapterError, match="timed out"):
+        await adapter.start()
+    assert client.closed is True
+    leaks = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and "discord" in t.get_name()
+    ]
+    assert leaks == []
+    await adapter.close()  # idempotent after abort
+
+
+async def test_close_during_startup_fails_promptly() -> None:
+    client = StartupFakeClient()
+    adapter = startup_adapter(client)
+
+    async def close_soon() -> None:
+        await asyncio.sleep(0.01)
+        client.ready.set()  # close() releases the readiness wait
+        await adapter.close()
+
+    closer = asyncio.create_task(close_soon())
+    with pytest.raises(AdapterError, match="closed during startup"):
+        await adapter.start()
+    await closer
+
+
+async def test_clean_early_connect_return_surfaces_error() -> None:
+    client = StartupFakeClient()
+    client._stop.set()  # noqa: SLF001 - connect() returns without READY
+    adapter = startup_adapter(client)
+    with pytest.raises(RecoverableAdapterError, match="before the gateway"):
+        await adapter.start()
+    assert client.closed is True
+
+
+async def test_ready_wins_race_and_start_is_idempotent() -> None:
+    client = StartupFakeClient()
+    adapter = startup_adapter(client)
+    client.ready.set()
+    await adapter.start()
+    await adapter.start()  # idempotent: no second connect
+    assert client.connect_runs == 1
+    client._stop.set()  # noqa: SLF001
+    await adapter.close()
+
+
 # ----- reactions via the light http route -----
 
 
