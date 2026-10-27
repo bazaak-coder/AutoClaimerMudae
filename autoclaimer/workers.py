@@ -238,9 +238,15 @@ class WorkerManager:
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-            for adapter in self._adapters.values():
-                await adapter.close()
         finally:
+            # Adapters close in the finally: outer cancellation of stop()
+            # must never leak live clients (N1). Adapter close() is
+            # idempotent, so a retried stop() is harmless.
+            for adapter in list(self._adapters.values()):
+                try:
+                    await adapter.close()
+                except Exception:
+                    logger.exception("adapter close failed during shutdown")
             self._adapters.clear()
             # Workers stay registered (their done tasks report STOPPED via
             # status()); _spawn_worker replaces finished workers on restart.

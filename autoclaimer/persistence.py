@@ -296,7 +296,7 @@ class TaskStateStore:
         block on the store lock like any other task, so do not await
         store-using child tasks inside a transaction body (self-deadlock).
         """
-        if self._txn_owner.get() is not None:
+        if self._txn_owner.get() is asyncio.current_task():
             yield
             return
         async with self._lock:

@@ -96,8 +96,10 @@ class AutoClaimerController:
         if self._closed:
             return
         self._closed = True
-        await self._manager.stop()
-        await self._store.close()
+        try:
+            await self._manager.stop()
+        finally:
+            await self._store.close()  # always released (N7)
 
     # ----- account controls (valid before start) -----
 
