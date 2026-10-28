@@ -795,8 +795,20 @@ def _translate(exc: discord.DiscordException, *, mutating: bool = False) -> Adap
             return AccountFatalError(
                 f"gateway session invalidated (close code {exc.code}): {exc.reason or exc}"
             )
+        if mutating:
+            # The connection failed around a mutating call — the platform
+            # may have received and applied it before the closure. The
+            # outcome is unknown: never auto-retry (same policy as 5xx).
+            return UncertainOutcomeError(
+                f"connection closed (code {exc.code}) during a mutation; "
+                f"the outcome is unknown: {exc}"
+            )
         return RecoverableAdapterError(f"connection problem: {exc}")
     if isinstance(exc, discord.GatewayNotFound):
+        if mutating:
+            return UncertainOutcomeError(
+                f"gateway unavailable during a mutation; the outcome is unknown: {exc}"
+            )
         return RecoverableAdapterError(f"connection problem: {exc}")
     # Unknown library errors: for mutating operations the outcome is
     # unknown (agents.md section 17.3 — never assume retry safety from
