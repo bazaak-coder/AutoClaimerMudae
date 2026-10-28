@@ -343,12 +343,21 @@ class EventDispatcher:
         # Report undelivered events BEFORE tearing pumps down. In-flight
         # events (dequeued by a pump, blocked inside a consumer) are
         # disjoint from the queues — counted together exactly once
-        # (PR #3 review fix). Cancellation-suppressing consumers that
-        # survive the timeout may still deliver their in-flight event
-        # afterwards; they are already 'abandoned' per the bounded-stop
-        # contract, so the conservative loss report stands.
+        # (PR #3 review fix). EXCEPT the calling pump (follow-up review
+        # fix): stop() is safe to call from inside a consumer, that pump
+        # is deliberately skipped below and RESUMES after stop()
+        # returns — its in-flight event is allowed to complete and is
+        # therefore not a loss. Its queued events stay counted: the
+        # normal self-stop caller is shutting down, and whether the
+        # surviving pump drains them afterwards is not observable here
+        # (conservative, documented). Cancellation-suppressing consumers
+        # that survive the timeout may still deliver their in-flight
+        # event; they are already 'abandoned' per the bounded-stop
+        # contract, so their loss report stands.
+        calling = next((s for s in self._subscribers.values() if s.pump is current), None)
         for subscription in self._subscribers.values():
-            undelivered = subscription.queue.qsize() + (1 if subscription.in_flight else 0)
+            in_flight_lost = 1 if subscription.in_flight and subscription is not calling else 0
+            undelivered = subscription.queue.qsize() + in_flight_lost
             if undelivered > 0:
                 self.dropped += undelivered
                 subscription.dropped += undelivered
