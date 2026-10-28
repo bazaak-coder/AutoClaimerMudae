@@ -48,8 +48,10 @@ class FakeButton:
         self.url = None
         self._result = result if result is not None else object()  # Interaction-like
         self._error = error
+        self.click_calls = 0
 
     async def click(self) -> Any:
+        self.click_calls += 1
         if self._error is not None:
             raise self._error
         return self._result
@@ -640,6 +642,31 @@ async def test_http_error_translation_matrix() -> None:
 
     for exc, expected in cases:
         translated = _translate(exc)
+        assert type(translated) is expected, f"{exc!r} -> {type(translated)}"
+
+
+def test_translation_matrix_mutating_mode() -> None:
+    """Mutating calls: ambiguous failures (5xx response received, unknown
+    library error) never classify as auto-retryable (PR #2 review fix);
+    everything else keeps its classification."""
+    from autoclaimer.discord_adapter import _translate
+
+    server_error = discord.DiscordServerError(
+        SimpleNamespace(status=503, reason="oops", text="unavailable"), "down"
+    )
+    cases: list[tuple[discord.DiscordException, type[AdapterError]]] = [
+        (server_error, UncertainOutcomeError),
+        (discord.ClientException("mystery"), UncertainOutcomeError),
+        # Unchanged in mutating mode:
+        (discord.RateLimited(9.0), CooldownError),  # 429 = rejected, not applied
+        (
+            discord.Forbidden(SimpleNamespace(status=403, reason="no"), "no"),
+            PermanentAdapterError,
+        ),
+        (discord.LoginFailure("bad token"), AccountFatalError),
+    ]
+    for exc, expected in cases:
+        translated = _translate(exc, mutating=True)
         assert type(translated) is expected, f"{exc!r} -> {type(translated)}"
 
 
