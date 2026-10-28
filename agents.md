@@ -126,7 +126,7 @@ A change is not fully documented until its knowledgebase entry is saved. If docu
 
 Use "uv" where compatible with the project for Python dependency and environment management.
 
-Workspace reality (this machine): the project lives on a normal Linux filesystem (ext4, user-owned) with a project-local virtualenv at ".venv" (see section 16). The system Python is 3.13.5 and externally-managed (PEP 668); do not install into it — always invoke the ".venv/bin" binaries for project work. "uv" is not installed on this machine; install it before any lockfile maintenance, then maintain "uv.lock" with "uv lock" (the old "UV_LINK_MODE=copy" workaround is obsolete on ext4). Network egress to PyPI is slow (~200 KB/s observed); long installs belong in the background and reuse pip's wheel cache.
+Workspace reality (this machine): the project lives on a normal Linux filesystem (ext4, user-owned) with a project-local virtualenv at ".venv" (see section 16). The system Python is 3.13.5 and externally-managed (PEP 668); do not install into it — always invoke the ".venv/bin" binaries for project work. "uv" is installed inside the project venv (".venv/bin/uv") and is not on PATH in non-interactive shells — invoke it by path. Maintain "uv.lock" with "uv lock" (the old "UV_LINK_MODE=copy" workaround is obsolete on ext4). "uv sync" is strict by default and prunes extraneous packages — including a pip-installed "uv" itself; pass "--inexact" to keep it. Network egress to PyPI is slow (~200 KB/s observed); long installs belong in the background and reuse pip's wheel cache.
 
 Use Ruff, mypy, and pytest as the primary development quality tools.
 
@@ -547,7 +547,7 @@ Paths
 Known constraints
 
 - The system Python is 3.13.5 and externally-managed (PEP 668); never pip-install into it and never pass "--break-system-packages"; use the project venv (section 10).
-- "uv" is not installed; install it before lockfile work. The FUSE-era "UV_LINK_MODE=copy" workaround is obsolete on ext4.
+- "uv" lives in the project venv (".venv/bin/uv"); it is not on PATH in non-interactive shells. "uv sync" is strict and would prune a pip-installed uv from the venv — use "--inexact" or the standalone copy at "~/.local/bin/uv".
 - File modes across the tree are 0777, inherited from the migration through a Windows/FUSE host; "core.filemode=false" is set globally, but a fresh clone resets the repo-local value to "true" — re-set it after any gitdir rebuild (section 7).
 - If a tracked file vanishes or shows unexpected mode-only modifications, verify against HEAD and record the incident in the knowledgebase.
 - Network egress to PyPI is slow (~200 KB/s observed); prefer pip's wheel cache and run long installs in the background.
