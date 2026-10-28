@@ -686,3 +686,28 @@ async def test_schedule_attempt_rejects_naive_and_terminal(tmp_path: Path) -> No
             await store.schedule_attempt(succeeded.id, _future(60))
     finally:
         await store.close()
+
+
+# Consolidated review #5: an available $rtu lookup clears a stale deadline
+
+
+async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
+    """Persist a future RT deadline, then learn '$rt is available!':
+    the clear operation removes the stale deadline — later reads cannot
+    return it as current truth. Clearing an absent row is a no-op."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(19 * 3600))
+        await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(3600))
+
+        await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # available lookup
+        deadlines = await store.mudae_deadlines(1)
+        assert MudaeStateKind.RT not in deadlines  # stale deadline gone
+        assert MudaeStateKind.CLAIM in deadlines  # untouched kinds survive
+
+        await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # no-op
+        assert MudaeStateKind.RT not in await store.mudae_deadlines(1)
+    finally:
+        await store.close()

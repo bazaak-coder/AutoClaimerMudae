@@ -344,3 +344,108 @@ async def test_self_stop_finishes_current_but_never_drains_queue() -> None:
     assert lost == [2]  # both queued events reported lost exactly once
     assert dispatcher.dropped == 2
     assert pumps[0] is not None and pumps[0].done()  # pump exited
+
+
+# Consolidated review (#1 variant, #2, #3): loss lifecycle completeness
+
+
+async def test_self_stop_with_blocked_consumer_release_after_stop() -> None:
+    """Reviewer's exact sequence: the self-stopping consumer blocks on
+    the first event with another queued behind it, stop() runs, the
+    consumer is released afterwards."""
+    dispatcher = EventDispatcher(queue_size=4, name="blockedrelease")
+    release = asyncio.Event()
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def blocked(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        await release.wait()  # blocks AFTER stop() returned
+        delivered.append(event)
+
+    dispatcher.subscribe(blocked, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # in-flight
+    await dispatcher.dispatch(make_event())  # queued behind
+    await asyncio.sleep(0.05)  # consumer entered; stop() ran inside it
+    assert lost == [1]  # queued event: lost exactly once
+    release.set()
+    await asyncio.sleep(0.05)
+    assert len(delivered) == 1  # first event finished after release; not a loss
+    assert lost == [1]  # queued event never delivered
+    assert pumps[0] is not None and pumps[0].done()
+
+
+async def test_consumer_exception_counts_loss_and_continues() -> None:
+    """Review #2: a consumer invocation that raises has NOT processed
+    its event — that is a loss for reconciliation purposes (counted +
+    reported), and the pump must continue with later events."""
+    dispatcher = EventDispatcher(queue_size=4, name="boomcount")
+    lost: list[int] = []
+    processed: list[Any] = []
+
+    async def flaky(event: Any) -> None:
+        processed.append(event)
+        if len(processed) == 1:
+            raise RuntimeError("consumer bug")
+
+    dispatcher.subscribe(flaky, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert lost == [1]  # the failed invocation's event: reported lost
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert len(processed) == 2  # the pump survived and delivered the next
+    assert lost == [1]  # no extra losses
+    assert dispatcher.dropped == 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_unsubscribe_accounts_queued_and_inflight_losses() -> None:
+    """Review #3 (external unsubscribe): queued + in-flight events are
+    abandoned — counted and reported exactly once, pump cancelled."""
+    dispatcher = EventDispatcher(queue_size=4, name="unsub")
+    lost: list[int] = []
+    started = asyncio.Event()
+
+    async def stuck(event: Any) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    unsubscribe = dispatcher.subscribe(stuck, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # becomes in-flight
+    await started.wait()
+    await dispatcher.dispatch(make_event())  # queued behind
+    unsubscribe()
+    assert lost == [2]  # in-flight (interrupted) + queued: both lost
+    assert dispatcher.dropped == 2
+    await asyncio.sleep(0.02)
+    assert pumps[0] is not None and pumps[0].done()  # cancelled, ended
+
+
+async def test_self_unsubscribe_finishes_current_accounts_queue_only() -> None:
+    """Review #3 (self-unsubscribe): no self-cancellation; the current
+    callback finishes (not a loss), queued events are accounted, and the
+    pump exits instead of draining."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfunsub")
+    lost: list[int] = []
+    delivered: list[Any] = []
+    unsubscribe_holder: list[Any] = []
+
+    async def one_shot(event: Any) -> None:
+        unsubscribe_holder[0]()  # its own unsubscribe, mid-callback
+        delivered.append(event)
+
+    unsubscribe_holder.append(dispatcher.subscribe(one_shot, on_events_lost=lost.append))
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # in-flight
+    await dispatcher.dispatch(make_event())  # queued at unsubscribe time
+    await asyncio.sleep(0.05)
+    assert len(delivered) == 1  # current callback finished
+    assert lost == [1]  # ONLY the queued event accounted as lost
+    assert dispatcher.dropped == 1
+    await dispatcher.dispatch(make_event())  # gone subscription: no crash
+    await asyncio.sleep(0.02)
+    assert len(delivered) == 1  # nothing further delivered
+    assert pumps[0] is not None and pumps[0].done()  # pump exited

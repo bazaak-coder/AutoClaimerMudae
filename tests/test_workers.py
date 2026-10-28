@@ -772,3 +772,118 @@ async def test_naive_outcome_retry_at_fails_terminally_not_stuck(tmp_path: Path)
     assert record.last_outcome is not None
     assert "timezone-naive" in record.last_outcome.message
     await store.close()
+
+
+# Consolidated review #4: loss callback through the production contract
+
+
+async def test_rate_limited_adapter_forwards_on_events_lost() -> None:
+
+    inner = MockAdapter()
+    limiter = RateLimiter()
+    wrapped = RateLimitedAdapter(inner, limiter, ACCOUNT)
+    lost: list[int] = []
+    wrapped.subscribe(lambda event: None, on_events_lost=lost.append)
+    stats = inner._events.stats()  # noqa: SLF001
+    assert stats.subscriber_count == 1  # forwarded to the real dispatcher
+    await inner.close()
+    assert lost == []  # nothing lost on a clean stop
+
+
+# Consolidated review #6: naive retry_at on ANY outcome never strands the row
+
+
+async def test_naive_retry_at_on_success_fails_terminally(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    async def bad_success(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED, retry_at=_dt(2026, 10, 29, 13, 0, 0))
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Naive success.",
+            validate_config=lambda config: None,
+            handler=bad_success,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "job")
+    assert record.status is TaskInstanceState.FAILED  # not stranded running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()
+
+
+async def test_naive_retry_at_on_permanent_failure_keeps_terminal(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    async def bad_permanent(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_PERMANENT,
+            message="boom",
+            retry_at=_dt(2026, 10, 29, 13, 0, 0),
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Naive permanent.",
+            validate_config=lambda config: None,
+            handler=bad_permanent,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "job")
+    assert record.status is TaskInstanceState.FAILED  # terminal, not running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()
