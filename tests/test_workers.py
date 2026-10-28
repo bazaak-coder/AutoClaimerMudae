@@ -17,7 +17,7 @@ from autoclaimer.persistence import (
 )
 from autoclaimer.ratelimit import EffectivePolicy, RateLimiter
 from autoclaimer.registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus, TaskType
-from autoclaimer.workers import WorkerManager, WorkerState
+from autoclaimer.workers import RateLimitedAdapter, WorkerManager, WorkerState
 
 ACCOUNT = 271485504361996288
 OTHER = 380028190142042112
@@ -541,3 +541,31 @@ async def test_store_closes_cleanly_after_manager_stop(tmp_path: Path) -> None:
         TaskInstanceState.SUCCEEDED
     )
     await h.store.close()
+
+
+# --- cache reads are not rate-limited operations ---
+
+
+async def test_cache_reads_are_not_rate_limited() -> None:
+    """get_channel/validate_channel are gateway-cache lookups: they must
+    pass straight through to the inner adapter without touching the
+    central rate limiter (no permit, no pacing slot, no route)."""
+    from autoclaimer.adapters import ChannelInfo
+    from autoclaimer.ratelimit import EffectivePolicy, RateLimiter
+
+    class NoRunLimiter(RateLimiter):
+        async def run(
+            self,
+            operation_fn: Any,
+            *,
+            account_id: int,
+            **kwargs: Any,
+        ) -> Any:
+            raise AssertionError("cache reads must not be rate-limited")
+
+    inner = MockAdapter()
+    inner.add_channel(ChannelInfo(channel_id=7, name="spam", channel_type="text"))
+    wrapped = RateLimitedAdapter(inner, NoRunLimiter(default_policy=EffectivePolicy()), ACCOUNT)
+    assert await wrapped.get_channel(7) == ChannelInfo(7, "spam", "text")
+    assert await wrapped.validate_channel(7) is True
+    assert [call.operation for call in inner.calls] == ["get_channel", "validate_channel"]

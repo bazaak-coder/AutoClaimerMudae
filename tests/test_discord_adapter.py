@@ -10,6 +10,7 @@ import pytest
 from autoclaimer.adapters import (
     AccountFatalError,
     AdapterError,
+    ChannelInfo,
     CooldownError,
     InteractionResult,
     PermanentAdapterError,
@@ -73,8 +74,17 @@ class FakeMessage:
 
 
 class FakeChannel:
-    def __init__(self, channel_id: int, messages: list[FakeMessage]) -> None:
+    def __init__(
+        self,
+        channel_id: int,
+        messages: list[FakeMessage],
+        *,
+        name: str = "test-channel",
+        channel_type: str = "text",
+    ) -> None:
         self.id = channel_id
+        self.name = name
+        self.type = SimpleNamespace(name=channel_type)  # ChannelType-like
         self._messages = messages
         self.sent: list[str] = []
         self.fetched: list[int] = []
@@ -150,6 +160,9 @@ class FakeClient:
         if self._channel is not None and self._channel.id == channel_id:
             return self._channel
         return None
+
+    async def fetch_channel(self, channel_id: int) -> Any:
+        raise AssertionError("fetch_channel must never be called (API-extensive)")
 
 
 def make_adapter(
@@ -501,6 +514,38 @@ async def test_button_click_without_response_is_uncertain_never_retried() -> Non
 
 
 # ----- error translation -----
+
+
+async def test_get_channel_and_validate_channel_are_cache_only() -> None:
+    """Consumer channel discovery: gateway cache only, never a REST call.
+
+    ``fetch_channel`` (REST GET /channels/{id}) is API-extensive over
+    user accounts and must never be reached; ``Client.get_channel`` is a
+    synchronous cache lookup."""
+    channel = FakeChannel(CHANNEL, [], name="mudae-claims", channel_type="text")
+    client = FakeClient(channel)
+    adapter = make_adapter(client)
+    await adapter.start()
+
+    info = await adapter.get_channel(CHANNEL)
+    assert info == ChannelInfo(channel_id=CHANNEL, name="mudae-claims", channel_type="text")
+    assert await adapter.validate_channel(CHANNEL) is True
+
+    assert await adapter.get_channel(111222333444) is None
+    assert await adapter.validate_channel(111222333444) is False
+
+    client.connect_stopped.set()
+    await adapter.close()
+
+
+async def test_get_channel_lazily_starts_adapter() -> None:
+    channel = FakeChannel(CHANNEL, [], name="any", channel_type="text")
+    client = FakeClient(channel)
+    adapter = make_adapter(client)
+    assert await adapter.validate_channel(CHANNEL) is True  # started on demand
+    assert client.login_calls == [TOKEN]
+    client.connect_stopped.set()
+    await adapter.close()
 
 
 async def test_http_error_translation_matrix() -> None:

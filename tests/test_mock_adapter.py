@@ -174,3 +174,23 @@ async def test_delay_applies_even_when_scripted_exception_fires() -> None:
     with pytest.raises(RecoverableAdapterError):
         await adapter.send_message(1, "x")
     assert loop.time() - started >= 0.01
+
+
+# --- channel discovery (cache-only, like the Discord adapter) ---
+
+
+async def test_get_channel_and_validate_channel() -> None:
+    from autoclaimer.adapters import ChannelInfo
+
+    adapter = MockAdapter()
+    adapter.add_channel(ChannelInfo(channel_id=7, name="general", channel_type="text"))
+    assert await adapter.get_channel(7) == ChannelInfo(7, "general", "text")
+    assert await adapter.validate_channel(7) is True
+    assert await adapter.get_channel(8) is None
+    assert await adapter.validate_channel(8) is False
+    assert [call.operation for call in adapter.calls] == [
+        "get_channel",
+        "validate_channel",
+        "get_channel",
+        "validate_channel",
+    ]
