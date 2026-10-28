@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 5000
 
 _MIGRATIONS: dict[int, str] = {
@@ -81,6 +81,15 @@ _MIGRATIONS: dict[int, str] = {
         scope TEXT PRIMARY KEY,
         deadline TEXT NOT NULL,
         server_directed INTEGER NOT NULL
+    );
+    """,
+    3: """
+    CREATE TABLE IF NOT EXISTS mudae_state (
+        account_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('claim', 'rt')),
+        deadline TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, kind)
     );
     """,
 }
@@ -115,6 +124,19 @@ class TaskInstanceState(Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class MudaeStateKind(Enum):
+    """Kinds of durable per-account Mudae deadlines (``mudae_state``).
+
+    ``CLAIM``: the claim cooldown deadline (learned from ``$mu`` /
+    claim-line replies via the claim-timer rule).
+    ``RT``: the ``$rt`` rolls-reset deadline (learned from ``$rtu``
+    replies; perk-dependent 5h-20h — never assumed, always looked up).
+    """
+
+    CLAIM = "claim"
+    RT = "rt"
 
 
 RESUMABLE_STATES = frozenset({TaskInstanceState.PENDING, TaskInstanceState.WAITING})
@@ -594,6 +616,56 @@ class TaskStateStore:
                 continue
             cooldowns[scope] = (deadline, bool(server_directed))
         return cooldowns
+
+    # ----- Mudae deadlines (per-account durable domain state) -----
+
+    async def set_mudae_deadline(
+        self, account_id: int, kind: MudaeStateKind, deadline: datetime
+    ) -> None:
+        """Store one learned Mudae deadline (absolute UTC).
+
+        A fresh lookup REPLACES the stored value: the reply is the
+        current truth (an ``$rtu`` check after ``$rt`` use supersedes any
+        previously assumed deadline). Naive datetimes are rejected at
+        this boundary (``_format_ts``).
+        """
+        now = _format_ts(self._clock())
+        await self._run(
+            self._update_sync,
+            "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (account_id, kind) DO UPDATE SET "
+            "deadline = excluded.deadline, updated_at = excluded.updated_at",
+            (account_id, kind.value, _format_ts(deadline), now),
+        )
+
+    async def mudae_deadlines(self, account_id: int) -> dict[MudaeStateKind, datetime]:
+        """Learned deadlines for one account ({kind: deadline}).
+
+        Corrupt rows (malformed/naive deadline, unknown kind) are
+        contained per the F3/F4 policy: skipped with an ERROR log naming
+        account and kind; the read never crashes.
+        """
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT kind, deadline FROM mudae_state WHERE account_id = ?",
+            (account_id,),
+        )
+        deadlines: dict[MudaeStateKind, datetime] = {}
+        for row in rows:
+            kind_raw = row["kind"]
+            try:
+                kind = MudaeStateKind(kind_raw)
+                deadline = _parse_ts(row["deadline"])
+            except (ValueError, TypeError) as exc:
+                error = PersistenceError(
+                    f"corrupt mudae_state row account={account_id} kind={kind_raw!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.error("skipping %s", error)
+                continue
+            deadlines[kind] = deadline
+        return deadlines
 
     # ----- internals -----
 

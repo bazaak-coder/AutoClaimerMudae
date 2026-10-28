@@ -35,7 +35,7 @@ Design facts verified against the vendored source:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .adapters import ChannelMessage, MessageCreatedEvent
@@ -43,8 +43,11 @@ from .mudae_parser import CooldownKind, InvalidMessageError, MudaeParser, ParseR
 
 __all__ = [
     "ClaimStatus",
+    "RollsResetStatus",
+    "anchor_deadline",
     "claim_status",
     "parse_mudae",
+    "roll_reset_status",
     "InvalidMessageError",
     "ParseResult",
 ]
@@ -107,6 +110,11 @@ def claim_status(result: ParseResult) -> ClaimStatus | None:
     Returns ``None`` when the parsed message carried no claim-line
     cooldown (unrelated or unrecognized messages — callers must treat
     that as "no verified information", never as available/unavailable).
+
+    ``$mu`` semantics (owner-confirmed 2026-10-29): ``$mu`` is a LOOKUP
+    command for the claim cooldown; its reply is parsed by the existing
+    claim-timer rule, which supersedes any dedicated ``$mu`` parser
+    entry (none exists, by design).
     """
     for cooldown in result.cooldowns:
         if cooldown.kind is not CooldownKind.CLAIM:
@@ -120,3 +128,55 @@ def claim_status(result: ParseResult) -> ClaimStatus | None:
             username=cooldown.username,
         )
     return None
+
+
+@dataclass(frozen=True)
+class RollsResetStatus:
+    """Typed view over an ``$rtu`` reply (the ``$rt`` reset cooldown).
+
+    ``$rtu`` rides the existing ``cooldowns.rt`` rule — no dedicated
+    parser entry (same supersession as ``$mu``). ``available=True`` is
+    the ready state ("$rt is available!") and carries NO duration
+    (``reported is None``: missing ≠ zero — never fabricate a deadline
+    from it). ``$rt``'s cooldown is perk-dependent (owner-observed range
+    5h–20h): the deadline must always be LEARNED from a ``$rtu`` reply
+    after ``$rt`` is used, never assumed from a fixed interval.
+    """
+
+    kind: CooldownKind
+    available: bool
+    reported: timedelta | None
+
+
+def roll_reset_status(result: ParseResult) -> RollsResetStatus | None:
+    """Extract the ``$rt`` reset status from a parse result, if present.
+
+    Returns ``None`` for messages that are not ``$rtu``/``$rt`` state
+    replies (callers: no verified information → look it up, do not
+    guess).
+    """
+    for cooldown in result.cooldowns:
+        if cooldown.kind is not CooldownKind.RT:
+            continue
+        if cooldown.metadata.get("available") is True:
+            return RollsResetStatus(kind=CooldownKind.RT, available=True, reported=None)
+        if cooldown.remaining is not None:
+            return RollsResetStatus(
+                kind=CooldownKind.RT, available=False, reported=cooldown.remaining
+            )
+    return None
+
+
+def anchor_deadline(reported: timedelta, *, now: datetime | None = None) -> datetime:
+    """Anchor a parsed RELATIVE duration to an absolute UTC deadline.
+
+    This is the single boundary where parser-provided durations become
+    deadlines (agents.md section 17.2.4): the Mudae task/state layer
+    calls this before persisting. ``now`` is injectable for
+    determinism; the system default is UTC now. Naive ``now`` values are
+    rejected — deadlines are timezone-aware UTC by contract.
+    """
+    current = now if now is not None else datetime.now(UTC)
+    if current.tzinfo is None:
+        raise ValueError("anchor_deadline requires a timezone-aware `now` (UTC)")
+    return current.astimezone(UTC) + reported
