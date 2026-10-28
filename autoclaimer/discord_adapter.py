@@ -29,6 +29,19 @@ Verified against discord.py-self 2.1.0 source (installed package):
   (``.retry_after``; *not* an ``HTTPException`` subclass in this fork),
   ``Forbidden``, ``NotFound``, ``DiscordServerError``, ``CaptchaRequired``,
   ``LoginFailure``, ``ConnectionClosed``, ``GatewayNotFound``, ``InvalidData``.
+- Fatal account errors (owner policy 2026-10-28): the fork defines
+  ``AuthFailure = LoginFailure`` (one class, two names) and raises it when
+  ``login()`` rejects the token (HTTP 401). ``Client.connect(reconnect=
+  True)`` only lets ``ConnectionClosed`` escape after a terminal
+  ``close()`` and for close codes it cannot handle — the gateway's
+  ``_can_handle_close`` treats ``1000`` (clean) and ``4004, 4010-4014``
+  (auth/intent/shard/API-version fatal) as non-reconnectable. Both map to
+  :class:`~autoclaimer.adapters.AccountFatalError`: the adapter latches
+  the error permanently (no re-login, no client rebuild, ``is_healthy``
+  false) and the worker manager stops the account. CAPTCHA challenges are
+  equally account-fatal (never bypassed). All other ``ConnectionClosed``
+  codes stay recoverable: the library already reconnected/resumed
+  internally before anything surfaced.
 
 Event model: inbound events are normalized to framework types
 (:class:`~autoclaimer.adapters.MessageCreatedEvent`,
@@ -74,6 +87,7 @@ from typing import Any
 import discord
 
 from .adapters import (
+    AccountFatalError,
     AdapterError,
     ChannelMessage,
     CooldownError,
@@ -94,6 +108,14 @@ from .credentials import CredentialProvider
 logger = logging.getLogger(__name__)
 
 _DEFAULT_JITTER_RANGE = (0.4, 1.2)
+
+#: Gateway close codes the library itself refuses to reconnect on
+#: (``DiscordWebSocket._can_handle_close``, discord.py-self 2.1.0).
+#: 4004 = authentication failed (token invalidated mid-session),
+#: 4010-4014 = invalid shard / sharding required / API version /
+#: intents problems. ``connect()`` closes the client and re-raises
+#: ``ConnectionClosed`` for exactly these — we adhere to that verdict.
+_FATAL_CLOSE_CODES = frozenset({4004, 4010, 4011, 4012, 4013, 4014})
 
 
 class DiscordAdapter:
@@ -125,6 +147,7 @@ class DiscordAdapter:
         self._start_lock = asyncio.Lock()
         self._connect_task: asyncio.Task[None] | None = None
         self._connect_error: BaseException | None = None
+        self._fatal: AccountFatalError | None = None
         self._started = False
         self._bridges_registered = False
         self._closed = False
@@ -133,20 +156,46 @@ class DiscordAdapter:
 
     @property
     def is_healthy(self) -> bool:
-        """True when the adapter is usable: not closed and connected.
+        """True when the adapter is usable: not closed, not fatal, connected.
 
         A started adapter whose connection task has died is unhealthy until
-        it restarts (``start()`` / any operation triggers recovery).
+        it restarts (``start()`` / any operation triggers recovery). An
+        adapter that hit an account-fatal error (bad credentials, fatal
+        gateway close, CAPTCHA) is permanently unhealthy: it never
+        restarts or re-logins; the manager must stop the account.
         """
-        if self._closed:
+        if self._closed or self._fatal is not None:
             return False
         if not self._started:
             return True
         task = self._connect_task
         return task is not None and not task.done()
 
+    def _latch_fatal(self, error: AccountFatalError) -> None:
+        """Permanently remember an account-fatal failure.
+
+        Once latched, every later ``start()``/operation re-raises the
+        error immediately — no client rebuild, no re-login, no network
+        traffic. The latch survives ``_reset_for_restart`` by design.
+        """
+        if self._fatal is None:
+            self._fatal = error
+            logger.error(
+                "discord adapter hit account-fatal error",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.fatal",
+                    "outcome": "account_fatal",
+                },
+            )
+
     def _reset_for_restart(self) -> None:
-        """Discard the terminal client and lifecycle state for a retry."""
+        """Discard the terminal client and lifecycle state for a retry.
+
+        The fatal latch is deliberately preserved: a client may be
+        rebuildable, but dead credentials or an invalidated session are
+        not the client's fault and must not trigger re-login churn.
+        """
         self._client = self._client_factory()
         self._connect_task = None
         self._connect_error = None
@@ -179,18 +228,25 @@ class DiscordAdapter:
         async with self._start_lock:
             if self._closed:
                 raise AdapterError("adapter is closed")
+            if self._fatal is not None:
+                raise self._fatal  # account-fatal: never re-login
             if self._started:
                 task = self._connect_task
                 if task is not None and not task.done():
                     return  # healthy and running
-                # Fatal disconnect after READY: rebuild and reconnect.
+                # A fatal disconnect after READY latches in
+                # _connect_finished / _await_ready; only non-fatal deaths
+                # (transient close codes, network loss) reach this rebuild.
                 self._reset_for_restart()
             self._register_bridges()
             token = self._credentials.get_token(self._account_id)
             try:
                 await self._client.login(token)
             except discord.DiscordException as exc:
-                raise _translate(exc) from exc
+                translated = _translate(exc)
+                if isinstance(translated, AccountFatalError):
+                    self._latch_fatal(translated)
+                raise translated from exc
             self._connect_error = None
             self._connect_task = asyncio.create_task(
                 self._client.connect(reconnect=True),
@@ -242,7 +298,10 @@ class DiscordAdapter:
                 else _UncleanExit("connection ended before the gateway reached READY")
             )
             await self._abort_startup(ready_task)
-            raise _translate_error(error)
+            translated = _translate_error(error)
+            if isinstance(translated, AccountFatalError):
+                self._latch_fatal(translated)
+            raise translated
         # Timeout: neither readiness nor failure — abort cleanly.
         await self._abort_startup(ready_task)
         raise AdapterError(f"discord startup timed out after {self._startup_timeout:.1f}s")
@@ -296,20 +355,34 @@ class DiscordAdapter:
         self._bridges_registered = True
 
     def _connect_finished(self, task: asyncio.Task[None]) -> None:
-        if not task.cancelled() and task.exception() is not None:
-            self._connect_error = task.exception()
-            logger.warning(
-                "discord connection task failed",
-                extra={
-                    "account_id": self._account_id,
-                    "operation": "discord.connect",
-                    "outcome": "connection_lost",
-                },
-            )
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        self._connect_error = error
+        # Latch fatal gateway verdicts the moment the connection dies
+        # (post-READY invalidation): is_healthy flips false immediately
+        # and the next operation fast-fails without any re-login.
+        translated = _translate_error(error)
+        if isinstance(translated, AccountFatalError):
+            self._latch_fatal(translated)
+        logger.warning(
+            "discord connection task failed",
+            extra={
+                "account_id": self._account_id,
+                "operation": "discord.connect",
+                "outcome": "account_fatal"
+                if isinstance(translated, AccountFatalError)
+                else "connection_lost",
+            },
+        )
 
     async def _ensure_ready(self) -> None:
         if self._closed:
             raise AdapterError("adapter is closed")
+        if self._fatal is not None:
+            raise self._fatal  # account-fatal: no restart, no re-login
         if not self._started or self._connect_task is None or self._connect_task.done():
             # Not started, or the connection died: (re)start with a fresh
             # client — bounded by the startup race, never a bare wait.
@@ -596,15 +669,24 @@ def _find_button(message: Any, component_id: str) -> Any:
 
 
 def _translate(exc: discord.DiscordException) -> AdapterError:
-    """Map library exceptions to the framework's typed error model."""
+    """Map library exceptions to the framework's typed error model.
+
+    Account-fatal verdicts (dead credentials, fatal gateway close codes,
+    CAPTCHA) map to :class:`AccountFatalError`, which stops the whole
+    account instead of failing one task (owner policy 2026-10-28).
+    """
     if isinstance(exc, discord.RateLimited):
         return CooldownError(exc.retry_after)
     if isinstance(exc, discord.CaptchaRequired):
-        return PermanentAdapterError(
-            "Discord requested a CAPTCHA challenge; automation is stopped — "
+        return AccountFatalError(
+            "Discord requested a CAPTCHA challenge; the account is stopped — "
             "challenges are never bypassed"
         )
-    if isinstance(exc, (discord.Forbidden, discord.NotFound, discord.LoginFailure)):
+    if isinstance(exc, discord.LoginFailure):
+        # AuthFailure is an alias of LoginFailure in this fork; the token
+        # was rejected — retrying it can only hammer the login endpoint.
+        return AccountFatalError(f"authentication failed: {exc}")
+    if isinstance(exc, (discord.Forbidden, discord.NotFound)):
         return PermanentAdapterError(str(exc))
     if isinstance(exc, discord.DiscordServerError):
         return RecoverableAdapterError(f"Discord server error ({exc.status}): {exc}")
@@ -626,7 +708,16 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
         # which does NOT mean the interaction failed: the action may have
         # been applied. Never auto-retry (uncertain outcome policy).
         return UncertainOutcomeError(f"uncertain interaction outcome: {exc}")
-    if isinstance(exc, (discord.ConnectionClosed, discord.GatewayNotFound)):
+    if isinstance(exc, discord.ConnectionClosed):
+        # Only codes the library itself refuses to reconnect on ever get
+        # here (gateway._can_handle_close): 4004 = token invalidated
+        # mid-session, 4010-4014 = shard/intents/API-version fatal.
+        if exc.code in _FATAL_CLOSE_CODES:
+            return AccountFatalError(
+                f"gateway session invalidated (close code {exc.code}): {exc.reason or exc}"
+            )
+        return RecoverableAdapterError(f"connection problem: {exc}")
+    if isinstance(exc, discord.GatewayNotFound):
         return RecoverableAdapterError(f"connection problem: {exc}")
     # Unknown library errors are treated as recoverable so bounded retries
     # (not silent success) decide the outcome.

@@ -44,6 +44,21 @@ class UncertainOutcomeError(AdapterError):
     """
 
 
+class AccountFatalError(PermanentAdapterError):
+    """The account itself is dead, not just one operation.
+
+    Raised when the platform rejects the account's credentials
+    (``LoginFailure``/``AuthFailure``), invalidates the gateway session
+    for an unrecoverable reason (fatal close codes such as 4004), or
+    blocks the account (CAPTCHA challenge). Unlike a plain
+    :class:`PermanentAdapterError` — which fails only the current task —
+    the worker manager must **stop the account**: fail every queued
+    instance, disable the account, and shut its worker down. Never
+    retried; re-enabling the account is the explicit owner-controlled
+    revive path (owner-directed policy, 2026-10-28).
+    """
+
+
 class CooldownError(RecoverableAdapterError):
     """Server-directed cooldown; the operation must not be retried before
     ``retry_after_seconds`` has elapsed."""
