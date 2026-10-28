@@ -18,8 +18,8 @@ dev = [
     "mypy>=1.11",
 ]
 
-[tool.setuptools]
-packages = ["autoclaimer"]
+[tool.setuptools.packages.find]
+include = ["autoclaimer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -28,6 +28,15 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+# Vendored upstream parser + its ported tests: excluded from
+# lint/format discovery — upstream style preserved byte-identical
+# (see autoclaimer/mudae_parser/VENDORED.md).
+exclude = [
+    "autoclaimer/mudae_parser",
+    "tests/test_mudae_parser.py",
+    "tests/test_mudae_parser_strings.py",
+    "tests/test_mudae_parser_settings.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
@@ -35,3 +44,16 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+# Vendored upstream parser + its ported tests: proven by their own suite
+# (80 tests); kept byte-identical to upstream, so AutoClaimer's strict
+# preset does not apply (see autoclaimer/mudae_parser/VENDORED.md).
+module = [
+    "autoclaimer.mudae_parser",
+    "autoclaimer.mudae_parser.*",
+    "test_mudae_parser",
+    "test_mudae_parser_strings",
+    "test_mudae_parser_settings",
+]
+ignore_errors = true
