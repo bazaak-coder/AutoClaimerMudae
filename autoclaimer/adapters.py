@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -188,10 +188,19 @@ class EventDispatcher:
     """Fan-out inbound events to subscribers with isolation and bounds.
 
     Each subscriber gets its own bounded queue and one pump task: a slow
-    or failing consumer never blocks or breaks the others. When a queue is
-    full the OLDEST event is dropped (fresh state wins) and the drop is
-    counted and logged. Per-subscriber delivery is FIFO in the order the
-    adapter dispatched the events.
+    or failing consumer never blocks or breaks the others. When a queue
+    is full the OLDEST event is dropped (fresh state wins) and the drop
+    is counted and logged. Per-subscriber delivery is FIFO in the order
+    the adapter dispatched the events.
+
+    Event-loss recovery (milestone 5): subscribers that must not miss
+    actionable events register ``on_events_lost`` — invoked with the
+    subscriber's CUMULATIVE dropped-event count whenever overflow drops
+    events AND when ``stop()`` abandons that subscriber's still-queued
+    events (adapter eviction, shutdown). Consumers diff the cumulative
+    count and reconcile (e.g. re-check Mudae cooldowns) instead of
+    assuming every event was processed. ``stats()`` exposes live queue
+    pressure and drop counters.
     """
 
     def __init__(self, *, queue_size: int = 64, name: str = "events") -> None:
@@ -201,12 +210,25 @@ class EventDispatcher:
         self._next_id = 0
         self.dropped = 0
 
-    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
-        """Register *consumer*; returns an unsubscribe callable."""
+    def subscribe(
+        self,
+        consumer: EventConsumer,
+        *,
+        on_events_lost: Callable[[int], None] | None = None,
+    ) -> Callable[[], None]:
+        """Register *consumer*; returns an unsubscribe callable.
+
+        ``on_events_lost`` (optional) receives the subscriber's
+        CUMULATIVE lost-event count each time events are lost for it —
+        a deliberate isolation boundary: callback exceptions are logged
+        and never break dispatch (agents.md section 17.4).
+        """
         self._next_id += 1
         handle = self._next_id
         name = getattr(consumer, "__name__", f"consumer-{handle}")
-        subscription = _Subscription(consumer, asyncio.Queue(self._queue_size), name=name)
+        subscription = _Subscription(
+            consumer, asyncio.Queue(self._queue_size), name=name, on_loss=on_events_lost
+        )
         subscription.pump = asyncio.get_running_loop().create_task(
             self._pump(subscription), name=f"{self._name}-pump-{handle}"
         )
@@ -239,7 +261,43 @@ class EventDispatcher:
                         "scope": subscription.name,
                     },
                 )
+                self._notify_loss(subscription)
             queue.put_nowait(event)
+
+    def _notify_loss(self, subscription: _Subscription) -> None:
+        """Report cumulative losses to the subscriber's callback, if any.
+
+        Isolation boundary: a broken callback is logged with its
+        traceback and never propagates into dispatch/stop.
+        """
+        if subscription.on_loss is None:
+            return
+        try:
+            subscription.on_loss(subscription.dropped)
+        except Exception:
+            logger.exception(
+                "event-loss callback failed; loss still counted",
+                extra={
+                    "operation": f"{self._name}.loss_callback",
+                    "outcome": "callback_error",
+                    "scope": subscription.name,
+                },
+            )
+
+    def stats(self) -> EventDispatcherStats:
+        """Read-only snapshot: subscriber count, lost-event totals, and
+        live queue pressure per subscription (keyed by subscribe handle)."""
+        return EventDispatcherStats(
+            subscriber_count=len(self._subscribers),
+            total_dropped=self.dropped,
+            subscriber_dropped={
+                handle: subscription.dropped for handle, subscription in self._subscribers.items()
+            },
+            queue_depths={
+                handle: subscription.queue.qsize()
+                for handle, subscription in self._subscribers.items()
+            },
+        )
 
     async def _pump(self, subscription: _Subscription) -> None:
         while True:
@@ -266,8 +324,28 @@ class EventDispatcher:
         Bounded: a consumer that suppresses cancellation cannot hang
         shutdown forever (survivors are logged and abandoned). Safe to
         call from inside a consumer (the calling pump is skipped).
+
+        Events still queued for a subscriber at stop time are LOST
+        (milestone 5): they are added to the loss counters and reported
+        through that subscriber's ``on_events_lost`` callback instead of
+        vanishing silently (adapter eviction / shutdown accounting).
         """
         current = asyncio.current_task()
+        # Report undelivered events BEFORE tearing pumps down.
+        for subscription in self._subscribers.values():
+            undelivered = subscription.queue.qsize()
+            if undelivered > 0:
+                self.dropped += undelivered
+                subscription.dropped += undelivered
+                logger.warning(
+                    "event queue abandoned at stop; events reported lost",
+                    extra={
+                        "operation": f"{self._name}.stop",
+                        "outcome": "lost",
+                        "scope": subscription.name,
+                    },
+                )
+                self._notify_loss(subscription)
         pumps = [
             s.pump
             for s in self._subscribers.values()
@@ -292,6 +370,19 @@ class _Subscription:
     name: str = "consumer"
     dropped: int = 0
     pump: asyncio.Task[None] | None = None
+    on_loss: Callable[[int], None] | None = None
+
+
+@dataclass(frozen=True)
+class EventDispatcherStats:
+    """Read-only dispatcher snapshot (milestone 5: queue pressure)."""
+
+    subscriber_count: int
+    total_dropped: int
+    #: Cumulative lost events per subscribe-handle (overflow + abandoned).
+    subscriber_dropped: Mapping[int, int]
+    #: Live queue backlog per subscribe-handle.
+    queue_depths: Mapping[int, int]
 
 
 @runtime_checkable
