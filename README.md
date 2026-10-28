@@ -284,10 +284,17 @@ never called and historical retrieval is not part of the contract.
   moderate read is `get_message` (needed to obtain component objects).
   Heavy endpoints (`fetch_user`, `fetch_channel`, …) are never called.
 - Error translation: `RateLimited`/HTTP 429 → `CooldownError(retry_after)`
-  (recorded and honored by the central limiter); `CaptchaRequired` →
-  permanent failure (CAPTCHAs are never bypassed); `Forbidden`/`NotFound`/
-  `LoginFailure` → permanent; 5xx, `ConnectionClosed`, `GatewayNotFound`,
-  `InvalidData` (uncertain interaction outcome) → recoverable.
+  (recorded and honored by the central limiter); `CaptchaRequired`,
+  `LoginFailure`/`AuthFailure` (one class in this fork), and
+  `ConnectionClosed` with a fatal close code (4004, 4010-4014 — the only
+  codes the library itself refuses to reconnect on; the client is
+  already terminal when they surface) → **`AccountFatalError`**: the
+  adapter latches the verdict permanently (no re-login, no client
+  rebuild) and the worker manager fails the account's queued instances,
+  disables the account, and stops its worker — never retries. CAPTCHAs
+  are never bypassed. `Forbidden`/`NotFound` → per-operation permanent;
+  5xx, non-fatal `ConnectionClosed`, `GatewayNotFound`, `InvalidData`
+  (uncertain interaction outcome) → recoverable.
 - No Discord objects leak past the adapter; tokens come from the
   credential provider at login time and are never stored, logged, or
   persisted.
@@ -362,9 +369,25 @@ disable/queue controls → clean shutdown → restart recovery. See
 - Known limitations: per-account concurrency permits only; limiter
   default policy governs adapter operations (per-task policies not yet
   wired per-operation); `reaction_add` rich events fire only for cached
-  messages (raw events cover the rest); no CAPTCHA handling (permanent
-  failure, never bypassed); user-account automation may violate
-  Discord's ToS (see platform restrictions above).
+  messages (raw events cover the rest); CAPTCHA/auth-fatal errors stop
+  the account permanently (never bypassed, never retried — re-enable is
+  the explicit revive path after the credential is fixed); user-account
+  automation may violate Discord's ToS (see platform restrictions above).
+
+## Benchmarks
+
+Hot-path micro-benchmarks (not part of the pytest suite — timings are
+reporting, not assertions):
+
+```bash
+.venv/bin/python scripts/benchmark.py
+```
+
+Reference numbers (Python 3.13.5, this workspace, 2026-10-28):
+dispatcher fan-out ~145k events/s (1 subscriber) / ~80k (4 subscribers);
+SQLite claim+success cycle ~505/s; limiter run overhead ~60k ops/s;
+registry execute overhead ~665k/s. Methodology notes live in the script
+docstrings; measured values in the knowledgebase.
 
 ## Next milestone (Mudae task handlers, not started)
 
