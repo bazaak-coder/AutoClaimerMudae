@@ -209,6 +209,7 @@ class EventDispatcher:
         self._subscribers: dict[int, _Subscription] = {}
         self._next_id = 0
         self.dropped = 0
+        self._stopped = False
 
     def subscribe(
         self,
@@ -300,7 +301,7 @@ class EventDispatcher:
         )
 
     async def _pump(self, subscription: _Subscription) -> None:
-        while True:
+        while not self._stopped:
             event = await subscription.queue.get()
             # In-flight tracking (PR #3 review fix): an event dequeued
             # into its consumer is invisible to queue.qsize(); stop()
@@ -340,6 +341,12 @@ class EventDispatcher:
         vanishing silently (adapter eviction / shutdown accounting).
         """
         current = asyncio.current_task()
+        # Terminal stop signal FIRST (third-round review fix): the
+        # self-stopping pump may finish its CURRENT consumer call and
+        # must then EXIT — never resume draining its queue (those queued
+        # events are counted and reported as lost just below, exactly
+        # once). Ordinary pumps are cancelled regardless of the signal.
+        self._stopped = True
         # Report undelivered events BEFORE tearing pumps down. In-flight
         # events (dequeued by a pump, blocked inside a consumer) are
         # disjoint from the queues — counted together exactly once
