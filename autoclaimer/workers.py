@@ -41,6 +41,7 @@ from typing import TypeVar
 
 from .adapters import (
     AccountFatalError,
+    ChannelInfo,
     EventConsumer,
     InteractionResult,
     PlatformAdapter,
@@ -144,6 +145,14 @@ class RateLimitedAdapter:
     def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
         """Inbound events are not rate-limited operations; pass through."""
         return self._inner.subscribe(consumer)
+
+    async def get_channel(self, channel_id: int) -> ChannelInfo | None:
+        """Cache-only channel lookup: not a platform operation, never limited."""
+        return await self._inner.get_channel(channel_id)
+
+    async def validate_channel(self, channel_id: int) -> bool:
+        """Cache-only visibility check: not a platform operation, never limited."""
+        return await self._inner.validate_channel(channel_id)
 
 
 class _AccountWorker:

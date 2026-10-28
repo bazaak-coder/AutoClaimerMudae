@@ -24,6 +24,7 @@ from typing import Any
 
 from .adapters import (
     AccountEventPayload,
+    ChannelInfo,
     EventConsumer,
     EventDispatcher,
     InteractionResult,
@@ -53,6 +54,7 @@ class MockAdapter:
         self.interactions: list[InteractionResult] = []
         self.closed = False
         self._scripts: dict[str, deque[Any]] = {}
+        self._channels: dict[int, ChannelInfo] = {}
         self._sequence = 0
         self._next_id = _FIRST_ID
         self._events = EventDispatcher(queue_size=event_queue_size, name="mock")
@@ -63,6 +65,10 @@ class MockAdapter:
         """Queue outcomes (values or ``BaseException`` instances) for an operation."""
         self._scripts.setdefault(operation, deque()).extend(outcomes)
 
+    def add_channel(self, info: ChannelInfo) -> None:
+        """Register a cached channel for ``get_channel``/``validate_channel``."""
+        self._channels[info.channel_id] = info
+
     async def emit(self, event: AccountEventPayload) -> None:
         """Deliver a synthetic normalized event to subscribers."""
         await self._events.dispatch(event)
@@ -70,6 +76,16 @@ class MockAdapter:
     def subscribe(self, consumer: EventConsumer) -> Any:
         """Subscribe to synthetic events; returns an unsubscribe callable."""
         return self._events.subscribe(consumer)
+
+    async def get_channel(self, channel_id: int) -> ChannelInfo | None:
+        """Cache-only lookup mirroring the Discord adapter (recorded, no script)."""
+        self._record("get_channel", {"channel_id": channel_id})
+        return self._channels.get(channel_id)
+
+    async def validate_channel(self, channel_id: int) -> bool:
+        """True when the channel was registered via ``add_channel``."""
+        self._record("validate_channel", {"channel_id": channel_id})
+        return channel_id in self._channels
 
     # ----- internals -----
 

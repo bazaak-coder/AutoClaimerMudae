@@ -80,6 +80,21 @@ class SentMessage:
 
 
 @dataclass(frozen=True)
+class ChannelInfo:
+    """A channel the account can see (gateway-cache view, no API call).
+
+    ``channel_type`` is the platform's type name (for Discord:
+    ``text``, ``private`` for DMs, ``group``, ``news``, threads, ...).
+    Deliberately minimal — no permission lists or member data, which
+    would require heavier endpoints.
+    """
+
+    channel_id: int
+    name: str
+    channel_type: str
+
+
+@dataclass(frozen=True)
 class InteractionResult:
     """Outcome of pressing a message component (for example a button)."""
 
@@ -299,6 +314,20 @@ class PlatformAdapter(Protocol):
 
     def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
         """Subscribe to normalized inbound events; returns unsubscribe."""
+        ...
+
+    async def get_channel(self, channel_id: int) -> ChannelInfo | None:
+        """Return cached channel info, or ``None`` when not visible.
+
+        Cache-only lookup (no platform API call): ``None`` means the
+        account does not currently see the channel — an unstarted or
+        reconnecting adapter has an empty cache, so ensure readiness
+        first when that matters.
+        """
+        ...
+
+    async def validate_channel(self, channel_id: int) -> bool:
+        """True when *channel_id* is visible to the account (cache)."""
         ...
 
     async def close(self) -> None:

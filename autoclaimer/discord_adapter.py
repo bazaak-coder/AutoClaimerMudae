@@ -89,6 +89,7 @@ import discord
 from .adapters import (
     AccountFatalError,
     AdapterError,
+    ChannelInfo,
     ChannelMessage,
     CooldownError,
     EventConsumer,
@@ -456,6 +457,24 @@ class DiscordAdapter:
             )
         return channel
 
+    async def get_channel(self, channel_id: int) -> ChannelInfo | None:
+        """Cached channel info, or ``None`` when the account cannot see it.
+
+        Uses the library's synchronous ``Client.get_channel`` (gateway
+        cache) exclusively — ``fetch_channel`` (REST) is API-extensive
+        over user accounts and is never called. Lazily ensures the
+        gateway connection (the cache only exists after READY).
+        """
+        await self._ensure_ready()
+        channel = self._client.get_channel(channel_id)
+        if channel is None:
+            return None
+        return _to_channel_info(channel)
+
+    async def validate_channel(self, channel_id: int) -> bool:
+        """True when *channel_id* is visible to this account (cache-only)."""
+        return await self.get_channel(channel_id) is not None
+
     # ----- PlatformAdapter operations -----
 
     async def send_message(self, channel_id: int, content: str) -> SentMessage:
@@ -651,6 +670,21 @@ def _to_channel_message(message: Any) -> ChannelMessage:
         has_components=bool(getattr(message, "components", None)),
         created_at=getattr(message, "created_at", None),
     )
+
+
+def _to_channel_info(channel: Any) -> ChannelInfo:
+    """Normalize a cached library channel object (never leaked as-is).
+
+    DM channels may carry no ``name``; fall back to the recipient's
+    name. The type enum is reduced to its plain name.
+    """
+    channel_type = getattr(channel, "type", None)
+    type_name = getattr(channel_type, "name", None) or str(channel_type)
+    name = getattr(channel, "name", None)
+    if not name:
+        recipient = getattr(channel, "recipient", None)
+        name = getattr(recipient, "name", "") if recipient is not None else ""
+    return ChannelInfo(channel_id=channel.id, name=name or "", channel_type=type_name)
 
 
 def _emoji_name(emoji: Any) -> str:
