@@ -53,10 +53,14 @@ never called and the adapter does not implement historical retrieval.
 
 Behavioural rules:
 
-- **Pacing**: a small randomized delay (``jitter_range`` seconds) precedes
-  every mutating action (send / react / press). This is conservative pacing
-  to avoid hammering the API for personal use — it is not and must not
-  become detection evasion.
+- **Pacing**: a randomized delay precedes every mutating action. Sends
+  use a dedicated, tighter humanization range — ``send_jitter_range``,
+  default 0.203–0.567 s, configurable as
+  ``settings.send_jitter_seconds: [low, high]`` in config.json (pass
+  ``settings.send_jitter_seconds`` from the parsed config into the
+  adapter factory). Reactions and component presses use the general
+  ``jitter_range`` (default 0.4–1.2 s). This is conservative pacing for
+  personal, non-abusive use — **not** detection evasion.
 - **Light endpoints only**: channels resolve from the gateway cache; the
   single moderate read used is ``get_message`` (required to obtain the
   component objects for a press). Heavy endpoints such as ``fetch_user``
@@ -110,6 +114,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_JITTER_RANGE = (0.4, 1.2)
 
+#: Dedicated humanization range for send_message (owner directive
+#: 2026-10-28: "keep it minimal range 0.203-0.567"). Configurable via
+#: ``settings.send_jitter_seconds`` in config.json.
+_DEFAULT_SEND_JITTER_RANGE = (0.203, 0.567)
+
 #: Gateway close codes the library itself refuses to reconnect on
 #: (``DiscordWebSocket._can_handle_close``, discord.py-self 2.1.0).
 #: 4004 = authentication failed (token invalidated mid-session),
@@ -130,6 +139,7 @@ class DiscordAdapter:
         client: discord.Client | None = None,
         client_factory: Callable[[], Any] | None = None,
         jitter_range: tuple[float, float] = _DEFAULT_JITTER_RANGE,
+        send_jitter_range: tuple[float, float] | None = None,
         jitter: Callable[[float, float], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         event_queue_size: int = 64,
@@ -143,6 +153,7 @@ class DiscordAdapter:
         self._client_factory = client_factory or (lambda: discord.Client())
         self._client = client if client is not None else self._client_factory()
         self._jitter_range = jitter_range
+        self._send_jitter_range = send_jitter_range or _DEFAULT_SEND_JITTER_RANGE
         self._jitter = jitter or (lambda low, high: random.uniform(low, high))
         self._sleep = sleep or asyncio.sleep
         self._start_lock = asyncio.Lock()
@@ -440,9 +451,14 @@ class DiscordAdapter:
 
     # ----- helpers -----
 
-    async def _pace(self) -> None:
-        """Randomized conservative delay before a mutating action."""
-        delay = self._jitter(*self._jitter_range)
+    async def _pace(self, jitter_range: tuple[float, float] | None = None) -> None:
+        """Randomized conservative delay before a mutating action.
+
+        ``send_message`` passes its dedicated, tighter humanization range
+        (``send_jitter_range``); reactions and component presses use the
+        general ``jitter_range``.
+        """
+        delay = self._jitter(*(jitter_range or self._jitter_range))
         if delay > 0:
             await self._sleep(delay)
 
@@ -479,7 +495,7 @@ class DiscordAdapter:
 
     async def send_message(self, channel_id: int, content: str) -> SentMessage:
         await self._ensure_ready()
-        await self._pace()
+        await self._pace(self._send_jitter_range)
         channel = self._channel(channel_id)
         try:
             message = await channel.send(content)
