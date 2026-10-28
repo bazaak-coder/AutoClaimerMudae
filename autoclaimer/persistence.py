@@ -560,6 +560,33 @@ class TaskStateStore:
         )
         return changed
 
+    async def schedule_attempt(self, instance_id: int, at: datetime) -> TaskInstanceRecord:
+        """Schedule the next attempt at an ABSOLUTE UTC deadline.
+
+        Milestone 4 (retry ownership): the Mudae task layer calls this
+        with deadlines LEARNED from parsed replies (anchored via
+        ``autoclaimer.mudae.anchor_deadline``) — never with fabricated or
+        transport-backoff values. ``pending|waiting -> waiting`` with
+        ``next_attempt_at = at`` (a fresh schedule replaces an earlier
+        one: latest observation wins, mirroring ``mudae_state``).
+        Terminal rows reject the transition; ``running`` rows belong to
+        their executing worker and are rejected too. Naive datetimes are
+        refused by ``_format_ts``.
+        """
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'waiting', next_attempt_at = ?, "
+            "updated_at = ? WHERE id = ? AND status IN ('pending', 'waiting')",
+            (_format_ts(at), now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            raise StateTransitionError(
+                f"Cannot schedule task instance {instance_id} from state '{current.status.value}'."
+            )
+        return await self.get_instance(instance_id)
+
     # ----- scope cooldowns (rate limiter persistence) -----
 
     async def set_scope_cooldown(
@@ -710,7 +737,10 @@ class TaskStateStore:
 
 
 def _outcome_json(outcome: TaskOutcome) -> str:
-    return json.dumps({"status": outcome.status.value, "message": outcome.message})
+    payload: dict[str, Any] = {"status": outcome.status.value, "message": outcome.message}
+    if outcome.retry_at is not None:
+        payload["retry_at"] = _format_ts(outcome.retry_at)
+    return json.dumps(payload)
 
 
 def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]:
@@ -743,8 +773,11 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
     outcome: TaskOutcome | None = None
     if outcome_raw is not None:
         payload = json.loads(outcome_raw)
+        retry_at_raw = payload.get("retry_at")
         outcome = TaskOutcome(
-            status=TaskStatus(payload["status"]), message=payload.get("message", "")
+            status=TaskStatus(payload["status"]),
+            message=payload.get("message", ""),
+            retry_at=_parse_ts(retry_at_raw) if retry_at_raw else None,
         )
     return TaskInstanceRecord(
         id=row["id"],

@@ -527,8 +527,16 @@ class WorkerManager:
                     retry_at=None,
                 )
                 return
-            delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
-            await self._record(record.id, outcome, retry_at=self._wall() + timedelta(seconds=delay))
+            if outcome.retry_at is not None:
+                # Milestone 4 (retry ownership): a LEARNED absolute UTC
+                # deadline (parsed from a Mudae reply, anchored at the
+                # domain boundary) supersedes generic transport backoff.
+                # An already-expired deadline means "due now".
+                retry_at = max(outcome.retry_at, self._wall())
+            else:
+                delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
+                retry_at = self._wall() + timedelta(seconds=delay)
+            await self._record(record.id, outcome, retry_at=retry_at)
         else:
             await self._record(record.id, outcome, retry_at=None)
 
