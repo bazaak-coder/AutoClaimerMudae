@@ -714,3 +714,61 @@ async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) 
     record = await store.get_instance_by_ids(ACCOUNT, "roll")
     assert record.next_attempt_at == learned  # the learned deadline, not backoff
     await store.close()
+
+
+# PR #3 review fix: naive outcome retry_at never leaves the row running
+
+
+async def test_naive_outcome_retry_at_fails_terminally_not_stuck(tmp_path: Path) -> None:
+    """Review finding 2: a handler returning a timezone-naive retry_at
+    would crash the worker's max() comparison AFTER the durable claim —
+    leaving the instance RUNNING forever. The worker boundary validates
+    the deadline: the attempt fails terminally with a clear message and
+    supervision continues."""
+    from datetime import datetime as _dt
+
+    async def bad_deadline(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_RECOVERABLE,
+            message="learned deadline",
+            retry_at=_dt(2026, 10, 29, 13, 0, 0),  # naive: contract violation
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Returns a naive deadline.",
+            validate_config=lambda config: None,
+            handler=bad_deadline,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.status is TaskInstanceState.FAILED  # NOT stuck running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()

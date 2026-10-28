@@ -234,12 +234,11 @@ async def test_t7_account_fatal_reports_queued_events_lost(tmp_path: Path) -> No
 
     async with manager:
         await wait_until(account_stopped, "account worker stopped after fatal error")
-    # Arithmetic (same lesson as the milestone-5 stats test): the pump
-    # took event(1) and hangs INSIDE the consumer — that event was
-    # delivered-to-a-stuck-consumer, not lost. event(2) was still queued
-    # when the fatal eviction closed the adapter: exactly one loss is
-    # reported, and it is attributed to this subscription.
-    assert lost == [1]
+    # Arithmetic (updated by the PR #3 review fix): the pump holds
+    # event(1) in-flight inside the stuck consumer and event(2) sits
+    # queued — BOTH are undelivered and both are counted exactly once
+    # at eviction (in-flight + queued are disjoint sets).
+    assert lost == [2]
     await manager._store.close()  # noqa: SLF001
 
 

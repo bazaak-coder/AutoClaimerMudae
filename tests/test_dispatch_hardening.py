@@ -262,3 +262,29 @@ async def test_stop_reports_undelivered_events_as_lost() -> None:
     await dispatcher.stop(pump_timeout=0.2)
     assert lost == [2]  # both undelivered events reported at shutdown
     assert dispatcher.dropped == 2  # honest global accounting
+
+
+# PR #3 review fix: interrupted in-flight delivery is a loss
+
+
+async def test_stop_reports_in_flight_event_interrupted_delivery() -> None:
+    """Review finding 1: an event already dequeued by the pump and
+    blocked inside its consumer is invisible to queue.qsize() — stop()
+    must still count and report it (no silent hole in the loss
+    contract), without double-counting (in-flight and queued are
+    disjoint sets)."""
+    dispatcher = EventDispatcher(queue_size=4, name="inflight")
+    lost: list[int] = []
+    started = asyncio.Event()
+
+    async def stuck_mid_delivery(event: Any) -> None:
+        started.set()
+        await asyncio.Event().wait()  # blocks INSIDE the consumer
+
+    dispatcher.subscribe(stuck_mid_delivery, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await started.wait()  # the pump now holds the event in the consumer
+    assert sum(dispatcher.stats().queue_depths.values()) == 0  # queue empty
+    await dispatcher.stop(pump_timeout=0.2)
+    assert lost == [1]  # the interrupted delivery IS a loss
+    assert dispatcher.dropped == 1
