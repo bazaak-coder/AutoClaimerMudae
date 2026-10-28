@@ -512,6 +512,26 @@ class TaskStateStore:
                 )
         return await self.get_instance(instance_id)
 
+    async def fail_account_queue(self, account_id: int, message: str) -> int:
+        """Bulk ``pending|waiting -> failed`` for one account's instances.
+
+        Account-fatal policy (owner directive 2026-10-28): when an account's
+        credentials or gateway session die, its queued work must fail
+        terminally instead of retrying. Returns the number of instances
+        failed. Terminal rows are untouched (idempotent); ``running`` rows
+        are left to their own outcome path — their in-flight execution
+        records its own failure.
+        """
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'failed', last_outcome = ?, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE account_id = ? AND status IN ('pending', 'waiting')",
+            (_outcome_json(TaskOutcome(TaskStatus.FAILED_PERMANENT, message)), now, account_id),
+        )
+        return changed
+
     # ----- scope cooldowns (rate limiter persistence) -----
 
     async def set_scope_cooldown(
