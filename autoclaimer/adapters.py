@@ -236,8 +236,45 @@ class EventDispatcher:
         self._subscribers[handle] = subscription
 
         def unsubscribe() -> None:
+            # Consolidated review #3: unsubscribing is an abandoning
+            # teardown — undelivered work is accounted and reported, not
+            # silently discarded.
             removed = self._subscribers.pop(handle, None)
-            if removed is not None and removed.pump is not None:
+            if removed is None:
+                return
+            removed.stopped = True  # the pump exits after its current callback
+            current = asyncio.current_task()
+            if removed.pump is not None and removed.pump is current:
+                # Self-unsubscribe: the current callback finishes (its
+                # event is NOT a loss); only queued events are abandoned.
+                queued = removed.queue.qsize()
+                if queued > 0:
+                    self.dropped += queued
+                    removed.dropped += queued
+                    logger.warning(
+                        "subscription unsubscribed with queued events; reported lost",
+                        extra={
+                            "operation": f"{self._name}.unsubscribe",
+                            "outcome": "lost",
+                            "scope": removed.name,
+                        },
+                    )
+                    self._notify_loss(removed)
+                return
+            undelivered = removed.queue.qsize() + (1 if removed.in_flight else 0)
+            if undelivered > 0:
+                self.dropped += undelivered
+                removed.dropped += undelivered
+                logger.warning(
+                    "subscription unsubscribed with undelivered events; reported lost",
+                    extra={
+                        "operation": f"{self._name}.unsubscribe",
+                        "outcome": "lost",
+                        "scope": removed.name,
+                    },
+                )
+                self._notify_loss(removed)
+            if removed.pump is not None:
                 removed.pump.cancel()
 
         return unsubscribe
@@ -301,7 +338,7 @@ class EventDispatcher:
         )
 
     async def _pump(self, subscription: _Subscription) -> None:
-        while not self._stopped:
+        while not self._stopped and not subscription.stopped:
             event = await subscription.queue.get()
             # In-flight tracking (PR #3 review fix): an event dequeued
             # into its consumer is invisible to queue.qsize(); stop()
@@ -318,15 +355,22 @@ class EventDispatcher:
                 # delivery as a loss (never swallowed, §17.4.5).
                 raise
             except Exception:
-                subscription.in_flight = None  # delivered to a failing consumer
+                subscription.in_flight = None
+                # Consolidated review #2: the consumer FAILED to process
+                # this event — that is an unprocessed event for
+                # reconciliation purposes: counted and reported as lost
+                # (the pump itself continues with later events).
+                subscription.dropped += 1
+                self.dropped += 1
                 logger.exception(
-                    "event consumer failed; continuing",
+                    "event consumer failed; event counted as lost",
                     extra={
                         "account_id": event.account_id,
                         "operation": f"{self._name}.consumer",
-                        "outcome": "consumer_error",
+                        "outcome": "consumer_error_lost",
                     },
                 )
+                self._notify_loss(subscription)
 
     async def stop(self, *, pump_timeout: float = 5.0) -> None:
         """Cancel and await all pump tasks (shutdown).
@@ -404,6 +448,8 @@ class _Subscription:
     on_loss: Callable[[int], None] | None = None
     #: Event currently dequeued into the consumer (loss accounting).
     in_flight: AccountEventPayload | None = None
+    #: Per-subscription exit signal (self-unsubscribe: finish current, exit).
+    stopped: bool = False
 
 
 @dataclass(frozen=True)
@@ -436,8 +482,19 @@ class PlatformAdapter(Protocol):
         """Press a component (button) attached to a message."""
         ...
 
-    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
-        """Subscribe to normalized inbound events; returns unsubscribe."""
+    def subscribe(
+        self,
+        consumer: EventConsumer,
+        *,
+        on_events_lost: Callable[[int], None] | None = None,
+    ) -> Callable[[], None]:
+        """Subscribe to normalized inbound events; returns unsubscribe.
+
+        ``on_events_lost`` (optional) receives the subscriber's
+        CUMULATIVE lost-event count whenever events are lost for it
+        (overflow, failed consumer invocation, abandoned at stop or
+        unsubscribe) — the reconciliation signal (§17.7).
+        """
         ...
 
     async def get_channel(self, channel_id: int) -> ChannelInfo | None:

@@ -666,6 +666,22 @@ class TaskStateStore:
             (account_id, kind.value, _format_ts(deadline), now),
         )
 
+    async def clear_mudae_deadline(self, account_id: int, kind: MudaeStateKind) -> None:
+        """Remove one learned Mudae deadline (no-op if absent).
+
+        Consolidated review #5: an ``$rtu`` lookup reporting AVAILABLE
+        ("$rt is available!") supersedes any previously stored deadline —
+        the ready state is current truth, so the stale future deadline is
+        cleared rather than left to mislead later reads. "Missing
+        duration is not zero" semantics are untouched: absence after a
+        clear means "known available", never a fabricated deadline.
+        """
+        await self._run(
+            self._update_sync,
+            "DELETE FROM mudae_state WHERE account_id = ? AND kind = ?",
+            (account_id, kind.value),
+        )
+
     async def mudae_deadlines(self, account_id: int) -> dict[MudaeStateKind, datetime]:
         """Learned deadlines for one account ({kind: deadline}).
 
