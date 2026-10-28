@@ -223,7 +223,16 @@ class EventDispatcher:
         CUMULATIVE lost-event count each time events are lost for it —
         a deliberate isolation boundary: callback exceptions are logged
         and never break dispatch (agents.md section 17.4).
+
+        Raises ``RuntimeError`` after ``stop()``: stop is terminal and a
+        post-stop subscription would silently drop every dispatch (its
+        pump exits immediately), so it is rejected loudly instead.
         """
+        if self._stopped:
+            raise RuntimeError(
+                "EventDispatcher is stopped; subscriptions are no longer "
+                "accepted (stop is terminal — create a new dispatcher)"
+            )
         self._next_id += 1
         handle = self._next_id
         name = getattr(consumer, "__name__", f"consumer-{handle}")

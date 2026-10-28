@@ -701,10 +701,15 @@ async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
     try:
         await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(19 * 3600))
         await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(3600))
+        # Before: the future deadline IS current truth.
+        assert MudaeStateKind.RT in await store.mudae_deadlines(1)
 
         await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # available lookup
+        # After: NO stale value survives — subsequent reads cannot
+        # return the cleared deadline as current truth.
         deadlines = await store.mudae_deadlines(1)
-        assert MudaeStateKind.RT not in deadlines  # stale deadline gone
+        assert MudaeStateKind.RT not in deadlines
+        assert deadlines.get(MudaeStateKind.RT) is None
         assert MudaeStateKind.CLAIM in deadlines  # untouched kinds survive
 
         await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # no-op

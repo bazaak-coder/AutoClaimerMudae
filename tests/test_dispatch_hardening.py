@@ -449,3 +449,20 @@ async def test_self_unsubscribe_finishes_current_accounts_queue_only() -> None:
     await asyncio.sleep(0.02)
     assert len(delivered) == 1  # nothing further delivered
     assert pumps[0] is not None and pumps[0].done()  # pump exited
+
+
+# Review follow-up: subscribing after stop must be explicit
+
+
+async def test_subscribe_after_stop_is_rejected() -> None:
+    """stop() is terminal: a subscription accepted afterwards would have
+    an already-exited pump and silently drop every future dispatch.
+    The API rejects it loudly instead."""
+    dispatcher = EventDispatcher(queue_size=2, name="poststop")
+
+    async def consumer(event: Any) -> None:
+        return None
+
+    await dispatcher.stop()
+    with pytest.raises(RuntimeError, match="stopped"):
+        dispatcher.subscribe(consumer)
