@@ -156,7 +156,13 @@ def _format_ts(value: datetime) -> str:
 
 def _parse_ts(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        # Naive timestamps are invalid persisted data: every write path
+        # produces timezone-aware UTC strings, so naive means corrupt or
+        # hand-edited state. Refuse to reinterpret it (agents.md
+        # section 17.6; audit F4) — callers treat this as a corrupt row.
+        raise ValueError(f"timezone-naive persisted timestamp {value!r}")
+    return parsed.astimezone(UTC)
 
 
 def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
@@ -557,16 +563,37 @@ class TaskStateStore:
         )
 
     async def active_scope_cooldowns(self) -> dict[str, tuple[datetime, bool]]:
-        """Return unexpired scope cooldowns as {scope: (deadline, server_directed)}."""
+        """Return unexpired scope cooldowns as {scope: (deadline, server_directed)}.
+
+        Corrupt rows (malformed or timezone-naive deadline, non-integer
+        flag) are contained: skipped with an ERROR log naming the scope,
+        raising a typed ``PersistenceError`` only as the logged diagnosis
+        (audit F3). One bad row must never crash manager startup — a
+        skipped cooldown self-corrects when the next violation re-records
+        it, and the log makes the corruption diagnosable.
+        """
         now = _format_ts(self._clock())
         rows = await self._run(
             self._fetchall_sync,
             "SELECT scope, deadline, server_directed FROM scope_cooldowns WHERE deadline > ?",
             (now,),
         )
-        return {
-            row["scope"]: (_parse_ts(row["deadline"]), bool(row["server_directed"])) for row in rows
-        }
+        cooldowns: dict[str, tuple[datetime, bool]] = {}
+        for row in rows:
+            scope = row["scope"]
+            try:
+                deadline = _parse_ts(row["deadline"])
+                server_directed = int(row["server_directed"])
+                if server_directed not in (0, 1):
+                    raise ValueError(f"server_directed flag is {row['server_directed']!r}")
+            except (ValueError, TypeError) as exc:
+                error = PersistenceError(
+                    f"corrupt scope_cooldowns row scope={scope!r}: {type(exc).__name__}: {exc}"
+                )
+                logger.error("skipping %s", error)
+                continue
+            cooldowns[scope] = (deadline, bool(server_directed))
+        return cooldowns
 
     # ----- internals -----
 
