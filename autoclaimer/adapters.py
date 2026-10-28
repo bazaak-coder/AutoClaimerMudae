@@ -204,6 +204,11 @@ class EventDispatcher:
     """
 
     def __init__(self, *, queue_size: int = 64, name: str = "events") -> None:
+        if queue_size <= 0:
+            # Audit (leak-F3): a non-positive size yields an UNBOUNDED
+            # queue on this platform (full() never True) — the bounded
+            # contract would silently vanish. Reject loudly.
+            raise ValueError("queue_size must be a positive integer")
         self._queue_size = queue_size
         self._name = name
         self._subscribers: dict[int, _Subscription] = {}
@@ -247,11 +252,18 @@ class EventDispatcher:
         def unsubscribe() -> None:
             # Consolidated review #3: unsubscribing is an abandoning
             # teardown — undelivered work is accounted and reported, not
-            # silently discarded.
+            # silently discarded. AFTER stop() began, stop() owns the
+            # terminal accounting (audit F1): a loss callback firing
+            # during stop may unsubscribe synchronously — then this is
+            # pure removal + pump cancellation, never a second count.
             removed = self._subscribers.pop(handle, None)
             if removed is None:
                 return
             removed.stopped = True  # the pump exits after its current callback
+            if self._stopped:
+                if removed.pump is not None and removed.pump is not asyncio.current_task():
+                    removed.pump.cancel()
+                return
             current = asyncio.current_task()
             if removed.pump is not None and removed.pump is current:
                 # Self-unsubscribe: the current callback finishes (its
@@ -289,8 +301,39 @@ class EventDispatcher:
         return unsubscribe
 
     async def dispatch(self, event: AccountEventPayload) -> None:
-        """Deliver *event* to every subscriber (drop-oldest on overflow)."""
-        for subscription in list(self._subscribers.values()):
+        """Deliver *event* to every subscriber (drop-oldest on overflow).
+
+        After ``stop()`` the event cannot be delivered to anyone: it is
+        counted and logged as lost instead of silently vanishing
+        (symmetric with the loud post-stop subscribe rejection).
+        """
+        if self._stopped:
+            self.dropped += 1
+            logger.warning(
+                "dispatch after stop; event counted as lost",
+                extra={
+                    "account_id": event.account_id,
+                    "operation": f"{self._name}.dispatch",
+                    "outcome": "lost_after_stop",
+                },
+            )
+            return
+        for handle, subscription in list(self._subscribers.items()):
+            if self._subscribers.get(handle) is not subscription or subscription.stopped:
+                # Removed mid-dispatch (e.g. an earlier subscriber's loss
+                # callback unsubscribed it): never strand the event on a
+                # dead queue — count it (audit race-F3/leak-F2).
+                self.dropped += 1
+                logger.warning(
+                    "dispatch to removed subscription; event counted as lost",
+                    extra={
+                        "account_id": event.account_id,
+                        "operation": f"{self._name}.dispatch",
+                        "outcome": "lost_dead_subscription",
+                        "scope": subscription.name,
+                    },
+                )
+                continue
             queue = subscription.queue
             if queue.full():
                 try:
@@ -309,6 +352,20 @@ class EventDispatcher:
                     },
                 )
                 self._notify_loss(subscription)
+                if subscription.stopped or self._stopped:
+                    # The loss callback unsubscribed this subscriber (or
+                    # stop() began): the event has no live target.
+                    self.dropped += 1
+                    logger.warning(
+                        "subscription removed during dispatch; event counted as lost",
+                        extra={
+                            "account_id": event.account_id,
+                            "operation": f"{self._name}.dispatch",
+                            "outcome": "lost_dead_subscription",
+                            "scope": subscription.name,
+                        },
+                    )
+                    continue
             queue.put_nowait(event)
 
     def _notify_loss(self, subscription: _Subscription) -> None:
@@ -365,6 +422,18 @@ class EventDispatcher:
                 raise
             except Exception:
                 subscription.in_flight = None
+                if self._stopped:
+                    # Audit leak-F5: stop() already accounted abandoned
+                    # work — a late failure of an abandoned consumer must
+                    # not double-count it (log only).
+                    logger.exception(
+                        "abandoned event consumer failed after stop",
+                        extra={
+                            "operation": f"{self._name}.consumer",
+                            "outcome": "consumer_error_after_stop",
+                        },
+                    )
+                    return
                 # Consolidated review #2: the consumer FAILED to process
                 # this event — that is an unprocessed event for
                 # reconciliation purposes: counted and reported as lost
@@ -415,7 +484,10 @@ class EventDispatcher:
         # event; they are already 'abandoned' per the bounded-stop
         # contract, so their loss report stands.
         calling = next((s for s in self._subscribers.values() if s.pump is current), None)
-        for subscription in self._subscribers.values():
+        # Snapshot iteration (audit F1, both agents): loss callbacks are
+        # arbitrary user code that may unsubscribe synchronously — a
+        # live-dict iteration would raise mid-teardown and abandon pumps.
+        for subscription in list(self._subscribers.values()):
             in_flight_lost = 1 if subscription.in_flight and subscription is not calling else 0
             undelivered = subscription.queue.qsize() + in_flight_lost
             if undelivered > 0:
@@ -441,8 +513,19 @@ class EventDispatcher:
         for pump in pumps:
             try:
                 await asyncio.wait_for(asyncio.shield(pump), timeout=pump_timeout)
-            except (asyncio.CancelledError, TimeoutError):
+            except asyncio.CancelledError:
                 pass
+            except TimeoutError:
+                # Audit leak-F4: the docstring promises survivors are
+                # logged — make the abandoned pump observable by name.
+                logger.warning(
+                    "event pump survived stop timeout; abandoned",
+                    extra={
+                        "operation": f"{self._name}.stop",
+                        "outcome": "pump_abandoned",
+                        "scope": pump.get_name(),
+                    },
+                )
             except Exception:
                 logger.exception("event pump failed to stop cleanly")
 
