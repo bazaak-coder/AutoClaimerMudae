@@ -121,9 +121,16 @@ hooks, or webhook URLs exist in this repository.
   handler exceptions propagate to the caller.
 - **Adapters** (`adapters.PlatformAdapter`) expose the minimum async
   operations (send message, react, press component, subscribe to events,
-  close) with explicit results and an error hierarchy:
-  `RecoverableAdapterError`, `PermanentAdapterError`, `CooldownError`
-  (carries `retry_after_seconds`). Concrete adapters own client lifecycle.
+  close) plus cache-only channel discovery
+  (:meth:`~autoclaimer.adapters.PlatformAdapter.get_channel` /
+  :meth:`~autoclaimer.adapters.PlatformAdapter.validate_channel` —
+  gateway-cache lookups normalized to
+  :class:`~autoclaimer.adapters.ChannelInfo`, never a REST fetch) with
+  explicit results and an error hierarchy:
+  `RecoverableAdapterError`, `PermanentAdapterError`,
+  `CooldownError` (carries `retry_after_seconds`),
+  `UncertainOutcomeError`, and `AccountFatalError` (stops the whole
+  account). Concrete adapters own client lifecycle.
 - **Mock adapter** (`mock_adapter.MockAdapter`) is deterministic and fully
   test-controlled: scripted return values or exception instances per
   operation (FIFO), simulated latency, synthetic event emission, and full call
