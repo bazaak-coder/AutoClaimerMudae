@@ -288,3 +288,28 @@ async def test_stop_reports_in_flight_event_interrupted_delivery() -> None:
     await dispatcher.stop(pump_timeout=0.2)
     assert lost == [1]  # the interrupted delivery IS a loss
     assert dispatcher.dropped == 1
+
+
+# PR #3 follow-up review: self-stop must not report its own in-flight event
+
+
+async def test_self_stop_does_not_report_own_in_flight_as_lost() -> None:
+    """stop() is documented safe to call from inside a consumer; that
+    pump is deliberately NOT cancelled — it resumes and finishes the
+    delivery. The completed event must not be counted or reported as a
+    loss (false loss would trigger needless reconciliation)."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfloss")
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def self_stopping(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        delivered.append(event)  # completes AFTER stop() returned
+
+    dispatcher.subscribe(self_stopping, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.05)  # pump entered the consumer; stop() ran inside it
+
+    assert len(delivered) == 1  # the event WAS delivered
+    assert lost == []  # therefore not a loss
+    assert dispatcher.dropped == 0
