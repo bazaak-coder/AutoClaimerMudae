@@ -455,3 +455,110 @@ async def test_operations_before_open_are_refused() -> None:
     store = TaskStateStore(":memory:")
     with pytest.raises(PersistenceError, match="not open"):
         await store.list_instances()
+
+
+# --- corrupt persisted state (audit F3/F4) ---
+
+
+def _future(seconds: int) -> datetime:
+    return BASE_TIME + timedelta(seconds=seconds)
+
+
+async def _inject_raw_rows(store: TaskStateStore, *rows: tuple[str, str, int]) -> None:
+    conn = store._connection()  # noqa: SLF001  # test: simulate hand-edited/corrupt rows
+    for scope, deadline, server_directed in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO scope_cooldowns (scope, deadline, server_directed) "
+            "VALUES (?, ?, ?)",
+            (scope, deadline, server_directed),
+        )
+
+
+async def test_active_scope_cooldowns_skips_corrupt_deadline_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F3: a malformed deadline must not crash the scan with a raw
+    ValueError. The corrupt row is skipped with an error log naming the
+    scope; valid rows still load (audit T5: startup continues)."""
+    import logging
+
+    clock = FakeClock()
+    store = TaskStateStore(tmp_path / "state.db", clock=clock)
+    await store.open()
+    try:
+        await store.set_scope_cooldown("account:1", _future(300), server_directed=True)
+        await _inject_raw_rows(
+            store,
+            ("account:2", "not-a-timestamp", 1),
+            # naive-but-future-sorting: passes the SQL string filter, then
+            # must be rejected by parsing (F4 via the F3 path)
+            ("account:3", "2027-01-01T00:00:00", 0),
+        )
+        with caplog.at_level(logging.ERROR, logger="autoclaimer.persistence"):
+            active = await store.active_scope_cooldowns()
+        assert set(active) == {"account:1"}  # only the valid row survives
+        assert "account:2" in caplog.text and "account:3" in caplog.text
+        assert "corrupt" in caplog.text.lower()
+    finally:
+        await store.close()
+
+
+async def test_load_persisted_cooldowns_survives_corrupt_rows(tmp_path: Path) -> None:
+    """F3 end-to-end: manager startup cooldown loading must not raise on
+    a corrupt row (typed containment, not a crash)."""
+    from autoclaimer.ratelimit import RateLimiter
+
+    clock = FakeClock()
+    store = TaskStateStore(tmp_path / "state.db", clock=clock)
+    await store.open()
+    try:
+        await store.set_scope_cooldown("account:1", _future(300), server_directed=True)
+        await _inject_raw_rows(store, ("account:2", "garbage", 1))
+        limiter = RateLimiter(store=store, wall=clock)
+        await limiter.load_persisted_cooldowns()  # must not raise
+        loaded = {info.scope for info in limiter.status().cooldowns}
+        assert "account:1" in loaded
+        assert "account:2" not in loaded
+    finally:
+        await store.close()
+
+
+async def test_parse_ts_rejects_naive_timestamps() -> None:
+    """F4: naive persisted timestamps are invalid data, not silently
+    reinterpreted as UTC (agents.md section 17.6)."""
+    from autoclaimer.persistence import _parse_ts
+
+    with pytest.raises(ValueError, match="timezone-naive"):
+        _parse_ts("2026-01-01T00:00:00")
+    aware = _parse_ts("2026-01-01T00:00:00+02:00")
+    offset = aware.utcoffset()
+    assert offset is not None
+    assert offset.total_seconds() == 0  # normalized to UTC
+
+
+async def test_naive_timestamp_row_is_treated_as_corrupt(tmp_path: Path) -> None:
+    """F4 end-to-end: a hand-edited naive timestamp in task_instances is
+    contained as a corrupt row (skipped in scans, typed error on direct
+    fetch) instead of being silently reinterpreted."""
+    from autoclaimer.persistence import PersistenceError, TaskInstanceState
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.create_instance(1, "ok_task")
+        conn = store._connection()  # noqa: SLF001
+        conn.execute(
+            "INSERT INTO task_instances "
+            "(account_id, task_id, status, created_at, updated_at) "
+            "VALUES (1, 'naive_task', 'pending', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        listed = await store.list_instances_by_account(1)
+        assert {r.task_id for r in listed} == {"ok_task"}  # corrupt row skipped
+
+        naive_row_id = conn.execute(
+            "SELECT id FROM task_instances WHERE task_id = 'naive_task'"
+        ).fetchone()[0]
+        with pytest.raises(PersistenceError, match="corrupt"):
+            await store.get_instance(naive_row_id)
+        assert (await store.get_instance_by_ids(1, "ok_task")).status is TaskInstanceState.PENDING
+    finally:
+        await store.close()
