@@ -177,3 +177,88 @@ async def test_cooldown_recorded_during_permit_wait_gates_operation() -> None:
     elapsed = asyncio.get_running_loop().time() - started
     assert result == "ran"
     assert elapsed >= 0.1  # gated until the cooldown expired (0.15s deadline)
+
+
+# Milestone 5: event-loss recovery — loss signaling and queue pressure
+
+
+async def test_on_events_lost_fires_on_overflow_with_cumulative_count() -> None:
+    """A subscriber that must not miss actionable events registers a
+    loss callback: drop-oldest overflow invokes it with the CUMULATIVE
+    dropped count (delta-safe for consumers that diff)."""
+    dispatcher = EventDispatcher(queue_size=1, name="loss")
+    lost: list[int] = []
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()  # never drains
+
+    dispatcher.subscribe(slow, on_events_lost=lost.append)
+    for _ in range(3):
+        await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert lost == [1, 2]  # two oldest dropped while queue holds 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_loss_callback_exceptions_are_isolated() -> None:
+    """A broken loss callback must not break dispatch (isolation
+    boundary per agents.md section 17.4) and must not hide the loss."""
+    dispatcher = EventDispatcher(queue_size=1, name="boomloss")
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    def broken(count: int) -> None:
+        raise RuntimeError("callback bug")
+
+    dispatcher.subscribe(slow, on_events_lost=broken)
+    for _ in range(2):
+        await dispatcher.dispatch(make_event())  # must not raise
+    await asyncio.sleep(0.02)
+    assert dispatcher.dropped == 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_stats_expose_queue_pressure_and_drops() -> None:
+    dispatcher = EventDispatcher(queue_size=2, name="stats")
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    async def idle(event: Any) -> None:
+        return None
+
+    dispatcher.subscribe(slow)
+    dispatcher.subscribe(idle)
+    for _ in range(4):
+        await dispatcher.dispatch(make_event())
+        await asyncio.sleep(0)  # let the draining subscriber keep up
+    stats = dispatcher.stats()
+    assert stats.subscriber_count == 2
+    # Arithmetic: of 4 events, the slow subscriber consumed 1 (then hung
+    # inside that consumer call), 2 sit queued, and 1 was dropped.
+    assert stats.total_dropped == 1
+    assert sum(stats.subscriber_dropped.values()) == 1
+    assert max(stats.queue_depths.values()) == 2  # slow subscriber's backlog
+    assert min(stats.queue_depths.values()) == 0  # idle subscriber drained
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_stop_reports_undelivered_events_as_lost() -> None:
+    """N4 observability: events still queued at stop() (e.g. adapter
+    eviction) are reported to the loss callback instead of vanishing
+    silently. No yields between dispatch and stop, so both events are
+    still queued (the pump never ran)."""
+    dispatcher = EventDispatcher(queue_size=8, name="stoploss")
+    lost: list[int] = []
+
+    async def parked(event: Any) -> None:
+        await asyncio.Event().wait()  # would never drain
+
+    dispatcher.subscribe(parked, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await dispatcher.dispatch(make_event())
+    assert lost == []  # queued, not dropped
+    await dispatcher.stop(pump_timeout=0.2)
+    assert lost == [2]  # both undelivered events reported at shutdown
+    assert dispatcher.dropped == 2  # honest global accounting
