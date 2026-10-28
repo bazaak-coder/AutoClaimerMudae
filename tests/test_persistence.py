@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 2
+        assert version_row[0] == s.schema_version == 3  # v3: mudae_state added
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -99,7 +99,7 @@ async def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
 # --- scope cooldowns (migration v2, rate-limiter persistence) ---
 
 
-async def test_v1_database_is_migrated_to_v2(tmp_path: Path) -> None:
+async def test_v1_database_is_migrated_to_current(tmp_path: Path) -> None:
     path = tmp_path / "state.db"
     s = await make_store(path)
     await s.close()
@@ -118,7 +118,7 @@ async def test_v1_database_is_migrated_to_v2(tmp_path: Path) -> None:
         assert len(rows) == 1
         version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == 2
+        assert version_row[0] == migrated.schema_version == 3  # v3: mudae_state added
     finally:
         await migrated.close()
 
@@ -560,5 +560,71 @@ async def test_naive_timestamp_row_is_treated_as_corrupt(tmp_path: Path) -> None
         with pytest.raises(PersistenceError, match="corrupt"):
             await store.get_instance(naive_row_id)
         assert (await store.get_instance_by_ids(1, "ok_task")).status is TaskInstanceState.PENDING
+    finally:
+        await store.close()
+
+
+# --- mudae_state: durable per-account Mudae deadlines (F2 decision) ---
+
+
+async def test_mudae_deadline_roundtrip_and_fresh_lookup_replaces(tmp_path: Path) -> None:
+    """A $rtu lookup REPLACES the stored deadline: the reply is the
+    current truth (perk-dependent 5-20h — never assumed, always learned)."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(19 * 3600))
+        await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(3600))
+        deadlines = await store.mudae_deadlines(1)
+        assert deadlines[MudaeStateKind.RT] == _future(19 * 3600)
+        assert deadlines[MudaeStateKind.CLAIM] == _future(3600)
+
+        # Fresher lookup wins, even when it shows LESS time than stored
+        # (stored value was stale/wrong — replace and diagnose via log).
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(2 * 3600))
+        deadlines = await store.mudae_deadlines(1)
+        assert deadlines[MudaeStateKind.RT] == _future(2 * 3600)
+
+        # Accounts are isolated.
+        assert await store.mudae_deadlines(2) == {}
+    finally:
+        await store.close()
+
+
+async def test_mudae_deadline_rejects_naive_datetime(tmp_path: Path) -> None:
+    from autoclaimer.persistence import MudaeStateKind, PersistenceError
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        with pytest.raises(PersistenceError, match="timezone-naive"):
+            await store.set_mudae_deadline(
+                1, MudaeStateKind.CLAIM, datetime(2026, 10, 29, 12, 0, 0)
+            )
+    finally:
+        await store.close()
+
+
+async def test_mudae_deadlines_contain_corrupt_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hand-edited garbage in mudae_state must not crash the read; the
+    corrupt row is skipped with a diagnosable error (F3/F4 policy)."""
+    import logging
+
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(3600))
+        conn = store._connection()  # noqa: SLF001
+        conn.execute(
+            "INSERT OR REPLACE INTO mudae_state (account_id, kind, deadline, updated_at) "
+            "VALUES (1, 'claim', 'garbage', '2026-01-01T00:00:00+00:00')"
+        )
+        with caplog.at_level(logging.ERROR, logger="autoclaimer.persistence"):
+            deadlines = await store.mudae_deadlines(1)
+        assert set(deadlines) == {MudaeStateKind.RT}
+        assert "corrupt" in caplog.text.lower()
     finally:
         await store.close()
