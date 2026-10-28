@@ -60,7 +60,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
 | `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
 | `autoclaimer/mudae_parser/` | implemented (vendored) | LibzentSuite's stdlib-only Mudae parser, byte-identical at revision `41b0775`; rules/locales/settings engine with its 80-test ported suite. See its VENDORED.md. |
-| `autoclaimer/mudae.py` | implemented | Thin interface: `parse_mudae()` (str/ChannelMessage/MessageCreatedEvent/embed shapes) + typed `ClaimStatus` view for `$mu`/claim lines; durations stay relative. |
+| `autoclaimer/mudae.py` | implemented | Thin interface: `parse_mudae()` (str/ChannelMessage/MessageCreatedEvent/embed shapes), typed `ClaimStatus` ($mu lookups ride the claim-timer rule — no dedicated entry) and `RollsResetStatus` ($rtu replies; perk-dependent 5–20h — always learned, never assumed), and `anchor_deadline()` (relative→absolute UTC at the single persistence boundary). Durations stay relative until anchored. |
 
 Planned boundaries are documented, not implemented; no stub modules exist to
 avoid speculative code.
@@ -162,6 +162,15 @@ hooks, or webhook URLs exist in this repository.
   `DatabaseBusyError` (busy timeout) with causes preserved. No credentials
   are ever stored. Default rollback journal (WAL's shared memory is
   unreliable under PRoot).
+- **Mudae deadlines** (schema v3, `mudae_state` table): durable
+  per-account claim and `$rt` reset deadlines as absolute UTC
+  timestamps. A fresh lookup REPLACES the stored deadline (the reply is
+  the current truth); corrupt rows are contained per the same policy as
+  `task_instances`/`scope_cooldowns` (skipped with a typed, named error
+  log). The vestigial instance-level `cooldown_until`/`cooldown_scope`
+  columns remain untouched and unused by design (audit F2 decision:
+  Mudae deadlines live in `mudae_state`, keeping `task_instances`
+  generic).
 
 ## Phase 4: central rate limiter
 
