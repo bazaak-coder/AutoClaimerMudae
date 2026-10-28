@@ -246,18 +246,15 @@ The owner's existing restriction on remote operations remains in force: no remot
 
 Established practice to date (owner-directed): commits land on "main" directly, granularly per section 7.4, and pushes happen only on an explicit per-batch "push" instruction from the owner. That practice satisfies section 7.5's authorization requirement; the PR workflow below applies when the owner requests it (for example for externally reviewed or multi-contributor changes).
 
-Push classification rule (owner directive, 2026-10-28)
+Push routing by change type (owner rule, 2026-10-28)
 
-Before any authorized push, the batch must be classified by work type and severity, and the classification recorded (knowledgebase entry and, when a PR is used, its description):
+Classify every batch before pushing; the classification decides PR versus direct push. Pushes still happen only on the owner's explicit instruction — the routing rule decides *how*, not *whether*. Record the classification in the batch's knowledgebase entry and, when a PR is used, in its description.
 
-1. Breaking change — removes, renames, or resemantics public API; changes configuration format or persistence schema incompatibly; alters documented behavioral contracts; major dependency bumps; security-boundary rework. Severity: HIGH by default.
-2. Feature implementation change — additive features, defect fixes, documentation, and tests that preserve existing contracts. Severity: MEDIUM when default runtime behavior changes (new default delays/pacing, changed retry or recovery behavior), when new configuration defaults apply out of the box, or when authentication/lifecycle/persistence paths are touched; LOW otherwise (pure docs, tests-only, or internal additive changes with no observable default change).
+1. Breaking changes — always via pull request. Never direct-pushed to the default branch. This category includes: configuration format or version changes; persistence schema changes that alter, drop, or reinterpret existing state; public API or protocol changes (adapter contract, registry, store, CLI command semantics); error-classification or retry-semantics changes; dependency additions, removals, or version-bound changes. PR + full CI + independent review (Phases B-D) are mandatory before merge.
+2. Feature implementation changes — prefer a pull request over direct push so review can catch bugs. This category includes new runtime behavior: task handlers (Mudae claim/roll/$mu flows), new adapter operations, scheduler/limiter/worker behavior additions, and new persisted-state kinds. Direct push remains allowed only when the owner explicitly instructs it for a specific batch (for example a small, fully tested feature); the full local gate (section 10) applies either way.
+3. Everything else (documentation, test-only changes, CI/tooling chores, knowledgebase) follows the established direct-push flow above.
 
-Routing by classification:
-
-- HIGH (breaking) and MEDIUM (feature) batches go through the full PR workflow below (phases A-E, independent review, owner-approved merge).
-- LOW (feature) batches may follow the established owner-directed direct push per section 7.4 on explicit instruction.
-- When classification is uncertain, classify upward (PR). Mixed batches route by their highest-severity component. Owner instructions always override this rule.
+When in doubt about the classification, ask the owner; a batch mixing categories is pushed by its highest-review category.
 
 Phase A — Prepare the change
 
@@ -541,10 +538,9 @@ Never claim that tests passed without executing them. Never describe an unreview
 - [ ] Knowledgebase documentation is appended.
 - [ ] Dependencies and lockfiles are consistent.
 - [ ] No secrets or unrelated changes are included.
-- [ ] The PR has been independently reviewed (applies to the PR workflow; owner-directed direct pushes still require the full local gate).
+- [ ] The PR has been independently reviewed (required for breaking changes and preferred for feature work per section 8's push routing; owner-directed direct pushes still require the full local gate).
 - [ ] Confirmed defects and justified security findings have been addressed.
 - [ ] Required CI checks pass (CI: `.github/workflows/ci.yml` — locked install with extras, ruff, format, mypy, pytest; first green run 40393344534 confirmed 2026-10-26; check "gh run list" for the latest state).
-- [ ] Push classification (breaking vs feature, severity) recorded per section 8 before any push.
 - [ ] No unresolved critical or high-severity findings remain.
 - [ ] Owner approval has been obtained for required remote operations and merging.
 - [ ] The final report accurately describes the verified state.
