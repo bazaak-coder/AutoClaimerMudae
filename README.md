@@ -59,6 +59,8 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
 | `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
+| `autoclaimer/mudae_parser/` | implemented (vendored) | LibzentSuite's stdlib-only Mudae parser, byte-identical at revision `41b0775`; rules/locales/settings engine with its 80-test ported suite. See its VENDORED.md. |
+| `autoclaimer/mudae.py` | implemented | Thin interface: `parse_mudae()` (str/ChannelMessage/MessageCreatedEvent/embed shapes) + typed `ClaimStatus` view for `$mu`/claim lines; durations stay relative. |
 
 Planned boundaries are documented, not implemented; no stub modules exist to
 avoid speculative code.
