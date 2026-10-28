@@ -216,14 +216,20 @@ class DiscordAdapter:
 
     # ----- event subscription -----
 
-    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
+    def subscribe(
+        self,
+        consumer: EventConsumer,
+        *,
+        on_events_lost: Callable[[int], None] | None = None,
+    ) -> Callable[[], None]:
         """Subscribe to normalized inbound events for THIS account.
 
         Subscribers may register before ``start()``; events only flow once
         the gateway connection delivers them, so nothing is lost between
-        subscription and startup.
+        subscription and startup. ``on_events_lost`` is the loss/
+        reconciliation signal (milestone 5; forwarded verbatim).
         """
-        return self._events.subscribe(consumer)
+        return self._events.subscribe(consumer, on_events_lost=on_events_lost)
 
     # ----- lifecycle -----
 

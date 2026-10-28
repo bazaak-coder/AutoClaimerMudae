@@ -142,9 +142,18 @@ class RateLimitedAdapter:
     async def close(self) -> None:
         await self._inner.close()
 
-    def subscribe(self, consumer: EventConsumer) -> Callable[[], None]:
-        """Inbound events are not rate-limited operations; pass through."""
-        return self._inner.subscribe(consumer)
+    def subscribe(
+        self,
+        consumer: EventConsumer,
+        *,
+        on_events_lost: Callable[[int], None] | None = None,
+    ) -> Callable[[], None]:
+        """Inbound events are not rate-limited operations; pass through.
+
+        ``on_events_lost`` forwards to the inner adapter so the loss/
+        reconciliation signal is uniform across adapter implementations.
+        """
+        return self._inner.subscribe(consumer, on_events_lost=on_events_lost)
 
     async def get_channel(self, channel_id: int) -> ChannelInfo | None:
         """Cache-only channel lookup: not a platform operation, never limited."""
@@ -511,6 +520,32 @@ class WorkerManager:
                 "outcome": outcome.status.value,
             },
         )
+        if outcome.retry_at is not None and outcome.retry_at.tzinfo is None:
+            # Consolidated review #6: validate ONCE for every status —
+            # `_outcome_json` serializes retry_at regardless of status,
+            # and persistence would reject a naive timestamp mid-record,
+            # stranding the claimed row in `running`. A naive deadline is
+            # a handler CONTRACT VIOLATION (§17.2.5): fail terminally
+            # with an explicit message; supervision continues.
+            logger.error(
+                "handler returned a timezone-naive retry_at; failing attempt terminally",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.execute",
+                    "outcome": "invalid_retry_at",
+                },
+            )
+            await self._record(
+                record.id,
+                TaskOutcome(
+                    TaskStatus.FAILED_PERMANENT,
+                    message="handler returned a timezone-naive retry_at; "
+                    "deadline rejected at the worker boundary",
+                ),
+                retry_at=None,
+            )
+            return
         if outcome.status is TaskStatus.SUCCEEDED:
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
@@ -527,8 +562,17 @@ class WorkerManager:
                     retry_at=None,
                 )
                 return
-            delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
-            await self._record(record.id, outcome, retry_at=self._wall() + timedelta(seconds=delay))
+            if outcome.retry_at is not None:
+                # Milestone 4 (retry ownership): a LEARNED absolute UTC
+                # deadline (parsed from a Mudae reply, anchored at the
+                # domain boundary) supersedes generic transport backoff.
+                # An already-expired deadline means "due now". Naive
+                # values were rejected above, for every status.
+                retry_at = max(outcome.retry_at, self._wall())
+            else:
+                delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
+                retry_at = self._wall() + timedelta(seconds=delay)
+            await self._record(record.id, outcome, retry_at=retry_at)
         else:
             await self._record(record.id, outcome, retry_at=None)
 

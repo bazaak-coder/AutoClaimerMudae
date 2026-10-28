@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -52,11 +53,19 @@ class TaskStatus(Enum):
 
 @dataclass(frozen=True)
 class TaskOutcome:
-    """Structured result of one task execution."""
+    """Structured result of one task execution.
+
+    ``retry_at`` (milestone 4: retry ownership) lets a handler hand the
+    scheduler a LEARNED absolute UTC deadline — parsed from a Mudae
+    reply and anchored via ``autoclaimer.mudae.anchor_deadline`` —
+    which supersedes generic transport backoff for recoverable
+    outcomes. Attempt-count bounds still apply.
+    """
 
     status: TaskStatus
     message: str = ""
     data: Mapping[str, Any] = field(default_factory=dict)
+    retry_at: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -177,3 +177,411 @@ async def test_cooldown_recorded_during_permit_wait_gates_operation() -> None:
     elapsed = asyncio.get_running_loop().time() - started
     assert result == "ran"
     assert elapsed >= 0.1  # gated until the cooldown expired (0.15s deadline)
+
+
+# Milestone 5: event-loss recovery — loss signaling and queue pressure
+
+
+async def test_on_events_lost_fires_on_overflow_with_cumulative_count() -> None:
+    """A subscriber that must not miss actionable events registers a
+    loss callback: drop-oldest overflow invokes it with the CUMULATIVE
+    dropped count (delta-safe for consumers that diff)."""
+    dispatcher = EventDispatcher(queue_size=1, name="loss")
+    lost: list[int] = []
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()  # never drains
+
+    dispatcher.subscribe(slow, on_events_lost=lost.append)
+    for _ in range(3):
+        await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert lost == [1, 2]  # two oldest dropped while queue holds 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_loss_callback_exceptions_are_isolated() -> None:
+    """A broken loss callback must not break dispatch (isolation
+    boundary per agents.md section 17.4) and must not hide the loss."""
+    dispatcher = EventDispatcher(queue_size=1, name="boomloss")
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    def broken(count: int) -> None:
+        raise RuntimeError("callback bug")
+
+    dispatcher.subscribe(slow, on_events_lost=broken)
+    for _ in range(2):
+        await dispatcher.dispatch(make_event())  # must not raise
+    await asyncio.sleep(0.02)
+    assert dispatcher.dropped == 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_stats_expose_queue_pressure_and_drops() -> None:
+    dispatcher = EventDispatcher(queue_size=2, name="stats")
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    async def idle(event: Any) -> None:
+        return None
+
+    dispatcher.subscribe(slow)
+    dispatcher.subscribe(idle)
+    for _ in range(4):
+        await dispatcher.dispatch(make_event())
+        await asyncio.sleep(0)  # let the draining subscriber keep up
+    stats = dispatcher.stats()
+    assert stats.subscriber_count == 2
+    # Arithmetic: of 4 events, the slow subscriber consumed 1 (then hung
+    # inside that consumer call), 2 sit queued, and 1 was dropped.
+    assert stats.total_dropped == 1
+    assert sum(stats.subscriber_dropped.values()) == 1
+    assert max(stats.queue_depths.values()) == 2  # slow subscriber's backlog
+    assert min(stats.queue_depths.values()) == 0  # idle subscriber drained
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_stop_reports_undelivered_events_as_lost() -> None:
+    """N4 observability: events still queued at stop() (e.g. adapter
+    eviction) are reported to the loss callback instead of vanishing
+    silently. No yields between dispatch and stop, so both events are
+    still queued (the pump never ran)."""
+    dispatcher = EventDispatcher(queue_size=8, name="stoploss")
+    lost: list[int] = []
+
+    async def parked(event: Any) -> None:
+        await asyncio.Event().wait()  # would never drain
+
+    dispatcher.subscribe(parked, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await dispatcher.dispatch(make_event())
+    assert lost == []  # queued, not dropped
+    await dispatcher.stop(pump_timeout=0.2)
+    assert lost == [2]  # both undelivered events reported at shutdown
+    assert dispatcher.dropped == 2  # honest global accounting
+
+
+# PR #3 review fix: interrupted in-flight delivery is a loss
+
+
+async def test_stop_reports_in_flight_event_interrupted_delivery() -> None:
+    """Review finding 1: an event already dequeued by the pump and
+    blocked inside its consumer is invisible to queue.qsize() — stop()
+    must still count and report it (no silent hole in the loss
+    contract), without double-counting (in-flight and queued are
+    disjoint sets)."""
+    dispatcher = EventDispatcher(queue_size=4, name="inflight")
+    lost: list[int] = []
+    started = asyncio.Event()
+
+    async def stuck_mid_delivery(event: Any) -> None:
+        started.set()
+        await asyncio.Event().wait()  # blocks INSIDE the consumer
+
+    dispatcher.subscribe(stuck_mid_delivery, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await started.wait()  # the pump now holds the event in the consumer
+    assert sum(dispatcher.stats().queue_depths.values()) == 0  # queue empty
+    await dispatcher.stop(pump_timeout=0.2)
+    assert lost == [1]  # the interrupted delivery IS a loss
+    assert dispatcher.dropped == 1
+
+
+# PR #3 follow-up review: self-stop must not report its own in-flight event
+
+
+async def test_self_stop_does_not_report_own_in_flight_as_lost() -> None:
+    """stop() is documented safe to call from inside a consumer; that
+    pump is deliberately NOT cancelled — it resumes and finishes the
+    delivery. The completed event must not be counted or reported as a
+    loss (false loss would trigger needless reconciliation)."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfloss")
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def self_stopping(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        delivered.append(event)  # completes AFTER stop() returned
+
+    dispatcher.subscribe(self_stopping, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.05)  # pump entered the consumer; stop() ran inside it
+
+    assert len(delivered) == 1  # the event WAS delivered
+    assert lost == []  # therefore not a loss
+    assert dispatcher.dropped == 0
+
+
+# PR #3 third-round review: self-stop must not keep draining the queue
+
+
+async def test_self_stop_finishes_current_but_never_drains_queue() -> None:
+    """The surviving (self-stopping) pump may finish its CURRENT
+    consumer call — and nothing more: events queued behind it are
+    reported lost exactly once and are never delivered after stop(); the
+    pump exits instead of resuming its loop."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfdrain")
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def self_stopping(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        delivered.append(event)  # finishes AFTER stop() returned
+
+    dispatcher.subscribe(self_stopping, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # becomes the in-flight event
+    await dispatcher.dispatch(make_event())  # queued behind
+    await dispatcher.dispatch(make_event())  # queued behind
+    await asyncio.sleep(0.05)  # pump entered the consumer; stop() ran inside
+
+    assert len(delivered) == 1  # current event finished, not reported lost
+    await asyncio.sleep(0.05)  # the pump loop resumes: it must EXIT
+    assert len(delivered) == 1  # queued events were NOT delivered after stop
+    assert lost == [2]  # both queued events reported lost exactly once
+    assert dispatcher.dropped == 2
+    assert pumps[0] is not None and pumps[0].done()  # pump exited
+
+
+# Consolidated review (#1 variant, #2, #3): loss lifecycle completeness
+
+
+async def test_self_stop_with_blocked_consumer_release_after_stop() -> None:
+    """Reviewer's exact sequence: the self-stopping consumer blocks on
+    the first event with another queued behind it, stop() runs, the
+    consumer is released afterwards."""
+    dispatcher = EventDispatcher(queue_size=4, name="blockedrelease")
+    release = asyncio.Event()
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def blocked(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        await release.wait()  # blocks AFTER stop() returned
+        delivered.append(event)
+
+    dispatcher.subscribe(blocked, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # in-flight
+    await dispatcher.dispatch(make_event())  # queued behind
+    await asyncio.sleep(0.05)  # consumer entered; stop() ran inside it
+    assert lost == [1]  # queued event: lost exactly once
+    release.set()
+    await asyncio.sleep(0.05)
+    assert len(delivered) == 1  # first event finished after release; not a loss
+    assert lost == [1]  # queued event never delivered
+    assert pumps[0] is not None and pumps[0].done()
+
+
+async def test_consumer_exception_counts_loss_and_continues() -> None:
+    """Review #2: a consumer invocation that raises has NOT processed
+    its event — that is a loss for reconciliation purposes (counted +
+    reported), and the pump must continue with later events."""
+    dispatcher = EventDispatcher(queue_size=4, name="boomcount")
+    lost: list[int] = []
+    processed: list[Any] = []
+
+    async def flaky(event: Any) -> None:
+        processed.append(event)
+        if len(processed) == 1:
+            raise RuntimeError("consumer bug")
+
+    dispatcher.subscribe(flaky, on_events_lost=lost.append)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert lost == [1]  # the failed invocation's event: reported lost
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    assert len(processed) == 2  # the pump survived and delivered the next
+    assert lost == [1]  # no extra losses
+    assert dispatcher.dropped == 1
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_unsubscribe_accounts_queued_and_inflight_losses() -> None:
+    """Review #3 (external unsubscribe): queued + in-flight events are
+    abandoned — counted and reported exactly once, pump cancelled."""
+    dispatcher = EventDispatcher(queue_size=4, name="unsub")
+    lost: list[int] = []
+    started = asyncio.Event()
+
+    async def stuck(event: Any) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    unsubscribe = dispatcher.subscribe(stuck, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # becomes in-flight
+    await started.wait()
+    await dispatcher.dispatch(make_event())  # queued behind
+    unsubscribe()
+    assert lost == [2]  # in-flight (interrupted) + queued: both lost
+    assert dispatcher.dropped == 2
+    await asyncio.sleep(0.02)
+    assert pumps[0] is not None and pumps[0].done()  # cancelled, ended
+
+
+async def test_self_unsubscribe_finishes_current_accounts_queue_only() -> None:
+    """Review #3 (self-unsubscribe): no self-cancellation; the current
+    callback finishes (not a loss), queued events are accounted, and the
+    pump exits instead of draining."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfunsub")
+    lost: list[int] = []
+    delivered: list[Any] = []
+    unsubscribe_holder: list[Any] = []
+
+    async def one_shot(event: Any) -> None:
+        unsubscribe_holder[0]()  # its own unsubscribe, mid-callback
+        delivered.append(event)
+
+    unsubscribe_holder.append(dispatcher.subscribe(one_shot, on_events_lost=lost.append))
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # in-flight
+    await dispatcher.dispatch(make_event())  # queued at unsubscribe time
+    await asyncio.sleep(0.05)
+    assert len(delivered) == 1  # current callback finished
+    assert lost == [1]  # ONLY the queued event accounted as lost
+    assert dispatcher.dropped == 1
+    await dispatcher.dispatch(make_event())  # gone subscription: no crash
+    await asyncio.sleep(0.02)
+    assert len(delivered) == 1  # nothing further delivered
+    assert pumps[0] is not None and pumps[0].done()  # pump exited
+
+
+# Review follow-up: subscribing after stop must be explicit
+
+
+async def test_subscribe_after_stop_is_rejected() -> None:
+    """stop() is terminal: a subscription accepted afterwards would have
+    an already-exited pump and silently drop every future dispatch.
+    The API rejects it loudly instead."""
+    dispatcher = EventDispatcher(queue_size=2, name="poststop")
+
+    async def consumer(event: Any) -> None:
+        return None
+
+    await dispatcher.stop()
+    with pytest.raises(RuntimeError, match="stopped"):
+        dispatcher.subscribe(consumer)
+
+
+# Dual-agent adversarial audit: racy/leaky lifecycle hardening
+
+
+async def test_stop_survives_loss_callback_that_unsubscribes() -> None:
+    """Audit F1 (both agents): a loss callback may unsubscribe during
+    stop()'s counting — arbitrary user code at an isolation boundary.
+    stop() must complete, account each subscription exactly once, and
+    cancel every pump (no half-dead dispatcher)."""
+    dispatcher = EventDispatcher(queue_size=4, name="stopmut")
+
+    async def parked(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    unsub_holder: list[Any] = []
+    a_lost: list[int] = []
+    b_lost: list[int] = []
+
+    dispatcher.subscribe(parked, on_events_lost=a_lost.append)
+    unsubscribe_b = dispatcher.subscribe(parked, on_events_lost=b_lost.append)
+    unsub_holder.append(unsubscribe_b)
+
+    def b_on_loss(count: int) -> None:
+        b_lost.append(count)
+        unsub_holder[0]()  # mutates _subscribers during stop()'s iteration
+
+    dispatcher._subscribers[2].on_loss = b_on_loss  # noqa: SLF001
+    for _ in range(3):
+        await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)  # pumps take one event each, park inside
+
+    await dispatcher.stop(pump_timeout=0.2)  # must not raise
+    # Each subscription accounted exactly once (2 queued + 1 in-flight = 3).
+    assert a_lost == [3]
+    assert b_lost == [3]
+    assert dispatcher.dropped == 6  # 3 per subscription, no double count
+    assert dispatcher._subscribers == {}  # noqa: SLF001  # fully torn down
+
+
+async def test_dispatch_to_subscription_unsubscribed_mid_dispatch() -> None:
+    """Audit F2/F3: an overflow loss callback that unsubscribes must not
+    strand the in-flight put on a dead queue — the event is counted as
+    dropped, never silently vanished."""
+    dispatcher = EventDispatcher(queue_size=1, name="deadput")
+    lost: list[int] = []
+    unsub_holder: list[Any] = []
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()  # would never drain
+
+    def on_loss(count: int) -> None:
+        lost.append(count)
+        unsub_holder[0]()  # unsubscribe synchronously, mid-dispatch
+
+    unsub_holder.append(dispatcher.subscribe(slow, on_events_lost=on_loss))
+    dead_queue = dispatcher._subscribers[1].queue  # noqa: SLF001
+    # No yields: both dispatches are atomic, so e1 is still QUEUED when
+    # e2 arrives -> overflow -> callback unsubscribes -> dead target.
+    await dispatcher.dispatch(make_event())  # e1 queued
+    await dispatcher.dispatch(make_event())  # e2: overflow drop -> unsubscribe
+    assert lost == [1]  # e1's overflow drop reported
+    assert dispatcher.dropped == 2  # e1 (drop-oldest) + e2 (dead target)
+    assert dead_queue.qsize() == 0  # e2 never stranded on the dead queue
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_dispatch_after_stop_is_counted_not_silent() -> None:
+    """Audit F2 (race)/F9a (leak): post-stop dispatch must not be a
+    silent black hole — symmetric with the loud post-stop subscribe
+    rejection: counted and logged."""
+    dispatcher = EventDispatcher(queue_size=2, name="poststopdispatch")
+    await dispatcher.stop()
+    await dispatcher.dispatch(make_event())  # must not raise, must not vanish
+    assert dispatcher.dropped == 1
+    await dispatcher.dispatch(make_event())
+    assert dispatcher.dropped == 2
+
+
+def test_non_positive_queue_size_is_rejected() -> None:
+    """Audit F3 (leak): queue_size <= 0 would create an UNBOUNDED queue
+    (full() always False on this Python) — contradicting the bounded
+    contract invisibly."""
+    with pytest.raises(ValueError, match="positive"):
+        EventDispatcher(queue_size=0)
+    with pytest.raises(ValueError, match="positive"):
+        EventDispatcher(queue_size=-3)
+
+
+async def test_stop_timeout_logs_surviving_pump_no_double_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Audit F4+F5 (leak): a cancellation-suppressing consumer surviving
+    the stop timeout is logged (docstring promise), and its later
+    failure does not double-count the already-reported loss."""
+    import logging
+
+    dispatcher = EventDispatcher(queue_size=2, name="survivor")
+    released = asyncio.Event()
+
+    async def suppressor(event: Any) -> None:
+        try:
+            await released.wait()
+        except asyncio.CancelledError:
+            await released.wait()  # suppress cancellation until released
+            raise RuntimeError("late failure") from None  # non-cancel error
+
+    dispatcher.subscribe(suppressor)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.adapters"):
+            await dispatcher.stop(pump_timeout=0.05)  # survivor abandoned, stop returns
+        assert dispatcher.dropped == 1  # in-flight counted ONCE at stop
+        assert "surviv" in caplog.text  # the abandoned pump is logged
+    finally:
+        released.set()  # let the suppressor finish before loop teardown
+    await asyncio.sleep(0.05)  # survivor resumes, re-raises Cancelled, fails the pump
+    assert dispatcher.dropped == 1  # no second count from the pump's failure

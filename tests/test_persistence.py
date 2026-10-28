@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 2
+        assert version_row[0] == s.schema_version == 3  # v3: mudae_state added
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -99,7 +99,7 @@ async def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
 # --- scope cooldowns (migration v2, rate-limiter persistence) ---
 
 
-async def test_v1_database_is_migrated_to_v2(tmp_path: Path) -> None:
+async def test_v1_database_is_migrated_to_current(tmp_path: Path) -> None:
     path = tmp_path / "state.db"
     s = await make_store(path)
     await s.close()
@@ -118,7 +118,7 @@ async def test_v1_database_is_migrated_to_v2(tmp_path: Path) -> None:
         assert len(rows) == 1
         version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == 2
+        assert version_row[0] == migrated.schema_version == 3  # v3: mudae_state added
     finally:
         await migrated.close()
 
@@ -455,3 +455,264 @@ async def test_operations_before_open_are_refused() -> None:
     store = TaskStateStore(":memory:")
     with pytest.raises(PersistenceError, match="not open"):
         await store.list_instances()
+
+
+# --- corrupt persisted state (audit F3/F4) ---
+
+
+def _future(seconds: int) -> datetime:
+    return BASE_TIME + timedelta(seconds=seconds)
+
+
+async def _inject_raw_rows(store: TaskStateStore, *rows: tuple[str, str, int]) -> None:
+    conn = store._connection()  # noqa: SLF001  # test: simulate hand-edited/corrupt rows
+    for scope, deadline, server_directed in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO scope_cooldowns (scope, deadline, server_directed) "
+            "VALUES (?, ?, ?)",
+            (scope, deadline, server_directed),
+        )
+
+
+async def test_active_scope_cooldowns_skips_corrupt_deadline_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F3: a malformed deadline must not crash the scan with a raw
+    ValueError. The corrupt row is skipped with an error log naming the
+    scope; valid rows still load (audit T5: startup continues)."""
+    import logging
+
+    clock = FakeClock()
+    store = TaskStateStore(tmp_path / "state.db", clock=clock)
+    await store.open()
+    try:
+        await store.set_scope_cooldown("account:1", _future(300), server_directed=True)
+        await _inject_raw_rows(
+            store,
+            ("account:2", "not-a-timestamp", 1),
+            # naive-but-future-sorting: passes the SQL string filter, then
+            # must be rejected by parsing (F4 via the F3 path)
+            ("account:3", "2027-01-01T00:00:00", 0),
+        )
+        with caplog.at_level(logging.ERROR, logger="autoclaimer.persistence"):
+            active = await store.active_scope_cooldowns()
+        assert set(active) == {"account:1"}  # only the valid row survives
+        assert "account:2" in caplog.text and "account:3" in caplog.text
+        assert "corrupt" in caplog.text.lower()
+    finally:
+        await store.close()
+
+
+async def test_load_persisted_cooldowns_survives_corrupt_rows(tmp_path: Path) -> None:
+    """F3 end-to-end: manager startup cooldown loading must not raise on
+    a corrupt row (typed containment, not a crash)."""
+    from autoclaimer.ratelimit import RateLimiter
+
+    clock = FakeClock()
+    store = TaskStateStore(tmp_path / "state.db", clock=clock)
+    await store.open()
+    try:
+        await store.set_scope_cooldown("account:1", _future(300), server_directed=True)
+        await _inject_raw_rows(store, ("account:2", "garbage", 1))
+        limiter = RateLimiter(store=store, wall=clock)
+        await limiter.load_persisted_cooldowns()  # must not raise
+        loaded = {info.scope for info in limiter.status().cooldowns}
+        assert "account:1" in loaded
+        assert "account:2" not in loaded
+    finally:
+        await store.close()
+
+
+async def test_parse_ts_rejects_naive_timestamps() -> None:
+    """F4: naive persisted timestamps are invalid data, not silently
+    reinterpreted as UTC (agents.md section 17.6)."""
+    from autoclaimer.persistence import _parse_ts
+
+    with pytest.raises(ValueError, match="timezone-naive"):
+        _parse_ts("2026-01-01T00:00:00")
+    aware = _parse_ts("2026-01-01T00:00:00+02:00")
+    offset = aware.utcoffset()
+    assert offset is not None
+    assert offset.total_seconds() == 0  # normalized to UTC
+
+
+async def test_naive_timestamp_row_is_treated_as_corrupt(tmp_path: Path) -> None:
+    """F4 end-to-end: a hand-edited naive timestamp in task_instances is
+    contained as a corrupt row (skipped in scans, typed error on direct
+    fetch) instead of being silently reinterpreted."""
+    from autoclaimer.persistence import PersistenceError, TaskInstanceState
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.create_instance(1, "ok_task")
+        conn = store._connection()  # noqa: SLF001
+        conn.execute(
+            "INSERT INTO task_instances "
+            "(account_id, task_id, status, created_at, updated_at) "
+            "VALUES (1, 'naive_task', 'pending', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        listed = await store.list_instances_by_account(1)
+        assert {r.task_id for r in listed} == {"ok_task"}  # corrupt row skipped
+
+        naive_row_id = conn.execute(
+            "SELECT id FROM task_instances WHERE task_id = 'naive_task'"
+        ).fetchone()[0]
+        with pytest.raises(PersistenceError, match="corrupt"):
+            await store.get_instance(naive_row_id)
+        assert (await store.get_instance_by_ids(1, "ok_task")).status is TaskInstanceState.PENDING
+    finally:
+        await store.close()
+
+
+# --- mudae_state: durable per-account Mudae deadlines (F2 decision) ---
+
+
+async def test_mudae_deadline_roundtrip_and_fresh_lookup_replaces(tmp_path: Path) -> None:
+    """A $rtu lookup REPLACES the stored deadline: the reply is the
+    current truth (perk-dependent 5-20h — never assumed, always learned)."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(19 * 3600))
+        await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(3600))
+        deadlines = await store.mudae_deadlines(1)
+        assert deadlines[MudaeStateKind.RT] == _future(19 * 3600)
+        assert deadlines[MudaeStateKind.CLAIM] == _future(3600)
+
+        # Fresher lookup wins, even when it shows LESS time than stored
+        # (stored value was stale/wrong — replace and diagnose via log).
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(2 * 3600))
+        deadlines = await store.mudae_deadlines(1)
+        assert deadlines[MudaeStateKind.RT] == _future(2 * 3600)
+
+        # Accounts are isolated.
+        assert await store.mudae_deadlines(2) == {}
+    finally:
+        await store.close()
+
+
+async def test_mudae_deadline_rejects_naive_datetime(tmp_path: Path) -> None:
+    from autoclaimer.persistence import MudaeStateKind, PersistenceError
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        with pytest.raises(PersistenceError, match="timezone-naive"):
+            await store.set_mudae_deadline(
+                1, MudaeStateKind.CLAIM, datetime(2026, 10, 29, 12, 0, 0)
+            )
+    finally:
+        await store.close()
+
+
+async def test_mudae_deadlines_contain_corrupt_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hand-edited garbage in mudae_state must not crash the read; the
+    corrupt row is skipped with a diagnosable error (F3/F4 policy)."""
+    import logging
+
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(3600))
+        conn = store._connection()  # noqa: SLF001
+        conn.execute(
+            "INSERT OR REPLACE INTO mudae_state (account_id, kind, deadline, updated_at) "
+            "VALUES (1, 'claim', 'garbage', '2026-01-01T00:00:00+00:00')"
+        )
+        with caplog.at_level(logging.ERROR, logger="autoclaimer.persistence"):
+            deadlines = await store.mudae_deadlines(1)
+        assert set(deadlines) == {MudaeStateKind.RT}
+        assert "corrupt" in caplog.text.lower()
+    finally:
+        await store.close()
+
+
+# --- domain-scheduled retries (milestone 4: retry ownership) ---
+
+
+async def test_schedule_attempt_sets_waiting_until_absolute_deadline(tmp_path: Path) -> None:
+    """The Mudae task layer schedules retries from LEARNED deadlines
+    (parsed replies anchored to UTC) — not transport backoff. The
+    instance stays waiting and not due until the deadline passes."""
+    store = await make_store(tmp_path / "state.db")
+    clock = store._clock
+    assert isinstance(clock, FakeClock)
+    try:
+        record = await store.create_instance(1, "roll")
+        await store.schedule_attempt(record.id, _future(3600))
+        waiting = await store.get_instance(record.id)
+        assert waiting.status is TaskInstanceState.WAITING
+        assert waiting.next_attempt_at == _future(3600)
+
+        due = await store.due_instances()
+        assert record.id not in [r.id for r in due]  # not due yet
+
+        clock.advance(3601)  # deadline passes -> claimable again
+        due = await store.due_instances()
+        assert record.id in [r.id for r in due]
+    finally:
+        await store.close()
+
+
+async def test_schedule_attempt_replaces_previous_schedule(tmp_path: Path) -> None:
+    """Fresher domain information replaces an earlier deadline (an $rtu
+    re-check supersedes the previous assumption)."""
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        await store.schedule_attempt(record.id, _future(7200))
+        await store.schedule_attempt(record.id, _future(1800))  # re-learned
+        waiting = await store.get_instance(record.id)
+        assert waiting.next_attempt_at == _future(1800)
+    finally:
+        await store.close()
+
+
+async def test_schedule_attempt_rejects_naive_and_terminal(tmp_path: Path) -> None:
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        with pytest.raises(PersistenceError, match="timezone-naive"):
+            await store.schedule_attempt(record.id, datetime(2026, 10, 29, 12, 0, 0))
+
+        succeeded = await store.claim(record.id)
+        from autoclaimer.registry import TaskOutcome, TaskStatus
+
+        await store.record_success(succeeded.id, TaskOutcome(TaskStatus.SUCCEEDED, message="done"))
+        with pytest.raises(StateTransitionError):
+            await store.schedule_attempt(succeeded.id, _future(60))
+    finally:
+        await store.close()
+
+
+# Consolidated review #5: an available $rtu lookup clears a stale deadline
+
+
+async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
+    """Persist a future RT deadline, then learn '$rt is available!':
+    the clear operation removes the stale deadline — later reads cannot
+    return it as current truth. Clearing an absent row is a no-op."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(19 * 3600))
+        await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(3600))
+        # Before: the future deadline IS current truth.
+        assert MudaeStateKind.RT in await store.mudae_deadlines(1)
+
+        await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # available lookup
+        # After: NO stale value survives — subsequent reads cannot
+        # return the cleared deadline as current truth.
+        deadlines = await store.mudae_deadlines(1)
+        assert MudaeStateKind.RT not in deadlines
+        assert deadlines.get(MudaeStateKind.RT) is None
+        assert MudaeStateKind.CLAIM in deadlines  # untouched kinds survive
+
+        await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # no-op
+        assert MudaeStateKind.RT not in await store.mudae_deadlines(1)
+    finally:
+        await store.close()

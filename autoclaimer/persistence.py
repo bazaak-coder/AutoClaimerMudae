@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 5000
 
 _MIGRATIONS: dict[int, str] = {
@@ -81,6 +81,15 @@ _MIGRATIONS: dict[int, str] = {
         scope TEXT PRIMARY KEY,
         deadline TEXT NOT NULL,
         server_directed INTEGER NOT NULL
+    );
+    """,
+    3: """
+    CREATE TABLE IF NOT EXISTS mudae_state (
+        account_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('claim', 'rt')),
+        deadline TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, kind)
     );
     """,
 }
@@ -115,6 +124,19 @@ class TaskInstanceState(Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class MudaeStateKind(Enum):
+    """Kinds of durable per-account Mudae deadlines (``mudae_state``).
+
+    ``CLAIM``: the claim cooldown deadline (learned from ``$mu`` /
+    claim-line replies via the claim-timer rule).
+    ``RT``: the ``$rt`` rolls-reset deadline (learned from ``$rtu``
+    replies; perk-dependent 5h-20h — never assumed, always looked up).
+    """
+
+    CLAIM = "claim"
+    RT = "rt"
 
 
 RESUMABLE_STATES = frozenset({TaskInstanceState.PENDING, TaskInstanceState.WAITING})
@@ -156,7 +178,13 @@ def _format_ts(value: datetime) -> str:
 
 def _parse_ts(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        # Naive timestamps are invalid persisted data: every write path
+        # produces timezone-aware UTC strings, so naive means corrupt or
+        # hand-edited state. Refuse to reinterpret it (agents.md
+        # section 17.6; audit F4) — callers treat this as a corrupt row.
+        raise ValueError(f"timezone-naive persisted timestamp {value!r}")
+    return parsed.astimezone(UTC)
 
 
 def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
@@ -532,6 +560,33 @@ class TaskStateStore:
         )
         return changed
 
+    async def schedule_attempt(self, instance_id: int, at: datetime) -> TaskInstanceRecord:
+        """Schedule the next attempt at an ABSOLUTE UTC deadline.
+
+        Milestone 4 (retry ownership): the Mudae task layer calls this
+        with deadlines LEARNED from parsed replies (anchored via
+        ``autoclaimer.mudae.anchor_deadline``) — never with fabricated or
+        transport-backoff values. ``pending|waiting -> waiting`` with
+        ``next_attempt_at = at`` (a fresh schedule replaces an earlier
+        one: latest observation wins, mirroring ``mudae_state``).
+        Terminal rows reject the transition; ``running`` rows belong to
+        their executing worker and are rejected too. Naive datetimes are
+        refused by ``_format_ts``.
+        """
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'waiting', next_attempt_at = ?, "
+            "updated_at = ? WHERE id = ? AND status IN ('pending', 'waiting')",
+            (_format_ts(at), now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            raise StateTransitionError(
+                f"Cannot schedule task instance {instance_id} from state '{current.status.value}'."
+            )
+        return await self.get_instance(instance_id)
+
     # ----- scope cooldowns (rate limiter persistence) -----
 
     async def set_scope_cooldown(
@@ -557,16 +612,103 @@ class TaskStateStore:
         )
 
     async def active_scope_cooldowns(self) -> dict[str, tuple[datetime, bool]]:
-        """Return unexpired scope cooldowns as {scope: (deadline, server_directed)}."""
+        """Return unexpired scope cooldowns as {scope: (deadline, server_directed)}.
+
+        Corrupt rows (malformed or timezone-naive deadline, non-integer
+        flag) are contained: skipped with an ERROR log naming the scope,
+        raising a typed ``PersistenceError`` only as the logged diagnosis
+        (audit F3). One bad row must never crash manager startup — a
+        skipped cooldown self-corrects when the next violation re-records
+        it, and the log makes the corruption diagnosable.
+        """
         now = _format_ts(self._clock())
         rows = await self._run(
             self._fetchall_sync,
             "SELECT scope, deadline, server_directed FROM scope_cooldowns WHERE deadline > ?",
             (now,),
         )
-        return {
-            row["scope"]: (_parse_ts(row["deadline"]), bool(row["server_directed"])) for row in rows
-        }
+        cooldowns: dict[str, tuple[datetime, bool]] = {}
+        for row in rows:
+            scope = row["scope"]
+            try:
+                deadline = _parse_ts(row["deadline"])
+                server_directed = int(row["server_directed"])
+                if server_directed not in (0, 1):
+                    raise ValueError(f"server_directed flag is {row['server_directed']!r}")
+            except (ValueError, TypeError) as exc:
+                error = PersistenceError(
+                    f"corrupt scope_cooldowns row scope={scope!r}: {type(exc).__name__}: {exc}"
+                )
+                logger.error("skipping %s", error)
+                continue
+            cooldowns[scope] = (deadline, bool(server_directed))
+        return cooldowns
+
+    # ----- Mudae deadlines (per-account durable domain state) -----
+
+    async def set_mudae_deadline(
+        self, account_id: int, kind: MudaeStateKind, deadline: datetime
+    ) -> None:
+        """Store one learned Mudae deadline (absolute UTC).
+
+        A fresh lookup REPLACES the stored value: the reply is the
+        current truth (an ``$rtu`` check after ``$rt`` use supersedes any
+        previously assumed deadline). Naive datetimes are rejected at
+        this boundary (``_format_ts``).
+        """
+        now = _format_ts(self._clock())
+        await self._run(
+            self._update_sync,
+            "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (account_id, kind) DO UPDATE SET "
+            "deadline = excluded.deadline, updated_at = excluded.updated_at",
+            (account_id, kind.value, _format_ts(deadline), now),
+        )
+
+    async def clear_mudae_deadline(self, account_id: int, kind: MudaeStateKind) -> None:
+        """Remove one learned Mudae deadline (no-op if absent).
+
+        Consolidated review #5: an ``$rtu`` lookup reporting AVAILABLE
+        ("$rt is available!") supersedes any previously stored deadline —
+        the ready state is current truth, so the stale future deadline is
+        cleared rather than left to mislead later reads. "Missing
+        duration is not zero" semantics are untouched: absence after a
+        clear means "known available", never a fabricated deadline.
+        """
+        await self._run(
+            self._update_sync,
+            "DELETE FROM mudae_state WHERE account_id = ? AND kind = ?",
+            (account_id, kind.value),
+        )
+
+    async def mudae_deadlines(self, account_id: int) -> dict[MudaeStateKind, datetime]:
+        """Learned deadlines for one account ({kind: deadline}).
+
+        Corrupt rows (malformed/naive deadline, unknown kind) are
+        contained per the F3/F4 policy: skipped with an ERROR log naming
+        account and kind; the read never crashes.
+        """
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT kind, deadline FROM mudae_state WHERE account_id = ?",
+            (account_id,),
+        )
+        deadlines: dict[MudaeStateKind, datetime] = {}
+        for row in rows:
+            kind_raw = row["kind"]
+            try:
+                kind = MudaeStateKind(kind_raw)
+                deadline = _parse_ts(row["deadline"])
+            except (ValueError, TypeError) as exc:
+                error = PersistenceError(
+                    f"corrupt mudae_state row account={account_id} kind={kind_raw!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.error("skipping %s", error)
+                continue
+            deadlines[kind] = deadline
+        return deadlines
 
     # ----- internals -----
 
@@ -611,7 +753,10 @@ class TaskStateStore:
 
 
 def _outcome_json(outcome: TaskOutcome) -> str:
-    return json.dumps({"status": outcome.status.value, "message": outcome.message})
+    payload: dict[str, Any] = {"status": outcome.status.value, "message": outcome.message}
+    if outcome.retry_at is not None:
+        payload["retry_at"] = _format_ts(outcome.retry_at)
+    return json.dumps(payload)
 
 
 def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]:
@@ -644,8 +789,11 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
     outcome: TaskOutcome | None = None
     if outcome_raw is not None:
         payload = json.loads(outcome_raw)
+        retry_at_raw = payload.get("retry_at")
         outcome = TaskOutcome(
-            status=TaskStatus(payload["status"]), message=payload.get("message", "")
+            status=TaskStatus(payload["status"]),
+            message=payload.get("message", ""),
+            retry_at=_parse_ts(retry_at_raw) if retry_at_raw else None,
         )
     return TaskInstanceRecord(
         id=row["id"],

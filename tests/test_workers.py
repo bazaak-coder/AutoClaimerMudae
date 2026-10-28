@@ -656,3 +656,234 @@ async def test_start_loads_persisted_server_cooldowns(tmp_path: Path) -> None:
 
     await manager.stop()
     await store2.close()
+
+
+# --- domain-scheduled retries via outcome deadlines (milestone 4) ---
+
+
+async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) -> None:
+    """A handler that LEARNED a Mudae deadline returns it on the
+    recoverable outcome; the worker schedules the next attempt at that
+    absolute deadline instead of computing transport backoff."""
+    from datetime import UTC, datetime
+
+    learned = datetime(2026, 10, 29, 13, 0, 0, tzinfo=UTC)
+
+    async def learns_deadline(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_RECOVERABLE,
+            message="$rt cooldown active",
+            retry_at=learned,
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Learns a deadline.",
+            validate_config=lambda config: None,
+            handler=learns_deadline,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    limiter = RateLimiter(store=store)
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=limiter,
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+        wall=lambda: datetime(2026, 10, 29, 12, 0, 0, tzinfo=UTC),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.WAITING)
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.next_attempt_at == learned  # the learned deadline, not backoff
+    await store.close()
+
+
+# PR #3 review fix: naive outcome retry_at never leaves the row running
+
+
+async def test_naive_outcome_retry_at_fails_terminally_not_stuck(tmp_path: Path) -> None:
+    """Review finding 2: a handler returning a timezone-naive retry_at
+    would crash the worker's max() comparison AFTER the durable claim —
+    leaving the instance RUNNING forever. The worker boundary validates
+    the deadline: the attempt fails terminally with a clear message and
+    supervision continues."""
+    from datetime import datetime as _dt
+
+    async def bad_deadline(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_RECOVERABLE,
+            message="learned deadline",
+            retry_at=_dt(2026, 10, 29, 13, 0, 0),  # naive: contract violation
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Returns a naive deadline.",
+            validate_config=lambda config: None,
+            handler=bad_deadline,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.status is TaskInstanceState.FAILED  # NOT stuck running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()
+
+
+# Consolidated review #4: loss callback through the production contract
+
+
+async def test_rate_limited_adapter_forwards_on_events_lost() -> None:
+
+    inner = MockAdapter()
+    limiter = RateLimiter()
+    wrapped = RateLimitedAdapter(inner, limiter, ACCOUNT)
+    lost: list[int] = []
+    wrapped.subscribe(lambda event: None, on_events_lost=lost.append)
+    stats = inner._events.stats()  # noqa: SLF001
+    assert stats.subscriber_count == 1  # forwarded to the real dispatcher
+    await inner.close()
+    assert lost == []  # nothing lost on a clean stop
+
+
+# Consolidated review #6: naive retry_at on ANY outcome never strands the row
+
+
+async def test_naive_retry_at_on_success_fails_terminally(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    async def bad_success(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED, retry_at=_dt(2026, 10, 29, 13, 0, 0))
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Naive success.",
+            validate_config=lambda config: None,
+            handler=bad_success,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "job")
+    assert record.status is TaskInstanceState.FAILED  # not stranded running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()
+
+
+async def test_naive_retry_at_on_permanent_failure_keeps_terminal(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    async def bad_permanent(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_PERMANENT,
+            message="boom",
+            retry_at=_dt(2026, 10, 29, 13, 0, 0),
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Naive permanent.",
+            validate_config=lambda config: None,
+            handler=bad_permanent,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.FAILED)
+    record = await store.get_instance_by_ids(ACCOUNT, "job")
+    assert record.status is TaskInstanceState.FAILED  # terminal, not running
+    assert record.last_outcome is not None
+    assert "timezone-naive" in record.last_outcome.message
+    await store.close()

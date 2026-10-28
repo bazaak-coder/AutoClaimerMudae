@@ -754,3 +754,36 @@ async def test_send_translates_forbidden_from_channel_send() -> None:
         await adapter.send_message(CHANNEL, "x")
     client.connect_stopped.set()
     await adapter.close()
+
+
+# Consolidated review #4: loss callback through the Discord adapter
+
+
+async def test_subscribe_forwards_on_events_lost_to_the_dispatcher() -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    client = FakeClient()
+    adapter = make_adapter(client)
+    lost: list[int] = []
+
+    async def parked(event: object) -> None:
+        await asyncio.Event().wait()
+
+    adapter.subscribe(parked, on_events_lost=lost.append)
+    await adapter.start()
+    # One inbound bridge event: the parked consumer holds it in-flight.
+    await adapter._on_message(  # noqa: SLF001
+        SimpleNamespace(
+            id=1,
+            content="hi",
+            author=SimpleNamespace(id=1),
+            channel=SimpleNamespace(id=CHANNEL),
+            components=[],
+            created_at=_dt.now(_UTC),
+        )
+    )
+    await asyncio.sleep(0.05)
+    client.connect_stopped.set()
+    await adapter.close()  # in-flight delivery interrupted -> reported lost
+    assert lost == [1]

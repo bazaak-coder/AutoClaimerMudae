@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,9 +74,15 @@ class MockAdapter:
         """Deliver a synthetic normalized event to subscribers."""
         await self._events.dispatch(event)
 
-    def subscribe(self, consumer: EventConsumer) -> Any:
-        """Subscribe to synthetic events; returns an unsubscribe callable."""
-        return self._events.subscribe(consumer)
+    def subscribe(
+        self, consumer: EventConsumer, *, on_events_lost: Callable[[int], None] | None = None
+    ) -> Any:
+        """Subscribe to synthetic events; returns an unsubscribe callable.
+
+        ``on_events_lost`` mirrors the dispatcher contract (milestone 5):
+        queued-but-undelivered events are reported at close() instead of
+        vanishing — the account-fatal/eviction path is observable."""
+        return self._events.subscribe(consumer, on_events_lost=on_events_lost)
 
     async def get_channel(self, channel_id: int) -> ChannelInfo | None:
         """Cache-only lookup mirroring the Discord adapter (recorded, no script)."""
