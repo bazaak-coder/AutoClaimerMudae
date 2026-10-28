@@ -296,17 +296,25 @@ never called and historical retrieval is not part of the contract.
   moderate read is `get_message` (needed to obtain component objects).
   Heavy endpoints (`fetch_user`, `fetch_channel`, …) are never called.
 - Error translation: `RateLimited`/HTTP 429 → `CooldownError(retry_after)`
-  (recorded and honored by the central limiter); `CaptchaRequired`,
-  `LoginFailure`/`AuthFailure` (one class in this fork), and
-  `ConnectionClosed` with a fatal close code (4004, 4010-4014 — the only
-  codes the library itself refuses to reconnect on; the client is
-  already terminal when they surface) → **`AccountFatalError`**: the
-  adapter latches the verdict permanently (no re-login, no client
-  rebuild) and the worker manager fails the account's queued instances,
-  disables the account, and stops its worker — never retries. CAPTCHAs
-  are never bypassed. `Forbidden`/`NotFound` → per-operation permanent;
-  5xx, non-fatal `ConnectionClosed`, `GatewayNotFound`, `InvalidData`
-  (uncertain interaction outcome) → recoverable.
+  (recorded and honored by the central limiter; a 429 means the request
+  was rejected, not applied — post-cooldown retry is safe even for
+  mutations). **Mutating calls** (`send_message`, `add_reaction`,
+  `Button.click`) translate with mutation awareness: a completed 5xx
+  response or an unrecognized library error maps to
+  `UncertainOutcomeError` — the action may have been applied and is
+  never auto-retried (PR #2 review fix); read paths (`fetch_message`)
+  and pre-mutation failures (readiness) keep safe bounded retries.
+  `CaptchaRequired`, `LoginFailure`/`AuthFailure` (one class in this
+  fork), and `ConnectionClosed` with a fatal close code (4004, 4010-4014
+  — the only codes the library itself refuses to reconnect on; the
+  client is already terminal when they surface) →
+  **`AccountFatalError`**: the adapter latches the verdict permanently
+  (no re-login, no client rebuild) and the worker manager fails the
+  account's queued instances, disables the account, and stops its
+  worker — never retries. CAPTCHAs are never bypassed.
+  `Forbidden`/`NotFound` → per-operation permanent; 5xx on reads,
+  non-fatal `ConnectionClosed`, `GatewayNotFound` → recoverable;
+  `InvalidData` (uncertain interaction outcome) → uncertain.
 - No Discord objects leak past the adapter; tokens come from the
   credential provider at login time and are never stored, logged, or
   persisted.
