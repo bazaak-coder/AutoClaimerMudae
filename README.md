@@ -313,7 +313,9 @@ never called and historical retrieval is not part of the contract.
   account's queued instances, disables the account, and stops its
   worker — never retries. CAPTCHAs are never bypassed.
   `Forbidden`/`NotFound` → per-operation permanent; 5xx on reads,
-  non-fatal `ConnectionClosed`, `GatewayNotFound` → recoverable;
+  non-fatal `ConnectionClosed` and `GatewayNotFound` on reads or
+  pre-mutation phases → recoverable (bounded retries); non-fatal
+  connection failures during a mutation → uncertain (outcome unknown);
   `InvalidData` (uncertain interaction outcome) → uncertain.
 - No Discord objects leak past the adapter; tokens come from the
   credential provider at login time and are never stored, logged, or
