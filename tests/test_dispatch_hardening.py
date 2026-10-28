@@ -313,3 +313,34 @@ async def test_self_stop_does_not_report_own_in_flight_as_lost() -> None:
     assert len(delivered) == 1  # the event WAS delivered
     assert lost == []  # therefore not a loss
     assert dispatcher.dropped == 0
+
+
+# PR #3 third-round review: self-stop must not keep draining the queue
+
+
+async def test_self_stop_finishes_current_but_never_drains_queue() -> None:
+    """The surviving (self-stopping) pump may finish its CURRENT
+    consumer call — and nothing more: events queued behind it are
+    reported lost exactly once and are never delivered after stop(); the
+    pump exits instead of resuming its loop."""
+    dispatcher = EventDispatcher(queue_size=4, name="selfdrain")
+    lost: list[int] = []
+    delivered: list[Any] = []
+
+    async def self_stopping(event: Any) -> None:
+        await dispatcher.stop(pump_timeout=0.2)
+        delivered.append(event)  # finishes AFTER stop() returned
+
+    dispatcher.subscribe(self_stopping, on_events_lost=lost.append)
+    pumps = [s.pump for s in dispatcher._subscribers.values()]  # noqa: SLF001
+    await dispatcher.dispatch(make_event())  # becomes the in-flight event
+    await dispatcher.dispatch(make_event())  # queued behind
+    await dispatcher.dispatch(make_event())  # queued behind
+    await asyncio.sleep(0.05)  # pump entered the consumer; stop() ran inside
+
+    assert len(delivered) == 1  # current event finished, not reported lost
+    await asyncio.sleep(0.05)  # the pump loop resumes: it must EXIT
+    assert len(delivered) == 1  # queued events were NOT delivered after stop
+    assert lost == [2]  # both queued events reported lost exactly once
+    assert dispatcher.dropped == 2
+    assert pumps[0] is not None and pumps[0].done()  # pump exited
