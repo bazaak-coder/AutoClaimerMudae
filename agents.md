@@ -246,6 +246,19 @@ The owner's existing restriction on remote operations remains in force: no remot
 
 Established practice to date (owner-directed): commits land on "main" directly, granularly per section 7.4, and pushes happen only on an explicit per-batch "push" instruction from the owner. That practice satisfies section 7.5's authorization requirement; the PR workflow below applies when the owner requests it (for example for externally reviewed or multi-contributor changes).
 
+Push classification rule (owner directive, 2026-10-28)
+
+Before any authorized push, the batch must be classified by work type and severity, and the classification recorded (knowledgebase entry and, when a PR is used, its description):
+
+1. Breaking change — removes, renames, or resemantics public API; changes configuration format or persistence schema incompatibly; alters documented behavioral contracts; major dependency bumps; security-boundary rework. Severity: HIGH by default.
+2. Feature implementation change — additive features, defect fixes, documentation, and tests that preserve existing contracts. Severity: MEDIUM when default runtime behavior changes (new default delays/pacing, changed retry or recovery behavior), when new configuration defaults apply out of the box, or when authentication/lifecycle/persistence paths are touched; LOW otherwise (pure docs, tests-only, or internal additive changes with no observable default change).
+
+Routing by classification:
+
+- HIGH (breaking) and MEDIUM (feature) batches go through the full PR workflow below (phases A-E, independent review, owner-approved merge).
+- LOW (feature) batches may follow the established owner-directed direct push per section 7.4 on explicit instruction.
+- When classification is uncertain, classify upward (PR). Mixed batches route by their highest-severity component. Owner instructions always override this rule.
+
 Phase A — Prepare the change
 
 1. Implement the change on an appropriate feature branch.
@@ -531,6 +544,7 @@ Never claim that tests passed without executing them. Never describe an unreview
 - [ ] The PR has been independently reviewed (applies to the PR workflow; owner-directed direct pushes still require the full local gate).
 - [ ] Confirmed defects and justified security findings have been addressed.
 - [ ] Required CI checks pass (CI: `.github/workflows/ci.yml` — locked install with extras, ruff, format, mypy, pytest; first green run 40393344534 confirmed 2026-10-26; check "gh run list" for the latest state).
+- [ ] Push classification (breaking vs feature, severity) recorded per section 8 before any push.
 - [ ] No unresolved critical or high-severity findings remain.
 - [ ] Owner approval has been obtained for required remote operations and merging.
 - [ ] The final report accurately describes the verified state.
