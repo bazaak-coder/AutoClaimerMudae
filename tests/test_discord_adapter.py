@@ -8,6 +8,7 @@ import discord
 import pytest
 
 from autoclaimer.adapters import (
+    AccountFatalError,
     AdapterError,
     CooldownError,
     InteractionResult,
@@ -224,7 +225,7 @@ async def test_operations_lazily_start_the_adapter() -> None:
     await adapter.close()
 
 
-async def test_login_failure_is_permanent_and_token_never_leaks() -> None:
+async def test_login_failure_is_account_fatal_latches_and_token_never_leaks() -> None:
     client = FakeClient()
 
     async def fail_login(token: str) -> None:
@@ -232,9 +233,16 @@ async def test_login_failure_is_permanent_and_token_never_leaks() -> None:
 
     client.login = fail_login  # type: ignore[method-assign]
     adapter = make_adapter(client)
-    with pytest.raises(PermanentAdapterError, match="Improper token"):
+    with pytest.raises(AccountFatalError, match="authentication failed.*Improper token"):
         await adapter.start()
     assert TOKEN not in repr(adapter)
+    # The fatal verdict latches: no second login attempt, ever.
+    assert adapter.is_healthy is False
+    with pytest.raises(AccountFatalError, match="authentication failed"):
+        await adapter.start()
+    with pytest.raises(AccountFatalError, match="authentication failed"):
+        await adapter.send_message(1, "x")
+    assert client.login_calls == []  # fail_login raises before recording; no retries
 
 
 # ----- pacing -----
@@ -513,9 +521,25 @@ async def test_http_error_translation_matrix() -> None:
                 SimpleNamespace(status=428, reason="captcha"),
                 {"captcha_key": ["x"], "captcha_sitekey": "site"},
             ),
-            PermanentAdapterError,
+            AccountFatalError,
         ),
+        # AuthFailure is an alias of LoginFailure in this fork: the token
+        # itself is dead — account-fatal, never retried (owner policy).
+        (discord.LoginFailure("Improper token"), AccountFatalError),
+        (discord.AuthFailure("Improper token"), AccountFatalError),
+        # Fatal gateway close codes (gateway._can_handle_close): the
+        # library already closed the client and gave up by the time these
+        # surface — the account's session is dead.
+        (discord.ConnectionClosed(4004, "authentication failed"), AccountFatalError),
+        (discord.ConnectionClosed(4010, "invalid shard"), AccountFatalError),
+        (discord.ConnectionClosed(4014, "disallowed intents"), AccountFatalError),
+        # Everything else the library can resume/reconnect from stays
+        # recoverable (code None = unknown/transport-level, 1000 clean,
+        # 1006 abnormal, 4xxx unknown-but-reconnectable).
         (discord.ConnectionClosed(None), RecoverableAdapterError),
+        (discord.ConnectionClosed(1000, "clean"), RecoverableAdapterError),
+        (discord.ConnectionClosed(1006, "abnormal"), RecoverableAdapterError),
+        (discord.ConnectionClosed(4000, "unknown"), RecoverableAdapterError),
         (discord.GatewayNotFound(), RecoverableAdapterError),  # type: ignore[no-untyped-call]
     ]
     from autoclaimer.discord_adapter import _translate
@@ -523,6 +547,34 @@ async def test_http_error_translation_matrix() -> None:
     for exc, expected in cases:
         translated = _translate(exc)
         assert type(translated) is expected, f"{exc!r} -> {type(translated)}"
+
+
+async def test_fatal_gateway_close_after_ready_latches_without_relogin() -> None:
+    """Session invalidated mid-session (owner scenario): Discord closes the
+    gateway with 4004; the connect task dies; the adapter latches the
+    fatal verdict and every later operation fast-fails — exactly one
+    login attempt total, no client rebuild."""
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+
+    async def invalidated_session(*, reconnect: bool = True) -> None:
+        raise discord.ConnectionClosed(4004, "authentication failed.")
+
+    client.connect = invalidated_session  # type: ignore[method-assign]
+    adapter = make_adapter(client)
+    await adapter.start()  # login + READY race: ready wins, connect dies after
+    task = adapter._connect_task  # noqa: SLF001
+    assert task is not None
+    with pytest.raises(discord.ConnectionClosed):
+        await task  # the library's fatal verdict escapes connect()
+    await asyncio.sleep(0)  # let the done-callback latch
+    assert adapter.is_healthy is False
+    with pytest.raises(AccountFatalError, match="close code 4004"):
+        await adapter.send_message(CHANNEL, "hi")
+    with pytest.raises(AccountFatalError, match="close code 4004"):
+        await adapter.start()
+    assert client.login_calls == [TOKEN]  # exactly one login: no retry churn
+    assert channel.sent == []  # nothing was sent on a dead session
 
 
 async def test_captcha_never_bypassed_message_is_explicit() -> None:
