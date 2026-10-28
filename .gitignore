@@ -1,6 +1,9 @@
 # Append-only agent knowledgebase is intentionally not tracked
 knowledgebase/
 
+# Local agent skill files (owner instruction 2026-10-28)
+.agents/
+
 # Discord webhook secret — never commit
 webhook.url
 
