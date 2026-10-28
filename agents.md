@@ -126,7 +126,7 @@ A change is not fully documented until its knowledgebase entry is saved. If docu
 
 Use "uv" where compatible with the project for Python dependency and environment management.
 
-Workspace reality (this machine): the system Python is an externally-managed (PEP 668) Alpine 3.14-series interpreter; do not install into it. All quality tooling lives in the virtualenv at "/workspace/autoclaimer-venv" (see section 16). The bare "pytest"/"ruff"/"mypy" on PATH belong to the system interpreter and cannot import the project — always invoke the venv binaries. "uv.lock" is maintained by running "uv lock" from the venv; there is no project-local .venv (FUSE cannot hold one).
+Workspace reality (this machine): the project lives on a normal Linux filesystem (ext4, user-owned) with a project-local virtualenv at ".venv" (see section 16). The system Python is 3.13.5 and externally-managed (PEP 668); do not install into it — always invoke the ".venv/bin" binaries for project work. "uv" is not installed on this machine; install it before any lockfile maintenance, then maintain "uv.lock" with "uv lock" (the old "UV_LINK_MODE=copy" workaround is obsolete on ext4). Network egress to PyPI is slow (~200 KB/s observed); long installs belong in the background and reuse pip's wheel cache.
 
 Use Ruff, mypy, and pytest as the primary development quality tools.
 
@@ -209,7 +209,7 @@ gh repo view
 
 Verify the repository, branch, and remote before operating. If "gh" is unavailable or unauthenticated, report the limitation and use other permitted local checks where possible.
 
-Workspace git topology (this machine): git metadata lives in "/workspace/autoclaimer.git" because the project tree sits on FUSE, which cannot host git object storage. The project root contains a ".git" *pointer file* ("gitdir: /workspace/autoclaimer.git") so plain git commands work in place; git hard-ignores the pointer, and it must never be committed or deleted. Never delete "/workspace/autoclaimer.git" — it is the repository. FUSE occasionally drops worktree files (observed once); if a tracked file vanishes, restore it from HEAD and note the incident. Commit identity is configured repo-locally (libosterelezent / noreply address) and "gh auth setup-git" provides the HTTPS credential helper.
+Workspace git topology (this machine): git metadata lives in "/home/libosterelezent/autoclaimer.git", outside the tree (a deliberate legacy of the FUSE-era setup, kept as the working topology). The project root contains a ".git" *pointer file* ("gitdir: /home/libosterelezent/autoclaimer.git") so plain git commands work in place; git hard-ignores the pointer, and neither the pointer nor the external git directory must ever be committed or deleted. Never delete "/home/libosterelezent/autoclaimer.git" — it is the repository. The external git directory does not travel with workspace copies: if it is lost (observed twice during machine migrations), rebuild it by cloning fresh, moving the clone's ".git" into place, and setting "core.worktree" plus repo-local "core.filemode=false" again — a fresh clone writes "core.filemode=true", which overrides the global "false" and makes every tracked file appear mode-modified. Commit identity is configured globally ("Liboster" / libosterelezent@zohomail.in) and "gh auth setup-git" provides the HTTPS credential helper; if the pointer file is ever broken, run "gh" commands from outside the project directory.
 
 During changes
 
@@ -422,9 +422,9 @@ Local YAML validation is not equivalent to a successful GitHub Actions run.
 
 Before declaring a change ready for review, run all applicable checks.
 
-On this machine (authoritative):
+On this machine (authoritative, run from the project root):
 
-V=/workspace/autoclaimer-venv/bin
+V=.venv/bin
 $V/ruff check .
 $V/ruff format --check .
 $V/mypy .
@@ -534,24 +534,24 @@ Never claim that tests passed without executing them. Never describe an unreview
 - [ ] Owner approval has been obtained for required remote operations and merging.
 - [ ] The final report accurately describes the verified state.
 
-16. Workspace Environment (Android/PRoot)
+16. Workspace Environment (Linux)
 
-This project is developed on an Android device inside a PRoot Alpine guest. Treat the following as stable facts until corrected by the owner:
+This project is developed on a Linux machine (ext4 root and home, user "libosterelezent"). Treat the following as stable facts until corrected by the owner:
 
 Paths
 
-- Project tree: "/sdcard/Download/AutoClaimer" (FUSE: no exec bits, no symlinks, git cannot write objects there).
-- Git metadata: "/workspace/autoclaimer.git" (ext4). The in-tree ".git" pointer file links them.
-- Virtualenv: "/workspace/autoclaimer-venv" (ext4; holds ruff, mypy, pytest, pytest-asyncio, uv, and the editable project install).
+- Project tree: "/home/libosterelezent/Workspace/AutoClaimer" (ext4, user-owned).
+- Git metadata: "/home/libosterelezent/autoclaimer.git" (outside the tree; see section 7). The in-tree ".git" pointer file links them.
+- Virtualenv: "/home/libosterelezent/Workspace/AutoClaimer/.venv" (project-local, gitignored; holds ruff, mypy, pytest, pytest-asyncio, and the editable project install).
 
 Known constraints
 
-- The system Python is externally-managed (PEP 668); never pip-install into it and never pass "--break-system-packages".
-- Bare "pytest"/"ruff"/"mypy"/"uv" on PATH run against the system interpreter and cannot import the project; always use the venv binaries (section 10).
-- "uv lock" fails on this machine with hardlink "Operation not permitted" errors; prefix it with "UV_LINK_MODE=copy".
-- FUSE cannot store executable bits or symlinks: venvs and git hooks must live under "/workspace"; in-tree hook scripts are non-executable.
-- FUSE has silently dropped a tracked file once (".githooks/post-commit"); on any unexpected worktree deletion, restore from HEAD, verify, and record the incident in the knowledgebase.
-- Prefer "/tmp/opencode" for throwaway artifacts and "/workspace" for anything needing exec bits or symlinks.
+- The system Python is 3.13.5 and externally-managed (PEP 668); never pip-install into it and never pass "--break-system-packages"; use the project venv (section 10).
+- "uv" is not installed; install it before lockfile work. The FUSE-era "UV_LINK_MODE=copy" workaround is obsolete on ext4.
+- File modes across the tree are 0777, inherited from the migration through a Windows/FUSE host; "core.filemode=false" is set globally, but a fresh clone resets the repo-local value to "true" — re-set it after any gitdir rebuild (section 7).
+- If a tracked file vanishes or shows unexpected mode-only modifications, verify against HEAD and record the incident in the knowledgebase.
+- Network egress to PyPI is slow (~200 KB/s observed); prefer pip's wheel cache and run long installs in the background.
+- Prefer "/tmp/opencode" for throwaway artifacts.
 
 Remote
 
