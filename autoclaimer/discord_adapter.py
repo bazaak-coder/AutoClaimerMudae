@@ -500,7 +500,9 @@ class DiscordAdapter:
         try:
             message = await channel.send(content)
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: a 5xx or unknown error leaves the outcome
+            # ambiguous — UncertainOutcomeError, never auto-retried.
+            raise _translate(exc, mutating=True) from exc
         logger.debug(
             "message sent",
             extra={
@@ -518,7 +520,8 @@ class DiscordAdapter:
         try:
             await self._client.http.add_reaction(channel_id, message_id, emoji)
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: ambiguous failures are never auto-retried.
+            raise _translate(exc, mutating=True) from exc
 
     async def press_component(
         self, channel_id: int, message_id: int, component_id: str
@@ -528,14 +531,20 @@ class DiscordAdapter:
         channel = self._channel(channel_id)
         try:
             message = await channel.fetch_message(message_id)
-            button = _find_button(message, component_id)
-            if button is None:
-                raise PermanentAdapterError(
-                    f"component {component_id!r} not found on message {message_id}"
-                )
+        except discord.DiscordException as exc:
+            # READ: a 5xx response proves nothing was mutated — safe to
+            # retry within bounds.
+            raise _translate(exc) from exc
+        button = _find_button(message, component_id)
+        if button is None:
+            raise PermanentAdapterError(
+                f"component {component_id!r} not found on message {message_id}"
+            )
+        try:
             result = await button.click()
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: ambiguous failures are never auto-retried.
+            raise _translate(exc, mutating=True) from exc
         # A str result means the "button" is a link: no interaction occurred.
         acknowledged = not isinstance(result, str)
         return InteractionResult(
@@ -718,14 +727,24 @@ def _find_button(message: Any, component_id: str) -> Any:
     return None
 
 
-def _translate(exc: discord.DiscordException) -> AdapterError:
+def _translate(exc: discord.DiscordException, *, mutating: bool = False) -> AdapterError:
     """Map library exceptions to the framework's typed error model.
+
+    ``mutating`` tells the translator whether the failing call could have
+    applied a platform side effect. A completed 5xx response (or an
+    unrecognized library error) does not prove a mutation was NOT
+    applied — for mutating operations it maps to
+    :class:`UncertainOutcomeError` (never auto-retried; PR #2 review
+    fix). Read-only calls and pre-mutation failures keep their safe
+    bounded-retry classification.
 
     Account-fatal verdicts (dead credentials, fatal gateway close codes,
     CAPTCHA) map to :class:`AccountFatalError`, which stops the whole
     account instead of failing one task (owner policy 2026-10-28).
     """
     if isinstance(exc, discord.RateLimited):
+        # 429 = the request was REJECTED, not applied: safe to retry for
+        # mutating operations too, after the recorded cooldown.
         return CooldownError(exc.retry_after)
     if isinstance(exc, discord.CaptchaRequired):
         return AccountFatalError(
@@ -739,6 +758,12 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
     if isinstance(exc, (discord.Forbidden, discord.NotFound)):
         return PermanentAdapterError(str(exc))
     if isinstance(exc, discord.DiscordServerError):
+        # The request completed with a 5xx RESPONSE: whether Discord
+        # applied the action is unknowable from here.
+        if mutating:
+            return UncertainOutcomeError(
+                f"server error {exc.status}; the mutation may have been applied: {exc}"
+            )
         return RecoverableAdapterError(f"Discord server error ({exc.status}): {exc}")
     if isinstance(exc, discord.HTTPException):
         if exc.status == 429:
@@ -751,6 +776,10 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
                     retry_after = 1.0
             return CooldownError(retry_after)
         if exc.status >= 500:
+            if mutating:
+                return UncertainOutcomeError(
+                    f"HTTP {exc.status}; the mutation may have been applied: {exc}"
+                )
             return RecoverableAdapterError(f"HTTP {exc.status}: {exc}")
         return PermanentAdapterError(f"HTTP {exc.status}: {exc}")
     if isinstance(exc, discord.InvalidData):
@@ -769,6 +798,11 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
         return RecoverableAdapterError(f"connection problem: {exc}")
     if isinstance(exc, discord.GatewayNotFound):
         return RecoverableAdapterError(f"connection problem: {exc}")
-    # Unknown library errors are treated as recoverable so bounded retries
-    # (not silent success) decide the outcome.
+    # Unknown library errors: for mutating operations the outcome is
+    # unknown (agents.md section 17.3 — never assume retry safety from
+    # surprise); elsewhere bounded retries decide the outcome.
+    if mutating:
+        return UncertainOutcomeError(
+            f"untranslated discord error; the mutation outcome is unknown: {exc}"
+        )
     return RecoverableAdapterError(f"untranslated discord error: {exc}")
