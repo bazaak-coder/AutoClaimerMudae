@@ -656,3 +656,61 @@ async def test_start_loads_persisted_server_cooldowns(tmp_path: Path) -> None:
 
     await manager.stop()
     await store2.close()
+
+
+# --- domain-scheduled retries via outcome deadlines (milestone 4) ---
+
+
+async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) -> None:
+    """A handler that LEARNED a Mudae deadline returns it on the
+    recoverable outcome; the worker schedules the next attempt at that
+    absolute deadline instead of computing transport backoff."""
+    from datetime import UTC, datetime
+
+    learned = datetime(2026, 10, 29, 13, 0, 0, tzinfo=UTC)
+
+    async def learns_deadline(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(
+            TaskStatus.FAILED_RECOVERABLE,
+            message="$rt cooldown active",
+            retry_at=learned,
+        )
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Learns a deadline.",
+            validate_config=lambda config: None,
+            handler=learns_deadline,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    limiter = RateLimiter(store=store)
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=limiter,
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+        wall=lambda: datetime(2026, 10, 29, 12, 0, 0, tzinfo=UTC),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.WAITING)
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.next_attempt_at == learned  # the learned deadline, not backoff
+    await store.close()

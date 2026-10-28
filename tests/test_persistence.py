@@ -628,3 +628,61 @@ async def test_mudae_deadlines_contain_corrupt_rows(
         assert "corrupt" in caplog.text.lower()
     finally:
         await store.close()
+
+
+# --- domain-scheduled retries (milestone 4: retry ownership) ---
+
+
+async def test_schedule_attempt_sets_waiting_until_absolute_deadline(tmp_path: Path) -> None:
+    """The Mudae task layer schedules retries from LEARNED deadlines
+    (parsed replies anchored to UTC) — not transport backoff. The
+    instance stays waiting and not due until the deadline passes."""
+    store = await make_store(tmp_path / "state.db")
+    clock = store._clock
+    assert isinstance(clock, FakeClock)
+    try:
+        record = await store.create_instance(1, "roll")
+        await store.schedule_attempt(record.id, _future(3600))
+        waiting = await store.get_instance(record.id)
+        assert waiting.status is TaskInstanceState.WAITING
+        assert waiting.next_attempt_at == _future(3600)
+
+        due = await store.due_instances()
+        assert record.id not in [r.id for r in due]  # not due yet
+
+        clock.advance(3601)  # deadline passes -> claimable again
+        due = await store.due_instances()
+        assert record.id in [r.id for r in due]
+    finally:
+        await store.close()
+
+
+async def test_schedule_attempt_replaces_previous_schedule(tmp_path: Path) -> None:
+    """Fresher domain information replaces an earlier deadline (an $rtu
+    re-check supersedes the previous assumption)."""
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        await store.schedule_attempt(record.id, _future(7200))
+        await store.schedule_attempt(record.id, _future(1800))  # re-learned
+        waiting = await store.get_instance(record.id)
+        assert waiting.next_attempt_at == _future(1800)
+    finally:
+        await store.close()
+
+
+async def test_schedule_attempt_rejects_naive_and_terminal(tmp_path: Path) -> None:
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        with pytest.raises(PersistenceError, match="timezone-naive"):
+            await store.schedule_attempt(record.id, datetime(2026, 10, 29, 12, 0, 0))
+
+        succeeded = await store.claim(record.id)
+        from autoclaimer.registry import TaskOutcome, TaskStatus
+
+        await store.record_success(succeeded.id, TaskOutcome(TaskStatus.SUCCEEDED, message="done"))
+        with pytest.raises(StateTransitionError):
+            await store.schedule_attempt(succeeded.id, _future(60))
+    finally:
+        await store.close()
