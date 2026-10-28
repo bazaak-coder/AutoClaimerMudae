@@ -133,6 +133,45 @@ async def test_unknown_library_error_on_mutation_is_not_retried() -> None:
     await adapter.close()
 
 
+async def test_click_connection_closed_after_send_is_uncertain_not_retried() -> None:
+    """Reviewer scenario: the connection can fail after Discord received
+    the interaction but before the client got confirmation. Non-fatal
+    ConnectionClosed during a mutation → outcome unknown → exactly one
+    click, never replayed."""
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+    button = FakeButton("claim", error=discord.ConnectionClosed(1006, "abnormal closure"))
+    channel._messages.append(  # noqa: SLF001
+        FakeMessage(9, "roll", components=[SimpleNamespace(children=[button])])
+    )
+    adapter = make_adapter(client)
+
+    with pytest.raises(UncertainOutcomeError, match="1006"):
+        await run_through_limiter(lambda: adapter.press_component(CHANNEL, 9, "claim"))
+    assert button.click_calls == 1
+    client.connect_stopped.set()
+    await adapter.close()
+
+
+async def test_send_gateway_not_found_is_uncertain_not_retried() -> None:
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+    attempts: list[str] = []
+
+    async def failing_send(content: str) -> FakeMessage:
+        attempts.append(content)
+        raise discord.GatewayNotFound()  # type: ignore[no-untyped-call]
+
+    channel.send = failing_send  # type: ignore[method-assign]
+    adapter = make_adapter(client)
+
+    with pytest.raises(UncertainOutcomeError, match="gateway"):
+        await run_through_limiter(lambda: adapter.send_message(CHANNEL, "$wa"))
+    assert attempts == ["$wa"]
+    client.connect_stopped.set()
+    await adapter.close()
+
+
 async def test_non_library_error_propagates_once() -> None:
     channel = FakeChannel(CHANNEL, [])
     client = FakeClient(channel)
@@ -196,6 +235,34 @@ async def test_read_phase_5xx_is_recoverable_and_retried() -> None:
     assert result.acknowledged is True
     assert len(fetch_attempts) == 2  # read retried…
     assert button.click_calls == 1  # …mutation exactly once
+    client.connect_stopped.set()
+    await adapter.close()
+
+
+async def test_read_phase_connection_closed_is_recoverable_and_retried() -> None:
+    """Reads keep safe bounded retries for connection problems: a
+    non-fatal ConnectionClosed during fetch_message proves no mutation
+    happened."""
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+    button = FakeButton("claim")
+    message = FakeMessage(9, "roll", components=[SimpleNamespace(children=[button])])
+    channel._messages.append(message)  # noqa: SLF001
+    fetch_attempts: list[int] = []
+
+    async def flaky_fetch(message_id: int) -> FakeMessage:
+        fetch_attempts.append(message_id)
+        if len(fetch_attempts) == 1:
+            raise discord.ConnectionClosed(1006, "abnormal closure")
+        return message
+
+    channel.fetch_message = flaky_fetch  # type: ignore[method-assign]
+    adapter = make_adapter(client)
+
+    result = await run_through_limiter(lambda: adapter.press_component(CHANNEL, 9, "claim"))
+    assert result.acknowledged is True
+    assert len(fetch_attempts) == 2
+    assert button.click_calls == 1
     client.connect_stopped.set()
     await adapter.close()
 

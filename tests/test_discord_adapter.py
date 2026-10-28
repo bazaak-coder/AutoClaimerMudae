@@ -657,6 +657,8 @@ def test_translation_matrix_mutating_mode() -> None:
     cases: list[tuple[discord.DiscordException, type[AdapterError]]] = [
         (server_error, UncertainOutcomeError),
         (discord.ClientException("mystery"), UncertainOutcomeError),
+        (discord.ConnectionClosed(1006, "abnormal"), UncertainOutcomeError),
+        (discord.GatewayNotFound(), UncertainOutcomeError),  # type: ignore[no-untyped-call]
         # Unchanged in mutating mode:
         (discord.RateLimited(9.0), CooldownError),  # 429 = rejected, not applied
         (
@@ -664,6 +666,7 @@ def test_translation_matrix_mutating_mode() -> None:
             PermanentAdapterError,
         ),
         (discord.LoginFailure("bad token"), AccountFatalError),
+        (discord.ConnectionClosed(4004, "auth"), AccountFatalError),  # fatal stays fatal
     ]
     for exc, expected in cases:
         translated = _translate(exc, mutating=True)
