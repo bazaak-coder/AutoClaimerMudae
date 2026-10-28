@@ -67,7 +67,8 @@ class TaskResult:
 - Follow PEP 8 and modern Python conventions.
 - Prefer small, cohesive functions and descriptive names.
 - Use "pathlib.Path", context managers, and structured logging.
-- Handle exceptions at meaningful boundaries without silently swallowing errors.
+- Handle exceptions at meaningful boundaries without silently swallowing errors; the full
+  classification, ownership, and recovery policy is section 17.
 - Preserve useful exception context and diagnostic information.
 - Avoid mutable global state, hidden side effects, blocking asynchronous code, and uncontrolled background tasks.
 - Handle cancellation, timeouts, retries, concurrency, and resource cleanup deliberately.
@@ -558,3 +559,128 @@ Remote
 - Repository: "libosterelezent/AutoClaimerMudae" (private). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
 
 Final principle: Correctness, security, reproducibility, traceability, and owner control take precedence over speed. A passing test suite is necessary but not sufficient: independent review must examine the implementation's logic, security boundaries, and fragile areas before a change can be merged.
+
+17. Error Handling, Failure Classification, and Recovery
+
+17.1 Core principles
+
+- Classify before recovering. Every handled failure must have a defined category, an owning layer, and an explicit recovery policy. Do not treat every failure as transient or retryable.
+- Catch narrowly by default. Catch the most specific exception type that supports the intended recovery. Never use broad exception handling merely to suppress errors, keep execution moving, or avoid fixing an underlying defect.
+- Preserve failure context. Include the operation, account/task identifiers where applicable, relevant lifecycle state, and a traceback for unexpected exceptions. Never include Discord tokens, credentials, authorization headers, or sensitive message content in logs.
+- Fail explicitly when recovery is unsafe. If the system cannot determine whether an operation succeeded, represent that uncertainty rather than silently marking it successful or blindly repeating a potentially mutating action.
+- Make recovery observable. Retries, cooldown deferrals, fatal transitions, event-loss recovery, and abandoned operations must produce structured logs or state transitions appropriate to their severity.
+
+17.2 Required error categories and ownership
+
+Every failure must be assigned to one of these categories. The layer that detects a failure may translate it into a typed error, but retry ownership must remain unambiguous.
+
+1. Configuration and validation errors
+
+   - Validate configuration structure, required fields, identifier types, ranges, and incompatible settings before starting workers.
+   - Validate channel and resource identifiers before use, and resolve resources at the appropriate adapter boundary.
+   - Treat invalid configuration as a startup or task-configuration failure, not as a transient Discord error.
+   - Do not repeatedly retry deterministic validation failures. Report the invalid field and expected format without exposing secrets.
+   - Credential format checks do not prove credential validity. Authentication must be verified through the supported login flow.
+
+2. Credential and Discord client lifecycle errors
+
+   - The client lifecycle layer owns login, connection, readiness, gateway disconnection, reconnection, and account-level fatal state.
+   - Distinguish recoverable disconnections from unrecoverable authentication failures, CAPTCHA/security challenges, and other fatal account conditions.
+   - Do not repeatedly re-login or reconnect after a classified fatal, unrecoverable failure. Stop or disable the affected account according to the established lifecycle policy.
+   - Do not allow a dead or failed client to remain represented as healthy or ready. Publish the state transition and ensure dependent workers stop, wait, or recover according to policy.
+
+3. Discord adapter and interaction errors
+
+   - The adapter translates library-specific failures into stable, typed AutoClaimer errors. Do not leak library exceptions throughout the task layer when a meaningful typed classification is available.
+   - Distinguish rate limits, permission or validation failures, recoverable transport failures, fatal client failures, and uncertain operation outcomes.
+   - Do not classify an HTTP/server error as automatically safe to retry when a mutating request may have reached Discord before the response was lost.
+   - The adapter reports what happened or what can be established; it does not decide Mudae-specific claim/roll cooldown policy.
+
+4. Mudae domain outcomes
+
+   - Treat parsed bot responses as domain outcomes, not automatically as Python exceptions.
+   - Represent successful actions, claim or roll cooldowns, already-claimed results, unsupported responses, malformed messages, and missing responses distinctly.
+   - The Mudae task/domain layer owns interpretation of Mudae messages and the scheduling of claim/roll retries from verified domain information.
+   - Convert parser-provided relative durations into timezone-aware absolute UTC deadlines at this boundary before persisting them.
+   - A missing duration is not zero. Never invent a cooldown deadline from a failed parse, absent response, or assumption.
+   - If a response is malformed or unrecognized, use a bounded, explicit fallback or reconciliation policy. Do not retry indefinitely or record an unverified success.
+
+5. Internal runtime, persistence, and programming errors
+
+   - Use typed persistence and runtime errors where callers need to distinguish recovery behavior.
+   - Treat invariant violations, impossible state transitions, unexpected AttributeError/TypeError, data corruption, and programming defects as defects to investigate, not routine transient failures.
+   - Preserve cancellation semantics. Do not convert task cancellation into an ordinary failure, retry, or successful completion.
+   - If durable state cannot be read or written safely, do not claim that the corresponding operation was durably recorded. Fail or suspend the affected work according to the persistence contract.
+
+17.3 Single-owner retry policy
+
+Each operation must have one clearly documented retry owner. Lower layers may expose typed errors and retry metadata, but must not independently retry in ways that conflict with the owning layer.
+
+- Client lifecycle: owns connection and readiness recovery, subject to the fatal-error policy.
+- Discord adapter/rate limiter: owns transport-level rate-limit handling, pacing, and explicitly classified transient interaction failures.
+- Mudae task/domain layer: owns claim/roll cooldown scheduling, domain-specific retry limits, and response reconciliation.
+- Worker/runtime: owns task supervision, worker restart policy, shutdown behavior, and bounded recovery from unexpected handler failures.
+- Configuration and validation: do not retry deterministic invalid input.
+
+Before retrying a mutating operation, determine whether the outcome is known:
+
+- Known not to have occurred: retry only if the error classification and retry policy permit it.
+- Known to have occurred: record or reconcile the confirmed outcome; do not repeat the mutation unnecessarily.
+- Outcome uncertain: do not blindly replay the action. Reconcile through an authoritative response, supported Mudae lookup, or another explicitly designed recovery mechanism. If reconciliation is unavailable, preserve the uncertainty and apply a bounded policy.
+
+Retries must be bounded by attempt/time limits or a documented scheduling policy. Use the existing rate limiter and cooldown state rather than introducing competing retry loops. Apply backoff where appropriate, and ensure a retry cannot bypass a server-directed cooldown. Persist retry schedules and absolute cooldown deadlines whenever restart correctness requires them.
+
+17.4 "except Exception" policy
+
+Broad catches are permitted only at deliberate safety boundaries where allowing an unexpected exception to escape would violate a defined supervision or cleanup contract. Examples include:
+
+- Top-level worker iteration or handler supervision.
+- Per-subscriber event-dispatch isolation.
+- Adapter event-bridge boundaries that must log malformed external payloads without corrupting unrelated event flows.
+- Best-effort cleanup during shutdown or account-fatal handling.
+
+Every broad catch must satisfy all of the following:
+
+1. Have a documented reason why a broad boundary is necessary.
+2. Log the exception with its traceback and sufficient non-sensitive operation context.
+3. Apply an explicit policy: propagate, mark the task failed, stop/disable the account, trigger bounded recovery, or continue only after safely isolating the failure.
+4. Avoid silently swallowing the error or reporting success after a failed operation.
+5. Preserve asyncio.CancelledError propagation and normal shutdown semantics. Never accidentally swallow cancellation in a broad handler.
+6. Have tests covering the recovery behavior where practical.
+
+Outside these boundaries, catch specific exception types. Do not add "except Exception: pass", log-and-ignore handlers without a defined policy, or generic retry-on-any-error loops.
+
+Review existing broad catches whenever their surrounding behavior changes. Narrow them when reliable specific exception types become available — for example, when parser and event-payload validation contracts make malformed input distinguishable from programming defects. Do not narrow a safety boundary blindly if doing so would leave worker supervision, dispatcher isolation, or resource cleanup unprotected.
+
+17.5 Unexpected exceptions and diagnostics
+
+- Use "logger.exception(...)" inside an exception handler when a traceback is needed, or explicitly include exception information in structured logging.
+- Keep log fields useful and bounded: error category, operation, account/task identifiers, attempt number, client/worker state, and recovery decision.
+- Redact tokens, credentials, sensitive headers, and other secrets from exception messages and contextual fields. Never log full credential-bearing configuration objects.
+- Use tracemalloc only when investigating Python memory allocations or suspected memory leaks. It is not an exception-reporting, traceback, or general debugging substitute.
+- Do not enable expensive diagnostics globally as a substitute for reproducing a defect. Add targeted instrumentation or deterministic tests when investigating a suspected race, leak, stale client, or event-dispatch failure.
+
+17.6 Persistence, cooldowns, and restart recovery
+
+- Persist cooldowns as absolute, timezone-aware UTC deadlines. Calculate remaining duration from the deadline and the current UTC time when needed.
+- A deadline at or before the current UTC time is expired; it must not block work after restart.
+- Load persisted cooldowns before spawning workers that could perform affected operations.
+- Treat malformed persisted state as an explicit, diagnosable state-validation or persistence error. Do not silently fabricate a deadline or reinterpret invalid data without a documented migration policy.
+- For crashes between sending a mutating action and persisting its result, assume the outcome may be uncertain. Reconcile before repeating non-idempotent actions whenever possible.
+- Do not claim exactly-once execution solely because events are queued or state is stored in SQLite. Document the actual delivery and execution guarantees.
+
+17.7 Required tests for error-handling changes
+
+When modifying error classification, retry behavior, lifecycle handling, or recovery, add or update deterministic tests as appropriate:
+
+- Fatal authentication/client errors stop the affected account and do not trigger repeated login attempts.
+- Recoverable disconnects follow the lifecycle reconnection policy.
+- Rate limits preserve their cooldown and cannot be bypassed by retries or restart.
+- Uncertain mutation outcomes do not trigger unguarded duplicate actions.
+- Malformed or unsupported Mudae responses do not produce fabricated success or cooldown state.
+- Unexpected worker/handler failures are observed, logged, and handled according to the supervision contract.
+- Cancellation propagates correctly through retries, worker shutdown, and adapter cleanup.
+- Corrupt persisted state fails explicitly and does not silently become valid-looking state.
+- Event-dispatch failures remain isolated without silently losing track of required reconciliation.
+
+Run the targeted tests first, then the relevant integration tests and full configured quality checks. Report the failure classification, recovery decision, tests run, and any remaining uncertainty with every significant error-handling change.
