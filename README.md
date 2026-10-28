@@ -284,8 +284,11 @@ never called and historical retrieval is not part of the contract.
   register before `start()` (no startup-loss window); reconnects never
   duplicate handlers (one-time registration on the persistent client);
   `close()` stops all pumps — stragglers are delivered to no one.
-- Pacing: a small random delay precedes every mutating action
-  (`jitter_range`, default 0.4–1.2s). This is conservative pacing for
+- Pacing: a random delay precedes every mutating action. Sends use a
+  dedicated, tighter humanization range (`send_jitter_range`, default
+  0.203–0.567s) configurable as `settings.send_jitter_seconds:
+  [low, high]` in config.json; reactions and component presses use the
+  general `jitter_range` (default 0.4–1.2s). This is conservative pacing for
   personal, non-abusive use — **not** detection evasion.
 - Light endpoints only: channels resolve from the gateway cache; the one
   moderate read is `get_message` (needed to obtain component objects).
