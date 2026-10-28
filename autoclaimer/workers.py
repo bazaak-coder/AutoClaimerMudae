@@ -40,6 +40,7 @@ from enum import Enum
 from typing import TypeVar
 
 from .adapters import (
+    AccountFatalError,
     EventConsumer,
     InteractionResult,
     PlatformAdapter,
@@ -184,6 +185,7 @@ class WorkerManager:
         self._wall = wall
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
         self._paused: set[int] = set()
+        self._fatal_accounts: set[int] = set()
         self._globally_paused = False
         self._shutdown = asyncio.Event()
         self._stopped = False
@@ -300,6 +302,16 @@ class WorkerManager:
 
     async def _worker_loop(self, worker: _AccountWorker) -> None:
         while not self._shutdown.is_set():
+            if worker.account_id in self._fatal_accounts:
+                logger.info(
+                    "account worker stopped after fatal adapter failure",
+                    extra={
+                        "account_id": worker.account_id,
+                        "operation": "worker.loop",
+                        "outcome": "account_fatal_stop",
+                    },
+                )
+                return  # task completes: status() reports STOPPED, no respawn
             try:
                 await self._worker_iteration(worker)
             except asyncio.CancelledError:
@@ -416,6 +428,30 @@ class WorkerManager:
             )
             try:
                 outcome = await self._registry.execute(context)
+            except AccountFatalError as exc:
+                # Credentials dead / gateway session invalidated / CAPTCHA:
+                # fail this instance, then stop the whole account (owner
+                # policy 2026-10-28) — never retry, never continue with
+                # the account's remaining tasks.
+                logger.error(
+                    "account-fatal adapter failure; stopping account",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "account_fatal",
+                    },
+                )
+                await self._record(
+                    record.id,
+                    TaskOutcome(
+                        TaskStatus.FAILED_PERMANENT,
+                        message=f"account-fatal: {exc}",
+                    ),
+                    retry_at=None,
+                )
+                await self._handle_account_fatal(account_id, str(exc))
+                return
             except RetryLimitExceededError as exc:
                 logger.warning(
                     "task execution exhausted retries",
@@ -498,6 +534,55 @@ class WorkerManager:
         base = policy.backoff_base_seconds * (2**exponent)
         return float(min(base, policy.backoff_cap_seconds))
 
+    async def _handle_account_fatal(self, account_id: int, message: str) -> None:
+        """Stop an account after a fatal adapter error (owner policy).
+
+        Fails every queued instance for the account, disables it, marks
+        it fatal (the worker loop exits, no adapter rebuilds), closes its
+        adapter, and leaves a loud log trail. Re-enabling the account via
+        ``set_account_enabled(account_id, True)`` is the explicit revive
+        path once the underlying credential problem is fixed.
+        """
+        try:
+            failed = await self._store.fail_account_queue(account_id, f"account-fatal: {message}")
+        except PersistenceError:
+            logger.exception(
+                "could not sweep queue for fatal account",
+                extra={
+                    "account_id": account_id,
+                    "operation": "account.fatal",
+                    "outcome": "sweep_failed",
+                },
+            )
+            failed = -1
+        self._enabled[account_id] = False
+        self._fatal_accounts.add(account_id)
+        adapter = self._adapters.pop(account_id, None)
+        if adapter is not None:
+            try:
+                await adapter.close()
+            except Exception:
+                logger.exception(
+                    "adapter close failed after account-fatal error",
+                    extra={
+                        "account_id": account_id,
+                        "operation": "account.fatal",
+                        "outcome": "close_failed",
+                    },
+                )
+        worker = self._workers.get(account_id)
+        if worker is not None:
+            worker.nudge()  # wake a parked loop so it observes the fatal flag
+        logger.error(
+            "account stopped after fatal adapter failure (queued instances failed: %s)",
+            failed,
+            extra={
+                "account_id": account_id,
+                "operation": "account.fatal",
+                "outcome": "account_stopped",
+            },
+        )
+
     async def _terminal_without_claim(self, record: TaskInstanceRecord, reason: str) -> None:
         """Fail a never-claimed instance terminally (invalid config etc.)."""
         logger.warning(
@@ -520,8 +605,16 @@ class WorkerManager:
         The limiter's default policy governs operations; per-task policy
         resolution at the operation level is a future refinement. The
         factory contract: each call must return a usable, unclosed adapter
-        (evicted adapters are rebuilt through it).
+        (evicted adapters are rebuilt through it). Accounts marked fatal
+        never rebuild — their adapter is closed and dropped by
+        ``_handle_account_fatal`` (a fresh adapter would re-login with
+        the same dead token).
         """
+        if account_id in self._fatal_accounts:
+            # Defensive: a fatal account must never build a new adapter.
+            raise AccountFatalError(
+                f"account {account_id} is stopped after a fatal adapter failure"
+            )
         adapter = self._adapters.get(account_id)
         if adapter is not None and not getattr(adapter._inner, "is_healthy", True):
             # Belt-and-braces: evict terminal adapters (the Discord adapter
@@ -555,6 +648,10 @@ class WorkerManager:
         """
         if account_id not in self._enabled:
             raise ValueError(f"unknown account {account_id}; not present in configuration")
+        if enabled:
+            # Explicit revive path after an account-fatal stop: the owner
+            # re-enables the account once the credential problem is fixed.
+            self._fatal_accounts.discard(account_id)
         self._enabled[account_id] = enabled
         if enabled and self._started and not self._stopped:
             worker = self._workers.get(account_id)
