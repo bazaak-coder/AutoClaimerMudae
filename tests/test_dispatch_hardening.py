@@ -466,3 +466,122 @@ async def test_subscribe_after_stop_is_rejected() -> None:
     await dispatcher.stop()
     with pytest.raises(RuntimeError, match="stopped"):
         dispatcher.subscribe(consumer)
+
+
+# Dual-agent adversarial audit: racy/leaky lifecycle hardening
+
+
+async def test_stop_survives_loss_callback_that_unsubscribes() -> None:
+    """Audit F1 (both agents): a loss callback may unsubscribe during
+    stop()'s counting — arbitrary user code at an isolation boundary.
+    stop() must complete, account each subscription exactly once, and
+    cancel every pump (no half-dead dispatcher)."""
+    dispatcher = EventDispatcher(queue_size=4, name="stopmut")
+
+    async def parked(event: Any) -> None:
+        await asyncio.Event().wait()
+
+    unsub_holder: list[Any] = []
+    a_lost: list[int] = []
+    b_lost: list[int] = []
+
+    dispatcher.subscribe(parked, on_events_lost=a_lost.append)
+    unsubscribe_b = dispatcher.subscribe(parked, on_events_lost=b_lost.append)
+    unsub_holder.append(unsubscribe_b)
+
+    def b_on_loss(count: int) -> None:
+        b_lost.append(count)
+        unsub_holder[0]()  # mutates _subscribers during stop()'s iteration
+
+    dispatcher._subscribers[2].on_loss = b_on_loss  # noqa: SLF001
+    for _ in range(3):
+        await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)  # pumps take one event each, park inside
+
+    await dispatcher.stop(pump_timeout=0.2)  # must not raise
+    # Each subscription accounted exactly once (2 queued + 1 in-flight = 3).
+    assert a_lost == [3]
+    assert b_lost == [3]
+    assert dispatcher.dropped == 6  # 3 per subscription, no double count
+    assert dispatcher._subscribers == {}  # noqa: SLF001  # fully torn down
+
+
+async def test_dispatch_to_subscription_unsubscribed_mid_dispatch() -> None:
+    """Audit F2/F3: an overflow loss callback that unsubscribes must not
+    strand the in-flight put on a dead queue — the event is counted as
+    dropped, never silently vanished."""
+    dispatcher = EventDispatcher(queue_size=1, name="deadput")
+    lost: list[int] = []
+    unsub_holder: list[Any] = []
+
+    async def slow(event: Any) -> None:
+        await asyncio.Event().wait()  # would never drain
+
+    def on_loss(count: int) -> None:
+        lost.append(count)
+        unsub_holder[0]()  # unsubscribe synchronously, mid-dispatch
+
+    unsub_holder.append(dispatcher.subscribe(slow, on_events_lost=on_loss))
+    dead_queue = dispatcher._subscribers[1].queue  # noqa: SLF001
+    # No yields: both dispatches are atomic, so e1 is still QUEUED when
+    # e2 arrives -> overflow -> callback unsubscribes -> dead target.
+    await dispatcher.dispatch(make_event())  # e1 queued
+    await dispatcher.dispatch(make_event())  # e2: overflow drop -> unsubscribe
+    assert lost == [1]  # e1's overflow drop reported
+    assert dispatcher.dropped == 2  # e1 (drop-oldest) + e2 (dead target)
+    assert dead_queue.qsize() == 0  # e2 never stranded on the dead queue
+    await dispatcher.stop(pump_timeout=0.2)
+
+
+async def test_dispatch_after_stop_is_counted_not_silent() -> None:
+    """Audit F2 (race)/F9a (leak): post-stop dispatch must not be a
+    silent black hole — symmetric with the loud post-stop subscribe
+    rejection: counted and logged."""
+    dispatcher = EventDispatcher(queue_size=2, name="poststopdispatch")
+    await dispatcher.stop()
+    await dispatcher.dispatch(make_event())  # must not raise, must not vanish
+    assert dispatcher.dropped == 1
+    await dispatcher.dispatch(make_event())
+    assert dispatcher.dropped == 2
+
+
+def test_non_positive_queue_size_is_rejected() -> None:
+    """Audit F3 (leak): queue_size <= 0 would create an UNBOUNDED queue
+    (full() always False on this Python) — contradicting the bounded
+    contract invisibly."""
+    with pytest.raises(ValueError, match="positive"):
+        EventDispatcher(queue_size=0)
+    with pytest.raises(ValueError, match="positive"):
+        EventDispatcher(queue_size=-3)
+
+
+async def test_stop_timeout_logs_surviving_pump_no_double_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Audit F4+F5 (leak): a cancellation-suppressing consumer surviving
+    the stop timeout is logged (docstring promise), and its later
+    failure does not double-count the already-reported loss."""
+    import logging
+
+    dispatcher = EventDispatcher(queue_size=2, name="survivor")
+    released = asyncio.Event()
+
+    async def suppressor(event: Any) -> None:
+        try:
+            await released.wait()
+        except asyncio.CancelledError:
+            await released.wait()  # suppress cancellation until released
+            raise RuntimeError("late failure") from None  # non-cancel error
+
+    dispatcher.subscribe(suppressor)
+    await dispatcher.dispatch(make_event())
+    await asyncio.sleep(0.02)
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.adapters"):
+            await dispatcher.stop(pump_timeout=0.05)  # survivor abandoned, stop returns
+        assert dispatcher.dropped == 1  # in-flight counted ONCE at stop
+        assert "surviv" in caplog.text  # the abandoned pump is logged
+    finally:
+        released.set()  # let the suppressor finish before loop teardown
+    await asyncio.sleep(0.05)  # survivor resumes, re-raises Cancelled, fails the pump
+    assert dispatcher.dropped == 1  # no second count from the pump's failure
