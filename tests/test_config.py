@@ -144,6 +144,38 @@ def base_app() -> dict[str, Any]:
     }
 
 
+def test_send_jitter_defaults_and_parses() -> None:
+    from autoclaimer.models import AppSettings
+
+    assert parse_app_config(base_app()).settings.send_jitter_seconds == (0.203, 0.567)
+
+    raw = base_app()
+    raw["settings"] = {**raw["settings"], "send_jitter_seconds": [0.25, 0.9]}
+    parsed = parse_app_config(raw).settings
+    assert parsed.send_jitter_seconds == (0.25, 0.9)
+    assert isinstance(parsed, AppSettings)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [0.203],
+        [0.203, 0.4, 0.9],
+        [0.6, 0.2],
+        [-0.1, 0.5],
+        ["0.2", "0.5"],
+        [0.2, float("nan")],
+        [0.2, float("inf")],
+        0.203,
+    ],
+)
+def test_send_jitter_invalid_values_are_rejected(bad: Any) -> None:
+    raw = base_app()
+    raw["settings"] = {**raw["settings"], "send_jitter_seconds": bad}
+    with pytest.raises(ConfigValidationError):
+        parse_app_config(raw)
+
+
 def base_accounts() -> dict[str, Any]:
     return {
         "version": 1,
