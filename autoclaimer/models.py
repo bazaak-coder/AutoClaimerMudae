@@ -19,6 +19,11 @@ class AppSettings:
     log_level: str = "INFO"
     max_concurrent_accounts: int = 3
     shutdown_timeout_seconds: int = 15
+    # Conservative humanization delay (low, high seconds) applied before
+    # every send_message; deliberately tighter than the general mutating-
+    # action jitter (owner directive 2026-10-28: "minimal, humanize the
+    # interaction").
+    send_jitter_seconds: tuple[float, float] = (0.203, 0.567)
 
 
 @dataclass(frozen=True)

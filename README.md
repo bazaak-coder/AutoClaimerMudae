@@ -59,6 +59,8 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
 | `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
+| `autoclaimer/mudae_parser/` | implemented (vendored) | LibzentSuite's stdlib-only Mudae parser, byte-identical at revision `41b0775`; rules/locales/settings engine with its 80-test ported suite. See its VENDORED.md. |
+| `autoclaimer/mudae.py` | implemented | Thin interface: `parse_mudae()` (str/ChannelMessage/MessageCreatedEvent/embed shapes) + typed `ClaimStatus` view for `$mu`/claim lines; durations stay relative. |
 
 Planned boundaries are documented, not implemented; no stub modules exist to
 avoid speculative code.
@@ -284,24 +286,37 @@ never called and historical retrieval is not part of the contract.
   register before `start()` (no startup-loss window); reconnects never
   duplicate handlers (one-time registration on the persistent client);
   `close()` stops all pumps — stragglers are delivered to no one.
-- Pacing: a small random delay precedes every mutating action
-  (`jitter_range`, default 0.4–1.2s). This is conservative pacing for
+- Pacing: a random delay precedes every mutating action. Sends use a
+  dedicated, tighter humanization range (`send_jitter_range`, default
+  0.203–0.567s) configurable as `settings.send_jitter_seconds:
+  [low, high]` in config.json; reactions and component presses use the
+  general `jitter_range` (default 0.4–1.2s). This is conservative pacing for
   personal, non-abusive use — **not** detection evasion.
 - Light endpoints only: channels resolve from the gateway cache; the one
   moderate read is `get_message` (needed to obtain component objects).
   Heavy endpoints (`fetch_user`, `fetch_channel`, …) are never called.
 - Error translation: `RateLimited`/HTTP 429 → `CooldownError(retry_after)`
-  (recorded and honored by the central limiter); `CaptchaRequired`,
-  `LoginFailure`/`AuthFailure` (one class in this fork), and
-  `ConnectionClosed` with a fatal close code (4004, 4010-4014 — the only
-  codes the library itself refuses to reconnect on; the client is
-  already terminal when they surface) → **`AccountFatalError`**: the
-  adapter latches the verdict permanently (no re-login, no client
-  rebuild) and the worker manager fails the account's queued instances,
-  disables the account, and stops its worker — never retries. CAPTCHAs
-  are never bypassed. `Forbidden`/`NotFound` → per-operation permanent;
-  5xx, non-fatal `ConnectionClosed`, `GatewayNotFound`, `InvalidData`
-  (uncertain interaction outcome) → recoverable.
+  (recorded and honored by the central limiter; a 429 means the request
+  was rejected, not applied — post-cooldown retry is safe even for
+  mutations). **Mutating calls** (`send_message`, `add_reaction`,
+  `Button.click`) translate with mutation awareness: a completed 5xx
+  response or an unrecognized library error maps to
+  `UncertainOutcomeError` — the action may have been applied and is
+  never auto-retried (PR #2 review fix); read paths (`fetch_message`)
+  and pre-mutation failures (readiness) keep safe bounded retries.
+  `CaptchaRequired`, `LoginFailure`/`AuthFailure` (one class in this
+  fork), and `ConnectionClosed` with a fatal close code (4004, 4010-4014
+  — the only codes the library itself refuses to reconnect on; the
+  client is already terminal when they surface) →
+  **`AccountFatalError`**: the adapter latches the verdict permanently
+  (no re-login, no client rebuild) and the worker manager fails the
+  account's queued instances, disables the account, and stops its
+  worker — never retries. CAPTCHAs are never bypassed.
+  `Forbidden`/`NotFound` → per-operation permanent; 5xx on reads,
+  non-fatal `ConnectionClosed` and `GatewayNotFound` on reads or
+  pre-mutation phases → recoverable (bounded retries); non-fatal
+  connection failures during a mutation → uncertain (outcome unknown);
+  `InvalidData` (uncertain interaction outcome) → uncertain.
 - No Discord objects leak past the adapter; tokens come from the
   credential provider at login time and are never stored, logged, or
   persisted.

@@ -53,10 +53,14 @@ never called and the adapter does not implement historical retrieval.
 
 Behavioural rules:
 
-- **Pacing**: a small randomized delay (``jitter_range`` seconds) precedes
-  every mutating action (send / react / press). This is conservative pacing
-  to avoid hammering the API for personal use — it is not and must not
-  become detection evasion.
+- **Pacing**: a randomized delay precedes every mutating action. Sends
+  use a dedicated, tighter humanization range — ``send_jitter_range``,
+  default 0.203–0.567 s, configurable as
+  ``settings.send_jitter_seconds: [low, high]`` in config.json (pass
+  ``settings.send_jitter_seconds`` from the parsed config into the
+  adapter factory). Reactions and component presses use the general
+  ``jitter_range`` (default 0.4–1.2 s). This is conservative pacing for
+  personal, non-abusive use — **not** detection evasion.
 - **Light endpoints only**: channels resolve from the gateway cache; the
   single moderate read used is ``get_message`` (required to obtain the
   component objects for a press). Heavy endpoints such as ``fetch_user``
@@ -110,6 +114,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_JITTER_RANGE = (0.4, 1.2)
 
+#: Dedicated humanization range for send_message (owner directive
+#: 2026-10-28: "keep it minimal range 0.203-0.567"). Configurable via
+#: ``settings.send_jitter_seconds`` in config.json.
+_DEFAULT_SEND_JITTER_RANGE = (0.203, 0.567)
+
 #: Gateway close codes the library itself refuses to reconnect on
 #: (``DiscordWebSocket._can_handle_close``, discord.py-self 2.1.0).
 #: 4004 = authentication failed (token invalidated mid-session),
@@ -130,6 +139,7 @@ class DiscordAdapter:
         client: discord.Client | None = None,
         client_factory: Callable[[], Any] | None = None,
         jitter_range: tuple[float, float] = _DEFAULT_JITTER_RANGE,
+        send_jitter_range: tuple[float, float] | None = None,
         jitter: Callable[[float, float], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         event_queue_size: int = 64,
@@ -143,6 +153,7 @@ class DiscordAdapter:
         self._client_factory = client_factory or (lambda: discord.Client())
         self._client = client if client is not None else self._client_factory()
         self._jitter_range = jitter_range
+        self._send_jitter_range = send_jitter_range or _DEFAULT_SEND_JITTER_RANGE
         self._jitter = jitter or (lambda low, high: random.uniform(low, high))
         self._sleep = sleep or asyncio.sleep
         self._start_lock = asyncio.Lock()
@@ -440,9 +451,14 @@ class DiscordAdapter:
 
     # ----- helpers -----
 
-    async def _pace(self) -> None:
-        """Randomized conservative delay before a mutating action."""
-        delay = self._jitter(*self._jitter_range)
+    async def _pace(self, jitter_range: tuple[float, float] | None = None) -> None:
+        """Randomized conservative delay before a mutating action.
+
+        ``send_message`` passes its dedicated, tighter humanization range
+        (``send_jitter_range``); reactions and component presses use the
+        general ``jitter_range``.
+        """
+        delay = self._jitter(*(jitter_range or self._jitter_range))
         if delay > 0:
             await self._sleep(delay)
 
@@ -479,12 +495,14 @@ class DiscordAdapter:
 
     async def send_message(self, channel_id: int, content: str) -> SentMessage:
         await self._ensure_ready()
-        await self._pace()
+        await self._pace(self._send_jitter_range)
         channel = self._channel(channel_id)
         try:
             message = await channel.send(content)
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: a 5xx or unknown error leaves the outcome
+            # ambiguous — UncertainOutcomeError, never auto-retried.
+            raise _translate(exc, mutating=True) from exc
         logger.debug(
             "message sent",
             extra={
@@ -502,7 +520,8 @@ class DiscordAdapter:
         try:
             await self._client.http.add_reaction(channel_id, message_id, emoji)
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: ambiguous failures are never auto-retried.
+            raise _translate(exc, mutating=True) from exc
 
     async def press_component(
         self, channel_id: int, message_id: int, component_id: str
@@ -512,14 +531,20 @@ class DiscordAdapter:
         channel = self._channel(channel_id)
         try:
             message = await channel.fetch_message(message_id)
-            button = _find_button(message, component_id)
-            if button is None:
-                raise PermanentAdapterError(
-                    f"component {component_id!r} not found on message {message_id}"
-                )
+        except discord.DiscordException as exc:
+            # READ: a 5xx response proves nothing was mutated — safe to
+            # retry within bounds.
+            raise _translate(exc) from exc
+        button = _find_button(message, component_id)
+        if button is None:
+            raise PermanentAdapterError(
+                f"component {component_id!r} not found on message {message_id}"
+            )
+        try:
             result = await button.click()
         except discord.DiscordException as exc:
-            raise _translate(exc) from exc
+            # Mutating call: ambiguous failures are never auto-retried.
+            raise _translate(exc, mutating=True) from exc
         # A str result means the "button" is a link: no interaction occurred.
         acknowledged = not isinstance(result, str)
         return InteractionResult(
@@ -702,14 +727,24 @@ def _find_button(message: Any, component_id: str) -> Any:
     return None
 
 
-def _translate(exc: discord.DiscordException) -> AdapterError:
+def _translate(exc: discord.DiscordException, *, mutating: bool = False) -> AdapterError:
     """Map library exceptions to the framework's typed error model.
+
+    ``mutating`` tells the translator whether the failing call could have
+    applied a platform side effect. A completed 5xx response (or an
+    unrecognized library error) does not prove a mutation was NOT
+    applied — for mutating operations it maps to
+    :class:`UncertainOutcomeError` (never auto-retried; PR #2 review
+    fix). Read-only calls and pre-mutation failures keep their safe
+    bounded-retry classification.
 
     Account-fatal verdicts (dead credentials, fatal gateway close codes,
     CAPTCHA) map to :class:`AccountFatalError`, which stops the whole
     account instead of failing one task (owner policy 2026-10-28).
     """
     if isinstance(exc, discord.RateLimited):
+        # 429 = the request was REJECTED, not applied: safe to retry for
+        # mutating operations too, after the recorded cooldown.
         return CooldownError(exc.retry_after)
     if isinstance(exc, discord.CaptchaRequired):
         return AccountFatalError(
@@ -723,6 +758,12 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
     if isinstance(exc, (discord.Forbidden, discord.NotFound)):
         return PermanentAdapterError(str(exc))
     if isinstance(exc, discord.DiscordServerError):
+        # The request completed with a 5xx RESPONSE: whether Discord
+        # applied the action is unknowable from here.
+        if mutating:
+            return UncertainOutcomeError(
+                f"server error {exc.status}; the mutation may have been applied: {exc}"
+            )
         return RecoverableAdapterError(f"Discord server error ({exc.status}): {exc}")
     if isinstance(exc, discord.HTTPException):
         if exc.status == 429:
@@ -735,6 +776,10 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
                     retry_after = 1.0
             return CooldownError(retry_after)
         if exc.status >= 500:
+            if mutating:
+                return UncertainOutcomeError(
+                    f"HTTP {exc.status}; the mutation may have been applied: {exc}"
+                )
             return RecoverableAdapterError(f"HTTP {exc.status}: {exc}")
         return PermanentAdapterError(f"HTTP {exc.status}: {exc}")
     if isinstance(exc, discord.InvalidData):
@@ -750,9 +795,26 @@ def _translate(exc: discord.DiscordException) -> AdapterError:
             return AccountFatalError(
                 f"gateway session invalidated (close code {exc.code}): {exc.reason or exc}"
             )
+        if mutating:
+            # The connection failed around a mutating call — the platform
+            # may have received and applied it before the closure. The
+            # outcome is unknown: never auto-retry (same policy as 5xx).
+            return UncertainOutcomeError(
+                f"connection closed (code {exc.code}) during a mutation; "
+                f"the outcome is unknown: {exc}"
+            )
         return RecoverableAdapterError(f"connection problem: {exc}")
     if isinstance(exc, discord.GatewayNotFound):
+        if mutating:
+            return UncertainOutcomeError(
+                f"gateway unavailable during a mutation; the outcome is unknown: {exc}"
+            )
         return RecoverableAdapterError(f"connection problem: {exc}")
-    # Unknown library errors are treated as recoverable so bounded retries
-    # (not silent success) decide the outcome.
+    # Unknown library errors: for mutating operations the outcome is
+    # unknown (agents.md section 17.3 — never assume retry safety from
+    # surprise); elsewhere bounded retries decide the outcome.
+    if mutating:
+        return UncertainOutcomeError(
+            f"untranslated discord error; the mutation outcome is unknown: {exc}"
+        )
     return RecoverableAdapterError(f"untranslated discord error: {exc}")

@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -569,3 +570,89 @@ async def test_cache_reads_are_not_rate_limited() -> None:
     assert await wrapped.get_channel(7) == ChannelInfo(7, "spam", "text")
     assert await wrapped.validate_channel(7) is True
     assert [call.operation for call in inner.calls] == ["get_channel", "validate_channel"]
+
+
+# --- restart recovery: persisted cooldowns (audit F1) ---
+
+
+async def test_start_loads_persisted_server_cooldowns(tmp_path: Path) -> None:
+    """Audit F1 regression: a restarting manager must adopt still-active
+    persisted scope cooldowns. A server-directed 429 deadline recorded in
+    a previous process gates the new process's first operation instead of
+    being forgotten."""
+    from autoclaimer.ratelimit import RateLimiter, account_scope
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+
+    async def noop(context: Any) -> Any:
+        from autoclaimer.registry import TaskOutcome, TaskStatus
+
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Restart cooldown probe.",
+            validate_config=lambda config: None,
+            handler=noop,
+        )
+    )
+    db = tmp_path / "state.db"
+
+    # "Previous run": a server-directed cooldown lands in the store.
+    store1 = TaskStateStore(db)
+    await store1.open()
+    limiter1 = RateLimiter(store=store1)
+    await limiter1.record_cooldown(
+        account_scope(ACCOUNT), retry_after_seconds=600, server_directed=True
+    )
+    await store1.close()
+
+    # Restart: fresh store handle, fresh limiter (empty in-memory state),
+    # manager over the same database. The limiter's clock advances with
+    # every fake sleep so cooldown re-check loops converge.
+    store2 = TaskStateStore(db)
+    await store2.open()
+    sleeps: list[float] = []
+    clock = {"now": datetime.now(UTC)}
+
+    def fake_wall() -> datetime:
+        return clock["now"]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] = clock["now"] + timedelta(seconds=seconds)
+
+    limiter2 = RateLimiter(store=store2, wall=fake_wall, sleep=fake_sleep)
+    manager = WorkerManager(
+        registry=registry,
+        store=store2,
+        limiter=limiter2,
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    await manager.start()
+
+    loaded = {info.scope: info for info in limiter2.status().cooldowns}
+    assert account_scope(ACCOUNT) in loaded, "persisted cooldown not adopted on start"
+    assert loaded[account_scope(ACCOUNT)].server_directed is True
+
+    # Behavioral: the account is parked until the persisted deadline.
+    await limiter2.wait_scopes(ACCOUNT)
+    assert sleeps and 500 < sleeps[-1] <= 600
+
+    await manager.stop()
+    await store2.close()

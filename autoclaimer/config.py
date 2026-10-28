@@ -126,6 +126,30 @@ def _duration(value: Any, where: str, *, minimum: float = 0.0) -> float:
     return float(value)
 
 
+def _jitter_pair(value: Any) -> tuple[float, float]:
+    """Validate an optional (low, high) jitter range for send humanization.
+
+    Exactly two finite numbers, ``0 <= low <= high <= 60``; absent means
+    the built-in default (0.203, 0.567).
+    """
+    default: tuple[float, float] = (0.203, 0.567)
+    if value is None:
+        return default
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ConfigValidationError(
+            "config.settings.send_jitter_seconds must be a pair [low, high] of seconds."
+        )
+    low = _duration(value[0], "config.settings.send_jitter_seconds[0]")
+    high = _duration(value[1], "config.settings.send_jitter_seconds[1]")
+    if high > 60.0:
+        raise ConfigValidationError(
+            "config.settings.send_jitter_seconds high must not exceed 60 seconds."
+        )
+    if low > high:
+        raise ConfigValidationError("config.settings.send_jitter_seconds low must not exceed high.")
+    return (low, high)
+
+
 def _parse_ratelimit(raw: Any, where: str) -> RateLimitPolicy:
     obj = _object(raw, where)
     _only_keys(obj, _RATELIMIT_KEYS, where)
@@ -227,7 +251,14 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
 
     s = _object(data.get("settings", {}), "config.settings")
     _only_keys(
-        s, {"log_level", "max_concurrent_accounts", "shutdown_timeout_seconds"}, "config.settings"
+        s,
+        {
+            "log_level",
+            "max_concurrent_accounts",
+            "shutdown_timeout_seconds",
+            "send_jitter_seconds",
+        },
+        "config.settings",
     )
     log_level = s.get("log_level", "INFO")
     if not isinstance(log_level, str) or log_level.upper() not in _LOG_LEVELS:
@@ -248,6 +279,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             minimum=1,
             maximum=600,
         ),
+        send_jitter_seconds=_jitter_pair(s.get("send_jitter_seconds")),
     )
 
     td = _object(data.get("task_defaults", {}), "config.task_defaults")

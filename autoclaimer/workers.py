@@ -211,6 +211,10 @@ class WorkerManager:
             return
         self._started = True
         await self._store.recover_interrupted()
+        # Adopt still-active persisted cooldowns BEFORE any worker can act:
+        # server-directed deadlines must survive restarts (audit F1; a
+        # no-op when the limiter has no store attached).
+        await self._limiter.load_persisted_cooldowns()
         for account_id in list(self._enabled):
             if self._enabled[account_id]:
                 await self._materialize(account_id)

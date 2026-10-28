@@ -48,8 +48,10 @@ class FakeButton:
         self.url = None
         self._result = result if result is not None else object()  # Interaction-like
         self._error = error
+        self.click_calls = 0
 
     async def click(self) -> Any:
+        self.click_calls += 1
         if self._error is not None:
             raise self._error
         return self._result
@@ -516,6 +518,55 @@ async def test_button_click_without_response_is_uncertain_never_retried() -> Non
 # ----- error translation -----
 
 
+async def test_send_jitter_range_is_dedicated_and_configurable() -> None:
+    """send_message humanization: a dedicated, tighter jitter range
+    (default 0.203-0.567 s) distinct from the general mutating-action
+    range used by react/press."""
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]  # fake implements the used surface
+        jitter=lambda low, high: low,  # expose the range's low bound
+        sleep=fake_sleep,
+        send_jitter_range=(0.25, 0.5),
+    )
+    await adapter.send_message(CHANNEL, "hi")  # send range low = 0.25
+    await adapter.add_reaction(CHANNEL, 1, "emoji")  # general range low = 0.4
+    assert sleeps == [0.25, 0.4]
+    client.connect_stopped.set()
+    await adapter.close()
+
+
+async def test_send_jitter_defaults_and_general_range_unchanged() -> None:
+    channel = FakeChannel(CHANNEL, [])
+    client = FakeClient(channel)
+    bounds: list[tuple[float, float]] = []
+
+    def record_bounds(low: float, high: float) -> float:
+        bounds.append((low, high))
+        return 0.0
+
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]  # fake implements the used surface
+        jitter=record_bounds,
+        sleep=_no_sleep_async,
+    )
+    await adapter.send_message(CHANNEL, "hi")
+    await adapter.add_reaction(CHANNEL, 1, "emoji")
+    assert bounds == [(0.203, 0.567), (0.4, 1.2)]  # send range, then general
+    client.connect_stopped.set()
+    await adapter.close()
+
+
 async def test_get_channel_and_validate_channel_are_cache_only() -> None:
     """Consumer channel discovery: gateway cache only, never a REST call.
 
@@ -591,6 +642,34 @@ async def test_http_error_translation_matrix() -> None:
 
     for exc, expected in cases:
         translated = _translate(exc)
+        assert type(translated) is expected, f"{exc!r} -> {type(translated)}"
+
+
+def test_translation_matrix_mutating_mode() -> None:
+    """Mutating calls: ambiguous failures (5xx response received, unknown
+    library error) never classify as auto-retryable (PR #2 review fix);
+    everything else keeps its classification."""
+    from autoclaimer.discord_adapter import _translate
+
+    server_error = discord.DiscordServerError(
+        SimpleNamespace(status=503, reason="oops", text="unavailable"), "down"
+    )
+    cases: list[tuple[discord.DiscordException, type[AdapterError]]] = [
+        (server_error, UncertainOutcomeError),
+        (discord.ClientException("mystery"), UncertainOutcomeError),
+        (discord.ConnectionClosed(1006, "abnormal"), UncertainOutcomeError),
+        (discord.GatewayNotFound(), UncertainOutcomeError),  # type: ignore[no-untyped-call]
+        # Unchanged in mutating mode:
+        (discord.RateLimited(9.0), CooldownError),  # 429 = rejected, not applied
+        (
+            discord.Forbidden(SimpleNamespace(status=403, reason="no"), "no"),
+            PermanentAdapterError,
+        ),
+        (discord.LoginFailure("bad token"), AccountFatalError),
+        (discord.ConnectionClosed(4004, "auth"), AccountFatalError),  # fatal stays fatal
+    ]
+    for exc, expected in cases:
+        translated = _translate(exc, mutating=True)
         assert type(translated) is expected, f"{exc!r} -> {type(translated)}"
 
 
