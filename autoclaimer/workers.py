@@ -531,7 +531,32 @@ class WorkerManager:
                 # Milestone 4 (retry ownership): a LEARNED absolute UTC
                 # deadline (parsed from a Mudae reply, anchored at the
                 # domain boundary) supersedes generic transport backoff.
-                # An already-expired deadline means "due now".
+                # An already-expired deadline means "due now". A naive
+                # deadline is a handler CONTRACT VIOLATION (PR #3 review
+                # fix): comparing it would raise after the durable claim
+                # and strand the instance in `running` — instead the
+                # attempt fails terminally with a clear message and
+                # supervision continues (§17.2.5).
+                if outcome.retry_at.tzinfo is None:
+                    logger.error(
+                        "handler returned a timezone-naive retry_at; failing attempt terminally",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": record.task_id,
+                            "operation": "task.execute",
+                            "outcome": "invalid_retry_at",
+                        },
+                    )
+                    await self._record(
+                        record.id,
+                        TaskOutcome(
+                            TaskStatus.FAILED_PERMANENT,
+                            message="handler returned a timezone-naive retry_at; "
+                            "deadline rejected at the worker boundary",
+                        ),
+                        retry_at=None,
+                    )
+                    return
                 retry_at = max(outcome.retry_at, self._wall())
             else:
                 delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)

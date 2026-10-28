@@ -302,13 +302,22 @@ class EventDispatcher:
     async def _pump(self, subscription: _Subscription) -> None:
         while True:
             event = await subscription.queue.get()
+            # In-flight tracking (PR #3 review fix): an event dequeued
+            # into its consumer is invisible to queue.qsize(); stop()
+            # counts it via `in_flight` so interrupted deliveries are
+            # reported as losses instead of vanishing.
+            subscription.in_flight = event
             try:
                 result = subscription.consumer(event)
                 if inspect.isawaitable(result):
                     await result
+                subscription.in_flight = None  # delivered
             except asyncio.CancelledError:
+                # Preserve in_flight: stop() reports the interrupted
+                # delivery as a loss (never swallowed, §17.4.5).
                 raise
             except Exception:
+                subscription.in_flight = None  # delivered to a failing consumer
                 logger.exception(
                     "event consumer failed; continuing",
                     extra={
@@ -331,9 +340,15 @@ class EventDispatcher:
         vanishing silently (adapter eviction / shutdown accounting).
         """
         current = asyncio.current_task()
-        # Report undelivered events BEFORE tearing pumps down.
+        # Report undelivered events BEFORE tearing pumps down. In-flight
+        # events (dequeued by a pump, blocked inside a consumer) are
+        # disjoint from the queues — counted together exactly once
+        # (PR #3 review fix). Cancellation-suppressing consumers that
+        # survive the timeout may still deliver their in-flight event
+        # afterwards; they are already 'abandoned' per the bounded-stop
+        # contract, so the conservative loss report stands.
         for subscription in self._subscribers.values():
-            undelivered = subscription.queue.qsize()
+            undelivered = subscription.queue.qsize() + (1 if subscription.in_flight else 0)
             if undelivered > 0:
                 self.dropped += undelivered
                 subscription.dropped += undelivered
@@ -371,6 +386,8 @@ class _Subscription:
     dropped: int = 0
     pump: asyncio.Task[None] | None = None
     on_loss: Callable[[int], None] | None = None
+    #: Event currently dequeued into the consumer (loss accounting).
+    in_flight: AccountEventPayload | None = None
 
 
 @dataclass(frozen=True)
