@@ -716,3 +716,32 @@ async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
         assert MudaeStateKind.RT not in await store.mudae_deadlines(1)
     finally:
         await store.close()
+
+
+# Milestone 7: recurring tasks — success rescheduling
+
+
+async def test_reschedule_success_resets_attempts_and_waits(tmp_path: Path) -> None:
+    """A recurring round that SUCCEEDED with a learned deadline keeps
+    the instance alive: running -> waiting, attempt count reset (each
+    round is a fresh window), outcome recorded for observability."""
+    from autoclaimer.registry import TaskOutcome, TaskStatus
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        claimed = await store.claim(record.id)
+        assert claimed.attempt_count == 1
+        outcome = TaskOutcome(TaskStatus.SUCCEEDED, message="rolled", retry_at=_future(3600))
+        rescheduled = await store.reschedule_success(record.id, outcome, _future(3600))
+        assert rescheduled.status is TaskInstanceState.WAITING
+        assert rescheduled.attempt_count == 0  # fresh window
+        assert rescheduled.next_attempt_at == _future(3600)
+        assert rescheduled.last_outcome is not None
+        assert rescheduled.last_outcome.status is TaskStatus.SUCCEEDED
+
+        with pytest.raises(StateTransitionError):
+            # Only the running (claimed) row may be rescheduled.
+            await store.reschedule_success(record.id, outcome, _future(60))
+    finally:
+        await store.close()

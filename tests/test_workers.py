@@ -887,3 +887,66 @@ async def test_naive_retry_at_on_permanent_failure_keeps_terminal(tmp_path: Path
     assert record.last_outcome is not None
     assert "timezone-naive" in record.last_outcome.message
     await store.close()
+
+
+# Milestone 7: recurring tasks
+
+
+async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) -> None:
+    """A recurring handler returns SUCCEEDED + a learned deadline: the
+    round is recorded as a success, the instance is rescheduled (waiting,
+    fresh attempt window) instead of going terminal — and the next round
+    executes at the deadline."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    calls: list[int] = []
+    learned = _dt(2026, 10, 29, 13, 0, 0, tzinfo=_UTC)
+
+    async def recurring(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        if len(calls) == 1:
+            return TaskOutcome(TaskStatus.SUCCEEDED, message="round done", retry_at=learned)
+        return TaskOutcome(TaskStatus.FAILED_PERMANENT, message="stop marker")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Recurring round.",
+            validate_config=lambda config: None,
+            handler=recurring,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+        wall=lambda: _dt(2026, 10, 29, 12, 0, 0, tzinfo=_UTC),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.WAITING)
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.status is TaskInstanceState.WAITING  # alive, not terminal
+    assert record.attempt_count == 0  # fresh window for the next round
+    assert record.next_attempt_at == learned
+    assert record.last_outcome is not None
+    assert record.last_outcome.status is TaskStatus.SUCCEEDED
+    await store.close()
