@@ -1539,3 +1539,60 @@ async def test_immediate_reaction_does_not_wait_out_the_text_timeout() -> None:
     assert elapsed < 1.2, f"confirmation took {elapsed:.2f}s — sequential wait suspected"
     assert outcome.retry_at is not None
     await store.close()
+
+
+# Review round 7: awaited concurrent-waiter cleanup at the loop boundary
+
+
+async def test_unrelated_text_then_reaction_no_overlap_no_survivors() -> None:
+    """Review fix: unrelated text arrives at the loop boundary (the pair
+    is cancelled); a qualifying ✅ follows. The reaction is handled ONCE,
+    no overlapping queue consumers remain on either waiter, and no child
+    tasks survive the round."""
+    adapter = MockAdapter()
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    rt_id = _FIRST_ID + 1
+
+    async def unrelated_text_then_mark() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)  # bind settles; the concurrent loop is live
+        now = datetime.now(UTC)
+        # Unrelated Mudae chatter FIRST: triggers a loop iteration whose
+        # wait pair must be fully torn down before the next pair starts.
+        await adapter.emit(_dc.replace(reply_event(60, "chatter one"), received_at=now))
+        await asyncio.sleep(0.05)
+        await adapter.emit(_dc.replace(reply_event(61, "chatter two"), received_at=now))
+        await asyncio.sleep(0.05)
+        # The qualifying reaction, after the loop boundary.
+        await adapter.emit(_dc.replace(reaction_event(rt_id), received_at=now))
+
+    emitter = Emitter(adapter)
+    emitter.on_send(reply_event(31, "text placeholder", author_id=MUDAE)).on_send(
+        reply_event(32, RT_COOLDOWN_REPLY)
+    )
+    script = asyncio.create_task(unrelated_text_then_mark())
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 2.0}
+        )
+    )
+    await script
+    # Confirmed exactly once: $rtu followed and the deadline was learned.
+    assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]
+    learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
+    assert outcome.retry_at == learned
+    assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
+    # No overlapping queue consumers: both waiters ended with empty
+    # queues and no in-flight wait() getters.
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    # Only the harness emitter/pump tasks may remain — no stray waiters.
+    assert all("wait" not in t.get_name() and "waiter" not in t.get_name() for t in pending)
+    await store.close()
