@@ -26,6 +26,7 @@ duplicate logical triggers act once (T10).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from collections.abc import Callable, Iterable
@@ -33,7 +34,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from .adapters import MessageCreatedEvent, PlatformAdapter, UncertainOutcomeError
+from .adapters import (
+    MessageCreatedEvent,
+    PlatformAdapter,
+    RawReactionAddedEvent,
+    UncertainOutcomeError,
+)
 from .mudae import ParseResult, anchor_deadline, claim_status, parse_mudae, roll_reset_status
 from .mudae_parser import CooldownKind, MessageFamily
 from .persistence import MudaeStateKind, TaskStateStore, utc_now
@@ -101,13 +107,22 @@ class _Waiter:
         author_id: int | None,
         exclude_message_ids: Iterable[int] | None,
         not_before: datetime | None = None,
+        reaction_target: tuple[int, int, str] | None = None,
     ) -> None:
+        """``reaction_target = (message_id, bot_user_id, emoji)`` switches
+        the waiter into REACTION mode: it matches
+        :class:`RawReactionAddedEvent` for exactly that message, by that
+        bot user, with that emoji (e.g. Mudae's ✅ on our ``$rt``
+        message) — used to positively confirm a command's success (CI
+        review finding 5). Message mode otherwise.
+        """
         self._adapter = adapter
         self._channel_id = channel_id
         self._author_id = author_id
         self._seen = set(exclude_message_ids) if exclude_message_ids is not None else set()
         self._not_before = not_before
-        self._matches: asyncio.Queue[MessageCreatedEvent] = asyncio.Queue(_MATCH_QUEUE_MAX)
+        self._reaction_target = reaction_target
+        self._matches: asyncio.Queue[Any] = asyncio.Queue(_MATCH_QUEUE_MAX)
         self._lost = asyncio.Event()
         self._unsubscribe: Callable[[], None] | None = None
 
@@ -125,6 +140,9 @@ class _Waiter:
             self._unsubscribe = None
 
     def _on_event(self, event: Any) -> None:
+        if self._reaction_target is not None:
+            self._on_reaction(event)
+            return
         if not isinstance(event, MessageCreatedEvent):
             return
         message = event.message
@@ -135,6 +153,39 @@ class _Waiter:
         if self._not_before is not None and event.received_at < self._not_before:
             return  # predates the operation: a previous command's leftover
         self._seen.add(message.id)  # duplicates of a matched id never re-match
+        self._enqueue(event)
+
+    def bind_target_message(self, message_id: int) -> None:
+        """Bind the reaction target to OUR sent message id (call right
+        after the send resolves; until bound, no reaction matches)."""
+        if self._reaction_target is not None:
+            self._reaction_target = (
+                message_id,
+                self._reaction_target[1],
+                self._reaction_target[2],
+            )
+
+    def _on_reaction(self, event: Any) -> None:
+        """Reaction mode: exactly OUR message, by the bot, with the
+        expected emoji — a stale check mark on an older message never
+        confirms the current operation (CI review finding 5)."""
+        if not isinstance(event, RawReactionAddedEvent):
+            return
+        assert self._reaction_target is not None
+        message_id, bot_user_id, emoji = self._reaction_target
+        if message_id == 0:
+            return  # not yet bound to our message: nothing can confirm
+        if event.message_id != message_id:
+            return  # reaction on a DIFFERENT (older) message: not ours
+        if event.user_id != bot_user_id:
+            return  # not the bot's reaction
+        if _emoji_name(event.emoji) != emoji:
+            return
+        if self._not_before is not None and event.received_at < self._not_before:
+            return  # predates the command: a stale reaction
+        self._enqueue(event)
+
+    def _enqueue(self, event: Any) -> None:
         try:
             self._matches.put_nowait(event)
         except asyncio.QueueFull:
@@ -152,10 +203,20 @@ class _Waiter:
         await self._lost.wait()
 
     async def wait(self, timeout: float) -> MudaeReply | None:
-        """Return the NEXT buffered/live match, or None on timeout/loss."""
+        """Return the NEXT buffered/live match, or None on timeout/loss.
+
+        Loss precedence: when the reply stream is known incomplete
+        (saturation or dispatcher loss), None is returned even if a
+        candidate is buffered — conservative for state changes (CI
+        review finding 7). Cancellation-safe: BOTH background tasks are
+        cancelled and awaited in ``finally`` (CI review finding 4) — an
+        orphaned queue getter could otherwise consume a later message
+        after the handler was cancelled.
+        """
+        getter: asyncio.Future[Any] | None = None
         loss_waiter: asyncio.Task[None] | None = None
         try:
-            getter: asyncio.Future[MessageCreatedEvent] = asyncio.ensure_future(self._matches.get())
+            getter = asyncio.ensure_future(self._matches.get())
             loss_waiter = asyncio.create_task(self._lost_wait_none())
             futures: set[asyncio.Future[object]] = {
                 asyncio.ensure_future(getter),
@@ -169,17 +230,29 @@ class _Waiter:
             if self._lost.is_set():
                 # A loss was signaled (saturation or dispatcher loss):
                 # the reconciliation path takes precedence over buffered
-                # chatter (CI review finding 3).
-                getter.cancel()
+                # chatter (CI review findings 3 and 7).
                 return None
             if getter.done() and not getter.cancelled():
                 event = getter.result()
-                return MudaeReply(message=event.message, result=parse_mudae(event.message))
-            getter.cancel()
+                return self._reply_for(event)
             return None
         finally:
-            if loss_waiter is not None:
-                loss_waiter.cancel()
+            for pending in (getter, loss_waiter):
+                if pending is not None:
+                    pending.cancel()
+            if getter is not None or loss_waiter is not None:
+                tasks = [t for t in (getter, loss_waiter) if t is not None]
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _reply_for(self, event: Any) -> MudaeReply:
+        """Build the reply payload for a matched event."""
+        if isinstance(event, RawReactionAddedEvent):
+            # Reaction mode: the payload is the normalized event; the
+            # "result" is an empty parse (the caller matches on the
+            # reaction itself, never on message content).
+            return MudaeReply(message=event, result=parse_mudae(""))
+        return MudaeReply(message=event.message, result=parse_mudae(event.message))
 
 
 async def await_mudae_reply(
@@ -355,10 +428,25 @@ _MAX_LEARNED = timedelta(hours=48)
 
 
 def _learn_deadline(reported: timedelta, *, now: datetime) -> datetime:
-    """Anchor a reported duration, rejecting implausible values."""
-    if reported > _MAX_LEARNED or reported < timedelta(0):
+    """Anchor a reported duration, rejecting implausible values.
+
+    CI review finding 6: a ZERO (or negative) duration means the state
+    is READY/expired, not "reschedule at now" — raising ``_ZeroDuration``
+    lets callers take the ready path (clear + conservative recheck)
+    instead of hot-looping immediate rounds.
+    """
+    if timedelta(0) >= reported:
+        raise _ZeroDuration(reported)
+    if reported > _MAX_LEARNED:
         raise _UntrustedDuration(reported)
     return anchor_deadline(reported, now=now)
+
+
+class _ZeroDuration(Exception):
+    """Internal: a reported duration of zero — the state is ready."""
+
+    def __init__(self, reported: timedelta) -> None:
+        super().__init__(f"reported duration is zero/negative: {reported}")
 
 
 class _UntrustedDuration(Exception):
@@ -440,6 +528,11 @@ def _make_mu_handler(
             return _recoverable("claim cooldown reply without a duration")
         try:
             learned = _learn_deadline(status.reported, now=clock())
+        except _ZeroDuration:
+            # CI review finding 6: zero remaining = ready NOW — clear and
+            # recheck at the interval, never an immediate hot loop.
+            await store.clear_mudae_deadline(context.account_id, MudaeStateKind.CLAIM)
+            return _round("claim ready now", clock() + timedelta(seconds=cfg.round_interval))
         except _UntrustedDuration:
             return _recoverable("$mu reported an implausible duration")
         await store.set_mudae_deadline(context.account_id, MudaeStateKind.CLAIM, learned)
@@ -463,28 +556,64 @@ def _make_rt_handler(
         if deadline is not None and deadline > now:
             return _round("rt window known; waiting", deadline)
 
-        reply = await await_mudae_reply(
+        # CI review finding 5: correlate $rt's own reply AND positively
+        # confirm the use via the bot's ✅ reaction on OUR message —
+        # $rtu runs only after confirmed success. BOTH waiters begin
+        # BEFORE the send; the reaction target binds to our message id
+        # the instant the send resolves.
+        confirmation = _Waiter(
             context.adapter,
             channel_id=cfg.channel,
-            command="$rt",
-            timeout=cfg.reply_timeout,
             author_id=cfg.author_id,
+            exclude_message_ids=None,
+            not_before=utc_now(),
+            reaction_target=(0, cfg.author_id, "\u2705"),
         )
-        if reply is None:
-            return _recoverable("$rt reply did not arrive")
-        rt = roll_reset_status(reply.result)
-        if rt is not None and not rt.available and rt.reported is not None:
-            try:
-                learned = _learn_deadline(rt.reported, now=clock())
-            except _UntrustedDuration:
-                return _recoverable("$rt reported an implausible duration")
-            await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
-            return _round("rt cooldown learned", learned)
-        if rt is not None and rt.available:
-            await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
-            return _round("rt available", clock() + timedelta(seconds=cfg.round_interval))
+        message_waiter = _Waiter(
+            context.adapter,
+            channel_id=cfg.channel,
+            author_id=cfg.author_id,
+            exclude_message_ids=None,
+            not_before=utc_now(),
+        )
+        confirmation.begin()
+        message_waiter.begin()
+        try:
+            sent = await context.adapter.send_message(cfg.channel, "$rt")
+            confirmation.bind_target_message(sent.message_id)
+            # Cooldown reply arriving as a MESSAGE (sent early):
+            reply = await message_waiter.wait(cfg.reply_timeout)
+            if reply is not None:
+                rt = roll_reset_status(reply.result)
+                if rt is not None and not rt.available and rt.reported is not None:
+                    try:
+                        learned = _learn_deadline(rt.reported, now=clock())
+                    except _ZeroDuration:
+                        await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
+                        return _round(
+                            "rt ready now", clock() + timedelta(seconds=cfg.round_interval)
+                        )
+                    except _UntrustedDuration:
+                        return _recoverable("$rt reported an implausible duration")
+                    await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
+                    return _round("rt cooldown learned", learned)
+                if rt is not None and rt.available:
+                    await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
+                    return _round("rt available", clock() + timedelta(seconds=cfg.round_interval))
 
-        # $rt was consumed: the owner's rule — check $rtu afterwards to
+            # No textual cooldown reply: confirm SUCCESS via the bot's ✅
+            # (heavy check mark) reaction on OUR $rt message — stale marks
+            # on older messages never confirm (message-id correlation).
+            reacted = await confirmation.wait(cfg.reply_timeout)
+        finally:
+            confirmation.end()
+            message_waiter.end()
+        if reacted is None:
+            # Unconfirmed (no reply, no check mark, or reaction lost):
+            # recover conservatively — never assume the use succeeded.
+            return _recoverable("$rt use unconfirmed (no cooldown reply, no check mark)")
+
+        # Confirmed success: the owner's rule — check $rtu afterwards to
         # LEARN the next reset deadline (perk-dependent; never assumed).
         check = await await_mudae_reply(
             context.adapter,
@@ -499,6 +628,9 @@ def _make_rt_handler(
         if rt_check is not None and not rt_check.available and rt_check.reported is not None:
             try:
                 learned = _learn_deadline(rt_check.reported, now=clock())
+            except _ZeroDuration:
+                await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
+                return _round("rt ready now", clock() + timedelta(seconds=cfg.round_interval))
             except _UntrustedDuration:
                 return _recoverable("$rtu reported an implausible duration")
             await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
@@ -723,3 +855,8 @@ def register_mudae_tasks(
                 handler=handler,
             )
         )
+
+
+def _emoji_name(emoji: Any) -> str:
+    """Normalize a normalized event's emoji to its string form."""
+    return emoji if isinstance(emoji, str) else str(emoji)
