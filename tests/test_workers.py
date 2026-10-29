@@ -696,7 +696,12 @@ async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) 
             handler=learns_deadline,
         )
     )
-    store = TaskStateStore(tmp_path / "state.db")
+    store = TaskStateStore(
+        tmp_path / "state.db",
+        clock=lambda: datetime(2026, 10, 29, 12, 0, 0, tzinfo=UTC),  # frozen WITH the wall:
+        # the learned 13:00 deadline is never due, so the next round
+        # cannot fire (audit-11 F3 fix — no real-clock race).
+    )
     await store.open()
     limiter = RateLimiter(store=store)
     manager = WorkerManager(
@@ -929,7 +934,8 @@ async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) ->
             handler=recurring,
         )
     )
-    store = TaskStateStore(tmp_path / "state.db")
+    frozen = _dt(2026, 10, 29, 12, 0, 0, tzinfo=_UTC)
+    store = TaskStateStore(tmp_path / "state.db", clock=lambda: frozen)
     await store.open()
     manager = WorkerManager(
         registry=registry,
@@ -939,10 +945,14 @@ async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) ->
         accounts=accounts,
         adapter_factory=lambda account_id: MockAdapter(),
         idle_interval_seconds=0.02,
-        wall=lambda: _dt(2026, 10, 29, 12, 0, 0, tzinfo=_UTC),
+        wall=lambda: frozen,
     )
     async with manager:
         await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.WAITING)
+    # Frozen clock: the learned 13:00 deadline is NOT due, so exactly ONE
+    # round ran (audit-11 F3 fix — the second round is now impossible,
+    # where the old real-clock store let it race and terminally flip).
+    assert len(calls) == 1
     record = await store.get_instance_by_ids(ACCOUNT, "roll")
     assert record.status is TaskInstanceState.WAITING  # alive, not terminal
     assert record.attempt_count == 0  # fresh window for the next round

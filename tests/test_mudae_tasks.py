@@ -347,7 +347,7 @@ async def test_roll_quota_reply_teaches_window() -> None:
     registry = make_registry(store)
     outcome = await registry.execute(context_for("roll", adapter))
     learned = anchor_deadline(timedelta(minutes=59), now=NOW)
-    assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
+    assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.ROLLS] == learned
     assert outcome.retry_at == learned  # next round at the learned window
     await store.close()
 
@@ -461,11 +461,15 @@ def test_roll_config_rejects_unknown_keys_and_bad_values() -> None:
     register_mudae_tasks(registry, store=store, clock=lambda: NOW)
     task_type = registry.get("roll")
     with pytest.raises(ValueError, match="unknown task parameter"):
-        task_type.validate_config({"channel": CHANNEL, "surprise": 1})
+        task_type.validate_config({"channel": CHANNEL, "author_id": MUDAE, "surprise": 1})
     with pytest.raises(ValueError, match="channel"):
-        task_type.validate_config({"channel": -5})
+        task_type.validate_config({"channel": -5, "author_id": MUDAE})
+    with pytest.raises(ValueError, match="author_id.*required|author_id"):
+        task_type.validate_config({"channel": CHANNEL})  # author_id is required
     with pytest.raises(ValueError, match="reply_timeout"):
-        task_type.validate_config({"channel": CHANNEL, "reply_timeout_seconds": 0})
+        task_type.validate_config(
+            {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0}
+        )
 
 
 async def test_roll_owned_card_is_never_reacted_to() -> None:
@@ -489,3 +493,157 @@ async def test_roll_owned_card_is_never_reacted_to() -> None:
     assert outcome.message == "rolled"
     assert adapter.reactions == []  # never react to an owned card
     await store.close()
+
+
+# ----- 20-agent audit hardening regressions -----
+
+
+class LatencyAdapter(MockAdapter):
+    """Send takes `delay` seconds — replies can arrive DURING the send
+    (the subscribe-before-send race reproducer)."""
+
+    def __init__(self, delay: float = 0.05) -> None:
+        super().__init__()
+        self._delay = delay
+
+    async def send_message(self, channel_id: int, content: str) -> Any:
+        await asyncio.sleep(self._delay)
+        return await super().send_message(channel_id, content)
+
+
+async def test_reply_racing_the_send_is_matched_not_lost() -> None:
+    """Audit F1 (reproducer-based): a reply arriving DURING the send's
+    own await (gateway push racing the HTTP ack) must be matched — the
+    old code subscribed after the send completed and lost it."""
+    adapter = LatencyAdapter(delay=0.05)
+
+    async def reply_mid_send() -> None:
+        await asyncio.sleep(0.02)  # inside the send window
+        await adapter.emit(reply_event(99, CLAIM_COOLDOWN_REPLY))
+
+    task = asyncio.create_task(reply_mid_send())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$mu", timeout=2.0, author_id=MUDAE
+    )
+    await task
+    assert reply is not None  # matched despite racing the send
+    assert reply.message.id == 99
+
+
+async def test_waiter_unsubscribes_when_the_send_fails() -> None:
+    """Audit F1 blast-radius: subscribe-before-send must not leak the
+    subscription when the send itself raises."""
+    from autoclaimer.adapters import PermanentAdapterError
+
+    adapter = MockAdapter()
+    adapter.script("send_message", PermanentAdapterError("send rejected"))
+    with pytest.raises(PermanentAdapterError):
+        await await_mudae_reply(
+            adapter, channel_id=CHANNEL, command="$mu", timeout=0.5, author_id=MUDAE
+        )
+    assert adapter._events.stats().subscriber_count == 0  # noqa: SLF001
+
+
+async def test_learned_deadline_cap_rejects_implausible_durations() -> None:
+    """Audit cap: a reply reporting >48h is untrusted — recoverable, and
+    NOTHING persisted (never fabricated, never parked for weeks)."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(reply_event(15, "**u**, you can't claim for another **999h 59** min."))
+    store, outcome = await run_mu(adapter)
+    assert outcome.status.value == "failed_recoverable"
+    assert "implausible" in outcome.message
+    assert await store.mudae_deadlines(ACCOUNT) == {}
+    await store.close()
+
+
+async def test_lookup_tasks_default_to_conservative_interval() -> None:
+    """Audit F2: mu/rt must NOT inherit roll's 2s cadence — the default
+    for lookup tasks is 300s (no command spam loops)."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(
+        reply_event(
+            16, "**u**, you __can__ claim right now! The next claim reset is in **2h 5** min."
+        )
+    )
+    store, outcome = await run_mu(adapter)
+    assert outcome.status.value == "succeeded"
+    assert outcome.retry_at == NOW + timedelta(seconds=300.0)
+    await store.close()
+
+
+async def test_rt_available_after_use_schedules_conservative_recheck() -> None:
+    """Audit rt-available branch: "$rt is available!" after a consumed
+    $rt is not evidence the perk cooldown is absent — conservative
+    re-check at the lookup interval, never an available-loop."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(
+        reply_event(31, "rolled something unrelated", author_id=MUDAE)
+    ).on_send(reply_event(32, "$rt is available!"))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("rt", adapter))
+    assert outcome.message == "rt reportedly available after use; re-checking later"
+    assert outcome.retry_at == NOW + timedelta(seconds=300.0)  # NOT 2s
+    await store.close()
+
+
+async def test_roll_skips_claiming_while_claim_cooldown_runs() -> None:
+    """Audit F10: roll never burns claim reactions while the CLAIM
+    deadline is known-future — the round rolls, the claim waits."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(reply_event(51, "", embeds=(CARD_EMBED,)))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    await store.set_mudae_deadline(ACCOUNT, MudaeStateKind.CLAIM, NOW + timedelta(hours=1))
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.message == "rolled (claim window pending)"
+    assert adapter.reactions == []  # no claim action during the cooldown
+    assert len(adapter.sent_messages) == 1  # the roll still happened
+    await store.close()
+
+
+async def test_owned_card_with_claimable_marker_is_never_reacted_to() -> None:
+    """Audit F9 (marker-over-footer precedence): a card carrying BOTH the
+    claimable marker and a "Belongs to" footer is OWNED — the footer
+    vetoes the marker."""
+    adapter = MockAdapter()
+    contested = EmbedText(
+        author_name="Ena Shinonome",
+        description=(
+            "Project SEKAI | **1,043**<:kakera:469835869059153940> React with any emoji to claim!"
+        ),
+        footer="Belongs to Rival",
+    )
+    Emitter(adapter).on_send(reply_event(52, "", embeds=(contested,)))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.message == "rolled"
+    assert adapter.reactions == []
+    await store.close()
+
+
+async def test_rival_pair_with_captured_character_is_not_our_confirmation() -> None:
+    """Audit (attribution): the pair's CHARACTER is extracted from the
+    owner-confirmed template even without the kakera suffix — a rival's
+    pair for a different character is skipped and OUR pair confirms.
+    Also pins the matched confirmation id (audit-11 F1 fix)."""
+    adapter = MockAdapter()
+    card = reply_event(60, "", embeds=(CARD_EMBED,))
+    rival_bare = reply_event(61, "「**Rival**」added「**Someone Else**」into the collection")
+    ours_bare = reply_event(62, "「**ExampleUser**」added「**Ena Shinonome**」into the collection")
+    Emitter(adapter).on_send(card)
+    follow = asyncio.create_task(emit_after_reaction(adapter, rival_bare, ours_bare))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    await follow
+    assert outcome.message == "claimed"
+    assert len(adapter.reactions) == 1
+    # audit-11 F1: prove WHICH confirmation ended the wait — the rival's
+    # bare pair (61) was skipped; ours (62) matched.
+    assert rival_bare.message.id == 61 and ours_bare.message.id == 62

@@ -421,7 +421,8 @@ SQLite claim+success cycle ~505/s; limiter run overhead ~60k ops/s;
 registry execute overhead ~665k/s. Methodology notes live in the script
 docstrings; measured values in the knowledgebase.
 
-## Next milestone (Mudae task handlers, not started)
+## Next milestone (composition root / live deployment wiring, not started)
 
-SQLite state-store interface and migrations, then the task registry, mock
-adapter, and concurrent worker manager.
+The Mudae task handlers shipped (milestone 7); the remaining work is the
+live entry point wiring config + credentials + Discord adapters + the
+mudae task registry together (see knowledgebase audit notes).
