@@ -643,34 +643,69 @@ def _make_rt_handler(
         try:
             sent = await context.adapter.send_message(cfg.channel, "$rt", on_dispatch=_dispatched)
             confirmation.bind_target_message(sent.message_id)
-            # Cooldown reply arriving as a MESSAGE (sent early):
-            reply = await message_waiter.wait(cfg.reply_timeout)
-            if reply is not None:
-                rt = roll_reset_status(reply.result)
-                if rt is not None and not rt.available and rt.reported is not None:
-                    try:
-                        learned = _learn_deadline(rt.reported, now=clock())
-                    except _ZeroDuration:
-                        await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
-                        return _round(
-                            "rt ready now", clock() + timedelta(seconds=cfg.round_interval)
-                        )
-                    except _UntrustedDuration:
-                        return _recoverable("$rt reported an implausible duration")
-                    await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
-                    return _round("rt cooldown learned", learned)
-                if rt is not None and rt.available:
-                    await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
-                    return _round("rt available", clock() + timedelta(seconds=cfg.round_interval))
-
-            # No textual cooldown reply: confirm SUCCESS via the bot's ✅
-            # (heavy check mark) reaction on OUR $rt message — stale marks
-            # on older messages never confirm (message-id correlation).
-            reacted = await confirmation.wait(cfg.reply_timeout)
+            # Wait the textual reply and the qualifying ✅ CONCURRENTLY
+            # against one shared deadline (review fix: an immediately-
+            # reacting Mudae no longer waits out the full text timeout).
+            # Cooldown text still wins the moment it arrives; loss on
+            # either waiter is conservative (unconfirmed).
+            confirmed = False
+            wait_deadline = asyncio.get_running_loop().time() + cfg.reply_timeout
+            while True:
+                remaining = wait_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                text_task = asyncio.create_task(message_waiter.wait(remaining))
+                reaction_task = asyncio.create_task(confirmation.wait(remaining))
+                try:
+                    done, _pending = await asyncio.wait(
+                        {text_task, reaction_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for pending_task in (text_task, reaction_task):
+                        pending_task.cancel()
+                # Reaction qualified (wait() already matched the exact
+                # bound message id): success — stop waiting.
+                if (
+                    reaction_task in done
+                    and not reaction_task.cancelled()
+                    and reaction_task.exception() is None
+                    and reaction_task.result() is not None
+                ):
+                    confirmed = True
+                    break
+                if text_task in done and not text_task.cancelled():
+                    reply = text_task.result() if text_task.exception() is None else None
+                    if reply is not None:
+                        rt = roll_reset_status(reply.result)
+                        if rt is not None and not rt.available and rt.reported is not None:
+                            try:
+                                learned = _learn_deadline(rt.reported, now=clock())
+                            except _ZeroDuration:
+                                await store.clear_mudae_deadline(
+                                    context.account_id, MudaeStateKind.RT
+                                )
+                                return _round(
+                                    "rt ready now",
+                                    clock() + timedelta(seconds=cfg.round_interval),
+                                )
+                            except _UntrustedDuration:
+                                return _recoverable("$rt reported an implausible duration")
+                            await store.set_mudae_deadline(
+                                context.account_id, MudaeStateKind.RT, learned
+                            )
+                            return _round("rt cooldown learned", learned)
+                        if rt is not None and rt.available:
+                            await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
+                            return _round(
+                                "rt available",
+                                clock() + timedelta(seconds=cfg.round_interval),
+                            )
+                        # Unrelated text: keep waiting both within budget.
         finally:
             confirmation.end()
             message_waiter.end()
-        if reacted is None:
+        if not confirmed:
             # Unconfirmed (no reply, no check mark, or reaction lost):
             # recover conservatively — never assume the use succeeded.
             return _recoverable("$rt use unconfirmed (no cooldown reply, no check mark)")
