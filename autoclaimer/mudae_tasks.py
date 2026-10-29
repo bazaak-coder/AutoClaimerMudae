@@ -662,8 +662,16 @@ def _make_rt_handler(
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
+                    # Cancel AND await termination: the loop may start the
+                    # next wait pair immediately after unrelated text —
+                    # the previous pair's internal cleanup (getter/loss
+                    # teardown) must be complete before overlapping new
+                    # wait() calls on the same waiters (review fix). Any
+                    # already-completed result is preserved in `done`.
                     for pending_task in (text_task, reaction_task):
                         pending_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.gather(text_task, reaction_task, return_exceptions=True)
                 # Reaction qualified (wait() already matched the exact
                 # bound message id): success — stop waiting.
                 if (
