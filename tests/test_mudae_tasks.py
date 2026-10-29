@@ -15,7 +15,12 @@ from autoclaimer.adapters import (
 )
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.mudae import anchor_deadline
-from autoclaimer.mudae_tasks import _Waiter, await_mudae_reply, register_mudae_tasks
+from autoclaimer.mudae_tasks import (
+    _MATCH_QUEUE_MAX,
+    _Waiter,
+    await_mudae_reply,
+    register_mudae_tasks,
+)
 from autoclaimer.persistence import MudaeStateKind, TaskStateStore, utc_now
 from autoclaimer.registry import TaskContext, TaskRegistry
 
@@ -590,13 +595,17 @@ async def test_roll_owned_card_is_never_reacted_to() -> None:
 
 class LatencyAdapter(MockAdapter):
     """Send takes `delay` seconds — replies can arrive DURING the send
-    (the subscribe-before-send race reproducer)."""
+    (the subscribe-before-send race reproducer). The delay simulates
+    POST-dispatch latency (the wire round trip), so on_dispatch fires
+    before the delay: fast replies racing the send are matched."""
 
     def __init__(self, delay: float = 0.05) -> None:
         super().__init__()
         self._delay = delay
 
-    async def send_message(self, channel_id: int, content: str) -> Any:
+    async def send_message(self, channel_id: int, content: str, *, on_dispatch: Any = None) -> Any:
+        if on_dispatch is not None:
+            on_dispatch()  # dispatched: pacing done, on the wire
         await asyncio.sleep(self._delay)
         return await super().send_message(channel_id, content)
 
@@ -1084,18 +1093,21 @@ async def test_repeated_zero_duration_does_not_hot_loop() -> None:
 
 
 class GatedSendAdapter(MockAdapter):
-    """Send records the message, then BLOCKS on a gate before returning —
-    forcing the early-reaction race deterministically (the message id is
-    knowable: MockAdapter ids are sequential from _FIRST_ID+1)."""
+    """Send records the message, then BLOCKS on a gate simulating
+    PRE-WIRE pacing (readiness / rate-limiter wait); on_dispatch fires
+    only after the gate — the wire moment. Events emitted while gated
+    are PRE-dispatch (stale by construction); after the gate they are
+    genuine replies. MockAdapter ids are sequential (_FIRST_ID+n)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.gate = asyncio.Event()
 
-    async def send_message(self, channel_id: int, content: str) -> Any:
-
-        result = await super().send_message(channel_id, content)
-        await self.gate.wait()  # blocked: recorded but not returned
+    async def send_message(self, channel_id: int, content: str, *, on_dispatch: Any = None) -> Any:
+        result = await super().send_message(channel_id, content)  # records the id
+        await self.gate.wait()  # outbound pacing delay
+        if on_dispatch is not None:
+            on_dispatch()  # the wire moment
         return result
 
 
@@ -1304,3 +1316,145 @@ async def test_subscription_active_before_send_begins() -> None:
     confirmation.end()
     assert before == 0
     assert count_inside_send >= 1  # subscribed before/inside the send
+
+
+# Review round 5: dispatch-boundary races, seen-state bounds, handler-level gating
+
+
+async def test_stale_reply_with_current_timestamp_during_pacing_is_rejected() -> None:
+    """Review finding 1 (the REAL race): a stale Mudae message delivered
+    during the outbound pacing wait has a CURRENT timestamp — the old
+    pre-send not_before accepted it. With dispatch-time anchoring it is
+    PRE-wire: rejected; the genuine post-wire reply matches."""
+    adapter = GatedSendAdapter()
+
+    async def stale_then_fresh() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        # While the send is gated (pre-wire), a leftover from a PREVIOUS
+        # command arrives — fresh timestamp, current content shape.
+        await adapter.emit(
+            _dc.replace(reply_event(200, CLAIM_COOLDOWN_REPLY), received_at=datetime.now(UTC))
+        )
+        adapter.gate.set()  # wire moment
+        await asyncio.sleep(0.01)
+        await adapter.emit(
+            _dc.replace(
+                reply_event(201, "**ExampleUser**, you can't claim for another **1h 42** min."),
+                received_at=datetime.now(UTC),
+            )
+        )
+
+    task = asyncio.create_task(stale_then_fresh())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$mu", timeout=2.0, author_id=MUDAE
+    )
+    await task
+    assert reply is not None
+    assert reply.message.id == 201  # the stale 200 (current timestamp!) rejected
+
+
+async def test_stale_current_timestamp_reply_alone_yields_none() -> None:
+    """Only stale-during-pacing traffic → None (bounded re-query), even
+    though every timestamp is current."""
+    adapter = GatedSendAdapter()
+
+    async def stale_only() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await adapter.emit(
+            _dc.replace(reply_event(210, RT_COOLDOWN_REPLY), received_at=datetime.now(UTC))
+        )
+        adapter.gate.set()
+
+    task = asyncio.create_task(stale_only())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$rtu", timeout=0.3, author_id=MUDAE
+    )
+    await task
+    assert reply is None
+
+
+async def test_seen_state_stops_growing_after_loss() -> None:
+    """Review finding 2: after the queue saturates (loss), the dedup set
+    must stop accumulating ids — a sustained flood leaves BOTH the
+    queue and _seen bounded."""
+    waiter = _Waiter(
+        MockAdapter(),
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+    )
+    waiter._on_event(  # noqa: SLF001 — drive the subscriber directly
+        dataclasses.replace(reply_event(300, "first"), received_at=datetime.now(UTC))
+    )
+    assert len(waiter._seen) == 1  # noqa: SLF001
+    # Saturate the queue (64): loss fires.
+    for i in range(64):
+        waiter._on_event(  # noqa: SLF001
+            dataclasses.replace(reply_event(400 + i, f"flood {i}"), received_at=datetime.now(UTC))
+        )
+    assert waiter._lost.is_set()  # noqa: SLF001
+    seen_at_loss = len(waiter._seen)  # noqa: SLF001
+    bound = _MATCH_QUEUE_MAX + 2  # pre-loss margin
+    assert seen_at_loss <= bound
+    # A sustained post-loss stream: neither queue nor seen grows.
+    for i in range(500):
+        waiter._on_event(  # noqa: SLF001
+            dataclasses.replace(
+                reply_event(1000 + i, f"post-loss {i}"), received_at=datetime.now(UTC)
+            )
+        )
+    assert len(waiter._seen) == seen_at_loss  # noqa: SLF001 — frozen at loss
+    assert waiter._matches.qsize() <= _MATCH_QUEUE_MAX  # noqa: SLF001
+
+
+async def test_handler_level_gated_reaction_race_confirms_exact_id() -> None:
+    """Review finding 3: the HANDLER-level early-reaction race — Mudae's
+    ✅ arrives while the $rt send is still gated (id known only to the
+    mock); after release the send returns, binds, and the buffered mark
+    confirms the EXACT id; $rtu follows. A wrong-id mark in the same
+    window never confirms."""
+    adapter = GatedSendAdapter()
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    rt_id = _FIRST_ID + 1  # the mock's first send id (deterministic)
+
+    async def script() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        # While gated (pre-wire): a WRONG-id mark and the RIGHT-id mark
+        # both arrive — the right one is post-gate in real life, but the
+        # waiter only anchors at dispatch, so emit both AFTER the wire.
+        adapter.gate.set()
+        await asyncio.sleep(0.01)
+        now = datetime.now(UTC)
+        await adapter.emit(_dc.replace(reaction_event(rt_id - 50), received_at=now))  # wrong id
+        await adapter.emit(_dc.replace(reaction_event(rt_id), received_at=now))  # ours
+
+    emitter = Emitter(adapter)
+    emitter.on_send(reply_event(31, "unrelated text", author_id=MUDAE)).on_send(
+        reply_event(32, RT_COOLDOWN_REPLY)
+    )
+    race = asyncio.create_task(script())
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+        )
+    )
+    await race
+    assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]
+    learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
+    assert outcome.retry_at == learned
+    assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
+    await store.close()
