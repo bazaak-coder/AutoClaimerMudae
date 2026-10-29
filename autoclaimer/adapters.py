@@ -407,6 +407,11 @@ class EventDispatcher:
                 },
             )
 
+    @property
+    def has_subscribers(self) -> bool:
+        """True when at least one live subscription exists (bridge fast-path)."""
+        return bool(self._subscribers)
+
     def stats(self) -> EventDispatcherStats:
         """Read-only snapshot: subscriber count, lost-event totals, and
         live queue pressure per subscription (keyed by subscribe handle)."""

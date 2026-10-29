@@ -564,6 +564,8 @@ class DiscordAdapter:
 
     async def _on_message(self, message: Any) -> None:
         """Bridge: ``on_message`` -> normalized MessageCreatedEvent."""
+        if not self._events.has_subscribers:
+            return  # audit perf: skip normalization when nobody listens
         try:
             await self._events.dispatch(
                 MessageCreatedEvent(
@@ -716,6 +718,8 @@ def _embed_texts(embeds: Any) -> tuple[EmbedText, ...]:
         return value if isinstance(value, str) and value.strip() else None
 
     harvested: list[EmbedText] = []
+    if embeds is not None and not hasattr(embeds, "__iter__"):
+        embeds = ()  # non-iterable attr: degrade, never drop the message (audit F15)
     for embed in embeds or ():
         embed_author = getattr(embed, "author", None)
         embed_footer = getattr(embed, "footer", None)
