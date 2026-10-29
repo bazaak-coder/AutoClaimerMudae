@@ -672,16 +672,13 @@ def _make_rt_handler(
                         pending_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.gather(text_task, reaction_task, return_exceptions=True)
-                # Reaction qualified (wait() already matched the exact
-                # bound message id): success — stop waiting.
-                if (
-                    reaction_task in done
-                    and not reaction_task.cancelled()
-                    and reaction_task.exception() is None
-                    and reaction_task.result() is not None
-                ):
-                    confirmed = True
-                    break
+                # Review fix: the TEXT result is evaluated FIRST — when
+                # both complete in the same batch, a RECOGNIZED cooldown
+                # reply wins over the reaction (matching the documented
+                # "cooldown text still wins" contract: a cooldown means
+                # $rt was NOT consumed; the reaction alone must not
+                # override it). The reaction confirms only when the text
+                # is unrelated or absent.
                 if text_task in done and not text_task.cancelled():
                     reply = text_task.result() if text_task.exception() is None else None
                     if reply is not None:
@@ -709,7 +706,18 @@ def _make_rt_handler(
                                 "rt available",
                                 clock() + timedelta(seconds=cfg.round_interval),
                             )
-                        # Unrelated text: keep waiting both within budget.
+                        # Unrelated text: fall through to the reaction check.
+                # Reaction qualified (wait() already matched the exact
+                # bound message id) and the text was unrelated/absent:
+                # success — stop waiting.
+                if (
+                    reaction_task in done
+                    and not reaction_task.cancelled()
+                    and reaction_task.exception() is None
+                    and reaction_task.result() is not None
+                ):
+                    confirmed = True
+                    break
         finally:
             confirmation.end()
             message_waiter.end()
