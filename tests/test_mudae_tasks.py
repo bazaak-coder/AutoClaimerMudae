@@ -1596,3 +1596,51 @@ async def test_unrelated_text_then_reaction_no_overlap_no_survivors() -> None:
     # Only the harness emitter/pump tasks may remain — no stray waiters.
     assert all("wait" not in t.get_name() and "waiter" not in t.get_name() for t in pending)
     await store.close()
+
+
+# Review round 8: simultaneous cooldown text + qualifying reaction
+
+
+async def test_simultaneous_cooldown_text_wins_over_reaction() -> None:
+    """Review fix: when the cooldown reply and the qualifying ✅ complete
+    in the same wait batch, the RECOGNIZED COOLDOWN WINS (the documented
+    contract): the deadline is learned, the confirmation path (and its
+    $rtu) never runs — the reaction alone cannot override a cooldown."""
+    adapter = MockAdapter()
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    rt_id = _FIRST_ID + 1
+
+    async def both_at_once() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)  # bind settles; the concurrent loop is live
+        now = datetime.now(UTC)
+        # Delivered back-to-back: the cooldown text and the qualifying
+        # mark land in the same wait window.
+        await adapter.emit(_dc.replace(reply_event(70, RT_COOLDOWN_REPLY), received_at=now))
+        await adapter.emit(_dc.replace(reaction_event(rt_id), received_at=now))
+
+    emitter = Emitter(adapter)
+    emitter.on_send(reply_event(31, "placeholder", author_id=MUDAE))
+    script = asyncio.create_task(both_at_once())
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+        )
+    )
+    await script
+    # The cooldown path won: deadline learned, NO $rtu (confirmation
+    # path skipped), round rescheduled AT the learned deadline.
+    learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
+    assert outcome.message == "rt cooldown learned"
+    assert outcome.retry_at == learned
+    assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
+    assert [m.content for m in adapter.sent_messages] == ["$rt"]  # no $rtu
+    await store.close()
