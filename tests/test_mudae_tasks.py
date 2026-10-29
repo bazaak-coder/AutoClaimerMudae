@@ -15,7 +15,7 @@ from autoclaimer.adapters import (
 )
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.mudae import anchor_deadline
-from autoclaimer.mudae_tasks import await_mudae_reply, register_mudae_tasks
+from autoclaimer.mudae_tasks import _Waiter, await_mudae_reply, register_mudae_tasks
 from autoclaimer.persistence import MudaeStateKind, TaskStateStore
 from autoclaimer.registry import TaskContext, TaskRegistry
 
@@ -54,6 +54,33 @@ async def emit_after_send(adapter: MockAdapter, event: Any) -> None:
     while not adapter.sent_messages:
         await asyncio.sleep(0.005)
     await adapter.emit(_dc.replace(event, received_at=datetime.now(UTC)))
+
+
+def reaction_event(
+    message_id: int, emoji: str = "\u2705", *, user_id: int = MUDAE, received: Any = None
+) -> Any:
+    from autoclaimer.adapters import RawReactionAddedEvent
+
+    return RawReactionAddedEvent(
+        account_id=ACCOUNT,
+        received_at=received or datetime.now(UTC),
+        channel_id=CHANNEL,
+        message_id=message_id,
+        user_id=user_id,
+        emoji=emoji,
+    )
+
+
+async def check_mark_after_send(adapter: MockAdapter) -> None:
+    """The bot confirms OUR $rt message with a heavy check mark, stamped
+    at delivery time (after the send resolves and the target binds)."""
+    import dataclasses as _dc
+
+    while not adapter.sent_messages:
+        await asyncio.sleep(0.005)
+    sent_id = adapter.sent_messages[0].message_id
+    await asyncio.sleep(0.02)  # let the send resolve + target bind first
+    await adapter.emit(_dc.replace(reaction_event(sent_id), received_at=datetime.now(UTC)))
 
 
 async def test_await_reply_parses_the_matched_message() -> None:
@@ -359,10 +386,12 @@ async def test_rt_cooldown_reply_teaches_deadline() -> None:
 
 
 async def test_rt_use_is_followed_by_rtu_check() -> None:
-    """The owner's rule: after $rt is USED, check $rtu to learn the next
+    """The owner's rule: after $rt is USED (positively confirmed by the
+    bot's heavy check mark on OUR message), check $rtu to learn the next
     reset deadline (perk-dependent 5-20h — never assumed)."""
     adapter = MockAdapter()
-    Emitter(adapter).on_send(  # send 1 ($rt): neutral reply -> consumed
+    confirmed = asyncio.create_task(check_mark_after_send(adapter))
+    Emitter(adapter).on_send(  # send 1 ($rt): neutral text (not a cooldown)
         reply_event(31, "rolled something unrelated", author_id=MUDAE)
     ).on_send(  # send 2 ($rtu): the cooldown reply
         reply_event(32, RT_COOLDOWN_REPLY)
@@ -375,6 +404,7 @@ async def test_rt_use_is_followed_by_rtu_check() -> None:
             "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
         )
     )
+    await confirmed
     assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]
     learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
     assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
@@ -642,6 +672,7 @@ async def test_rt_available_after_use_schedules_conservative_recheck() -> None:
     $rt is not evidence the perk cooldown is absent — conservative
     re-check at the lookup interval, never an available-loop."""
     adapter = MockAdapter()
+    confirmed = asyncio.create_task(check_mark_after_send(adapter))
     Emitter(adapter).on_send(
         reply_event(31, "rolled something unrelated", author_id=MUDAE)
     ).on_send(reply_event(32, "$rt is available!"))
@@ -653,6 +684,7 @@ async def test_rt_available_after_use_schedules_conservative_recheck() -> None:
             "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
         )
     )
+    await confirmed
     assert outcome.message == "rt reportedly available after use; re-checking later"
     assert outcome.retry_at == NOW + timedelta(seconds=300.0)  # NOT 2s
     await store.close()
@@ -850,3 +882,199 @@ async def test_waiter_queue_saturation_fails_fast_to_loss() -> None:
     )
     await task
     assert reply is None  # saturated -> loss path (bounded re-query upstream)
+
+
+# CI review finding 5: $rtu only after POSITIVE $rt confirmation
+
+
+async def test_check_mark_confirms_then_rtu_follows() -> None:
+    """The bot's ✅ on OUR $rt message → confirmed success → $rtu sent."""
+    adapter = MockAdapter()
+    confirmed = asyncio.create_task(check_mark_after_send(adapter))
+    Emitter(adapter).on_send(reply_event(31, "some unrelated text", author_id=MUDAE)).on_send(
+        reply_event(32, RT_COOLDOWN_REPLY)
+    )
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0.5}
+        )
+    )
+    await confirmed
+    assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]
+    assert outcome.retry_at is not None
+    await store.close()
+
+
+async def test_no_check_mark_means_no_rtu() -> None:
+    """An unrelated response WITHOUT the ✅ → the use is unconfirmed →
+    $rtu is never sent; conservative recoverable."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(reply_event(31, "some unrelated text", author_id=MUDAE))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0.3}
+        )
+    )
+    assert [m.content for m in adapter.sent_messages] == ["$rt"]  # no $rtu
+    assert outcome.status.value == "failed_recoverable"
+    assert "unconfirmed" in outcome.message
+    await store.close()
+
+
+async def test_check_mark_on_older_message_does_not_confirm() -> None:
+    """A ✅ reacting to an OLDER message (not our $rt) never confirms the
+    current use."""
+
+    async def old_mark(adapter: MockAdapter) -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)
+        await adapter.emit(
+            _dc.replace(reaction_event(1), received_at=datetime.now(UTC))
+        )  # message_id=1: an older message, not our $rt
+
+    adapter = MockAdapter()
+    stale = asyncio.create_task(old_mark(adapter))
+    Emitter(adapter).on_send(reply_event(31, "some unrelated text", author_id=MUDAE))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0.3}
+        )
+    )
+    await stale
+    assert [m.content for m in adapter.sent_messages] == ["$rt"]
+    assert "unconfirmed" in outcome.message
+    await store.close()
+
+
+async def test_lost_check_mark_recovers_bounded() -> None:
+    """The reaction dispatch is lost entirely → bounded wait → safe
+    recoverable (never an assumed success)."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(reply_event(31, "some unrelated text", author_id=MUDAE))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0.2}
+        )
+    )
+    assert outcome.status.value == "failed_recoverable"
+    assert MudaeStateKind.RT not in await store.mudae_deadlines(ACCOUNT)
+    await store.close()
+
+
+async def test_check_mark_after_timeout_does_not_confirm_later() -> None:
+    """A ✅ arriving AFTER the wait timed out lands on nobody (the
+    subscription ended) — it cannot retroactively confirm anything, and
+    a SUBSEQUENT round re-checks from scratch."""
+
+    async def late_mark(adapter: MockAdapter) -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.5)  # well past the 0.2s wait
+        sent_id = adapter.sent_messages[0].message_id
+        await adapter.emit(_dc.replace(reaction_event(sent_id), received_at=datetime.now(UTC)))
+
+    adapter = MockAdapter()
+    late = asyncio.create_task(late_mark(adapter))
+    Emitter(adapter).on_send(reply_event(31, "some unrelated text", author_id=MUDAE))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0.2}
+        )
+    )
+    assert outcome.status.value == "failed_recoverable"
+    await late
+    await asyncio.sleep(0.05)
+    assert [m.content for m in adapter.sent_messages] == ["$rt"]  # no phantom $rtu
+    await store.close()
+
+
+async def test_cancelled_reaction_wait_leaks_no_background_task() -> None:
+    """CI review finding 4: cancelling the caller mid-wait must tear
+    down BOTH background tasks — an orphaned queue getter would consume
+    a later message after cancellation."""
+    adapter = MockAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        reaction_target=(77, MUDAE, "✅"),
+    )
+    waiter.begin()
+    try:
+        waiting = asyncio.create_task(waiter.wait(5.0))
+        await asyncio.sleep(0.02)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        # A later matching event must remain UNCONSUMED (no orphan).
+        await adapter.emit(reaction_event(77))
+        await asyncio.sleep(0.05)
+        assert waiter._matches.qsize() == 1  # noqa: SLF001
+    finally:
+        waiter.end()
+
+
+# CI review finding 6: zero-duration deadlines never hot-loop
+
+
+async def test_zero_duration_cooldown_settles_at_interval() -> None:
+    """A recognized cooldown with ZERO remaining = ready now — clear the
+    deadline and recheck at the interval; the retry_at is strictly in
+    the FUTURE (no immediate re-execution)."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(
+        reply_event(17, "**ExampleUser**, you can't claim for another **0** min.")
+    )
+    store, outcome = await run_mu(adapter)
+    assert outcome.status.value == "succeeded"
+    assert outcome.message == "claim ready now"
+    assert outcome.retry_at is not None and outcome.retry_at > NOW
+    assert outcome.retry_at == NOW + timedelta(seconds=300.0)  # lookup interval
+    assert MudaeStateKind.CLAIM not in await store.mudae_deadlines(ACCOUNT)
+    await store.close()
+
+
+async def test_repeated_zero_duration_does_not_hot_loop() -> None:
+    """Repeated zero-duration replies each end in ONE command per round
+    with an interval-spaced reschedule — never an immediate loop."""
+    adapter = MockAdapter()
+    retry_ats: list[Any] = []
+    sent_total = 0
+    for i in range(3):
+        adapter = MockAdapter()  # fresh adapter per round (fresh Emitter
+        # indices) — the reply always follows THIS round's send
+        emitter = Emitter(adapter)
+        emitter.on_send(
+            reply_event(100 + i, "**ExampleUser**, you can't claim for another **0** min.")
+        )
+        store, outcome = await run_mu(adapter)
+        assert outcome.message == "claim ready now"
+        assert outcome.retry_at is not None
+        retry_ats.append(outcome.retry_at)
+        sent_total += len(adapter.sent_messages)
+        await store.close()
+    # Every reschedule is interval-spaced from the frozen NOW — no
+    # deadline ever equals 'now' (which would be immediately due).
+    assert all(r == NOW + timedelta(seconds=300.0) for r in retry_ats)
+    assert sent_total == 3  # one $mu per round, no extras
