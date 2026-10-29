@@ -824,20 +824,53 @@ async def test_roll_early_cooldown_addressed_to_rival_is_not_learned() -> None:
 
 
 async def test_stale_reply_from_a_previous_command_is_ignored() -> None:
-    """A message whose received_at predates the current command's send
-    (a slow-delivered leftover of a PREVIOUS operation — e.g. delivered
-    during our rate-limit wait) is rejected; the fresh reply matches."""
+    """The REAL send-boundary race (review fix): a stale-looking reply
+    with a CURRENT timestamp delivered while the send is blocked BEFORE
+    dispatch (outbound pacing) is rejected by the on_dispatch boundary;
+    only the post-wire fresh reply matches. Explicit synchronization:
+    the send blocks pre-dispatch on the gate → stale emitted → gate
+    released (on_dispatch fires) → fresh emitted → only fresh accepted."""
+    adapter = GatedSendAdapter()
+
+    async def race_script() -> None:
+        import dataclasses as _dc
+
+        # Wait until the send is recorded AND gated (pre-wire pacing).
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)  # the send is now blocked on the gate
+        # Stale traffic during the pacing window — CURRENT timestamp.
+        await adapter.emit(
+            _dc.replace(reply_event(90, RT_COOLDOWN_REPLY), received_at=datetime.now(UTC))
+        )
+        adapter.gate.set()  # wire moment: on_dispatch fires inside send
+        await asyncio.sleep(0.01)
+        await adapter.emit(
+            _dc.replace(reply_event(91, CLAIM_COOLDOWN_REPLY), received_at=datetime.now(UTC))
+        )
+
+    task = asyncio.create_task(race_script())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$mu", timeout=2.0, author_id=MUDAE
+    )
+    await task
+    assert reply is not None
+    assert reply.message.id == 91  # the current-timestamp stale 90 was rejected
+
+
+async def test_backdated_reply_is_rejected_as_defense_in_depth() -> None:
+    """Defense in depth: even a slow-delivered event whose received_at
+    predates the dispatch boundary is rejected regardless of the gate."""
     adapter = LatencyAdapter(delay=0.05)
     stale = dataclasses.replace(
-        reply_event(90, RT_COOLDOWN_REPLY), received_at=datetime.now(UTC) - timedelta(seconds=30)
+        reply_event(93, RT_COOLDOWN_REPLY), received_at=datetime.now(UTC) - timedelta(seconds=30)
     )
-    fresh_reply = reply_event(91, CLAIM_COOLDOWN_REPLY)
+    fresh_reply = reply_event(94, CLAIM_COOLDOWN_REPLY)
 
     async def emitter() -> None:
         while not adapter.sent_messages:
             await asyncio.sleep(0.005)
-        await adapter.emit(stale)  # stale delivered DURING our send window
-        # The fresh reply is stamped AT DELIVERY (real replies are).
+        await adapter.emit(stale)
         await adapter.emit(dataclasses.replace(fresh_reply, received_at=datetime.now(UTC)))
 
     task = asyncio.create_task(emitter())
@@ -846,7 +879,7 @@ async def test_stale_reply_from_a_previous_command_is_ignored() -> None:
     )
     await task
     assert reply is not None
-    assert reply.message.id == 91  # the stale 90 was temporally rejected
+    assert reply.message.id == 94
 
 
 async def test_stale_reply_alone_times_out_to_bounded_requery() -> None:
@@ -1457,4 +1490,52 @@ async def test_handler_level_gated_reaction_race_confirms_exact_id() -> None:
     learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
     assert outcome.retry_at == learned
     assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
+    await store.close()
+
+
+# Review round 6: early reaction completes promptly (concurrent wait)
+
+
+async def test_immediate_reaction_does_not_wait_out_the_text_timeout() -> None:
+    """Review finding 2: a valid ✅ arriving immediately (with NO textual
+    reply at all) completes the confirmation promptly — the handler waits
+    text and reaction CONCURRENTLY, so success is recognized without
+    burning the full reply_timeout."""
+    adapter = MockAdapter()
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    rt_id = _FIRST_ID + 1
+
+    async def immediate_mark() -> None:
+        import dataclasses as _dc
+
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)  # bind settles
+        await adapter.emit(_dc.replace(reaction_event(rt_id), received_at=datetime.now(UTC)))
+        # NO textual reply is ever emitted for $rt.
+
+    emitter = Emitter(adapter)
+    emitter.on_send(reply_event(31, "placeholder", author_id=MUDAE)).on_send(
+        reply_event(32, RT_COOLDOWN_REPLY)  # the $rtu reply (send 2)
+    )
+    mark = asyncio.create_task(immediate_mark())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 2.0}
+        )
+    )
+    elapsed = loop.time() - started
+    await mark
+    assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]  # confirmed → $rtu
+    # Prompt completion: well under the 2.0s text timeout (the old
+    # sequential code would have waited it out before checking the mark).
+    assert elapsed < 1.2, f"confirmation took {elapsed:.2f}s — sequential wait suspected"
+    assert outcome.retry_at is not None
     await store.close()
