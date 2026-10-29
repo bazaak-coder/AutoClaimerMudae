@@ -121,9 +121,12 @@ class RateLimitedAdapter:
             policy=self._policy,
         )
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
         return await self._run(
-            "send_message", lambda: self._inner.send_message(channel_id, content)
+            "send_message",
+            lambda: self._inner.send_message(channel_id, content, on_dispatch=on_dispatch),
         )
 
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:

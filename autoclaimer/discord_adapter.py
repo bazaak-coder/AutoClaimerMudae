@@ -500,10 +500,19 @@ class DiscordAdapter:
 
     # ----- PlatformAdapter operations -----
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
         await self._ensure_ready()
         await self._pace(self._send_jitter_range)
         channel = self._channel(channel_id)
+        # The send boundary AFTER outbound pacing (review fix): invoked
+        # immediately before the library call — anything arriving before
+        # this moment cannot be a reply to THIS message. Residual
+        # ambiguity: the microscopic window between this callback and
+        # the wire itself (documented).
+        if on_dispatch is not None:
+            on_dispatch()
         try:
             message = await channel.send(content)
         except discord.DiscordException as exc:

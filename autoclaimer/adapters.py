@@ -584,8 +584,17 @@ class EventDispatcherStats:
 class PlatformAdapter(Protocol):
     """Minimum asynchronous operations the framework needs from a platform."""
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
-        """Send *content* to *channel_id* and return the sent message."""
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
+        """Send *content* to *channel_id* and return the sent message.
+
+        ``on_dispatch`` (optional) is invoked the moment the message is
+        issued on the wire — after any readiness/pacing wait, before the
+        send resolves — the reliable send-boundary anchor for reply
+        correlation. Adapters without a pacing phase invoke it
+        immediately before returning.
+        """
         ...
 
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:

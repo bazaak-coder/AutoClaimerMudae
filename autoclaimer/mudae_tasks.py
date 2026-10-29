@@ -108,6 +108,7 @@ class _Waiter:
         exclude_message_ids: Iterable[int] | None,
         not_before: datetime | None = None,
         reaction_target: tuple[int, int, str] | None = None,
+        dispatch_gated: bool = False,
     ) -> None:
         """``reaction_target = (message_id, bot_user_id, emoji)`` switches
         the waiter into REACTION mode: it matches
@@ -115,16 +116,41 @@ class _Waiter:
         bot user, with that emoji (e.g. Mudae's ✅ on our ``$rt``
         message) — used to positively confirm a command's success (CI
         review finding 5). Message mode otherwise.
+
+        ``not_before`` as a constructor arg is used only by
+        send-less waits (:func:`await_mudae_event`); command waits use
+        :meth:`mark_dispatched` via the adapter's ``on_dispatch``
+        callback — the reliable send boundary AFTER outbound pacing
+        (review fix): everything arriving before the wire cannot be a
+        reply to this command, stale-looking timestamps included.
         """
         self._adapter = adapter
         self._channel_id = channel_id
         self._author_id = author_id
         self._seen = set(exclude_message_ids) if exclude_message_ids is not None else set()
         self._not_before = not_before
+        # Command waits (on_dispatch-anchored): everything arriving
+        # before the wire moment is stale BY CONSTRUCTION — the command
+        # is not on the wire yet, whatever the event's timestamp says.
+        self._dispatch_gated = not_before is None and dispatch_gated
         self._reaction_target = reaction_target
         self._matches: asyncio.Queue[Any] = asyncio.Queue(_MATCH_QUEUE_MAX)
         self._lost = asyncio.Event()
         self._unsubscribe: Callable[[], None] | None = None
+
+    def mark_dispatched(self) -> None:
+        """Record the SEND BOUNDARY: called via ``on_dispatch`` the
+        moment the adapter issues the message (after pacing). Events
+        arriving before this moment predate the operation — stale."""
+        self._dispatch_gated = False
+        self._not_before = utc_now()
+
+    def _stale(self, event: Any) -> bool:
+        if self._dispatch_gated and self._not_before is None:
+            return True  # pre-wire: cannot be a reply to this command
+        if self._not_before is not None and event.received_at < self._not_before:
+            return True
+        return False
 
     def begin(self) -> None:
         """Subscribe. Call BEFORE the act whose reply is awaited."""
@@ -140,6 +166,8 @@ class _Waiter:
             self._unsubscribe = None
 
     def _on_event(self, event: Any) -> None:
+        if self._lost.is_set():
+            return  # unreliable: stop growing dedup state (review fix 2)
         if self._reaction_target is not None:
             self._on_reaction(event)
             return
@@ -150,8 +178,8 @@ class _Waiter:
             return
         if self._author_id is not None and message.author_id != self._author_id:
             return
-        if self._not_before is not None and event.received_at < self._not_before:
-            return  # predates the operation: a previous command's leftover
+        if self._stale(event):
+            return  # predates the operation's dispatch: a stale reply
         self._seen.add(message.id)  # duplicates of a matched id never re-match
         self._enqueue(event)
 
@@ -173,6 +201,8 @@ class _Waiter:
         race). Exact-message-id qualification happens at ``wait()`` time
         (the id is only known after the send resolves); a stale check
         mark on an older message is buffered, then rejected by id."""
+        if self._lost.is_set():
+            return  # unreliable: stop capturing (review fix 2)
         if not isinstance(event, RawReactionAddedEvent):
             return
         assert self._reaction_target is not None
@@ -183,8 +213,6 @@ class _Waiter:
             return  # not the bot's reaction (another user's check mark)
         if _emoji_name(event.emoji) != emoji:
             return
-        if self._not_before is not None and event.received_at < self._not_before:
-            return  # predates the command: a stale reaction
         self._enqueue(event)
 
     def _enqueue(self, event: Any) -> None:
@@ -304,11 +332,11 @@ async def await_mudae_reply(
         channel_id=channel_id,
         author_id=author_id,
         exclude_message_ids=exclude_message_ids,
-        not_before=utc_now(),  # captured before the send: stale leftovers rejected
+        dispatch_gated=True,
     )
     waiter.begin()
     try:
-        await adapter.send_message(channel_id, command)
+        await adapter.send_message(channel_id, command, on_dispatch=waiter.mark_dispatched)
         return await waiter.wait(timeout)
     finally:
         waiter.end()
@@ -591,20 +619,29 @@ def _make_rt_handler(
             channel_id=cfg.channel,
             author_id=cfg.author_id,
             exclude_message_ids=None,
-            not_before=utc_now(),
             reaction_target=(0, cfg.author_id, "\u2705"),
+            dispatch_gated=True,
         )
         message_waiter = _Waiter(
             context.adapter,
             channel_id=cfg.channel,
             author_id=cfg.author_id,
             exclude_message_ids=None,
-            not_before=utc_now(),
+            dispatch_gated=True,
         )
         confirmation.begin()
         message_waiter.begin()
+
+        def _dispatched() -> None:
+            # The reliable send boundary (review fix 1): both waiters
+            # anchor the instant the adapter issues $rt — after pacing —
+            # so stale traffic during the wait cannot pass as this
+            # command's reply, whatever its timestamp.
+            confirmation.mark_dispatched()
+            message_waiter.mark_dispatched()
+
         try:
-            sent = await context.adapter.send_message(cfg.channel, "$rt")
+            sent = await context.adapter.send_message(cfg.channel, "$rt", on_dispatch=_dispatched)
             confirmation.bind_target_message(sent.message_id)
             # Cooldown reply arriving as a MESSAGE (sent early):
             reply = await message_waiter.wait(cfg.reply_timeout)

@@ -117,7 +117,9 @@ class MockAdapter:
 
     # ----- PlatformAdapter operations -----
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
         self._record("send_message", {"channel_id": channel_id, "content": content})
         outcome = await self._next_outcome("send_message")
         sent = (
@@ -128,6 +130,10 @@ class MockAdapter:
             )
         )
         self.sent_messages.append(sent)
+        # The wire boundary (no pacing in the mock): a reply from here on
+        # genuinely answers THIS message.
+        if on_dispatch is not None:
+            on_dispatch()
         return sent
 
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
