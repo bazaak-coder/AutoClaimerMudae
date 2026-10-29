@@ -1,6 +1,7 @@
 """Mudae task machinery: reply matching and handlers (milestone 7)."""
 
 import asyncio
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -46,10 +47,13 @@ def reply_event(
 
 async def emit_after_send(adapter: MockAdapter, event: Any) -> None:
     """Deterministic orchestration: emit the reply once the command send
-    has been recorded by the mock adapter."""
+    has been recorded by the mock adapter (re-stamped at emit time: the
+    waiter's temporal correlation rejects pre-send timestamps)."""
+    import dataclasses as _dc
+
     while not adapter.sent_messages:
         await asyncio.sleep(0.005)
-    await adapter.emit(event)
+    await adapter.emit(_dc.replace(event, received_at=datetime.now(UTC)))
 
 
 async def test_await_reply_parses_the_matched_message() -> None:
@@ -81,9 +85,14 @@ async def test_await_reply_ignores_other_authors_and_channels() -> None:
     adapter = MockAdapter()
 
     async def noise() -> None:
+        import dataclasses as _dc
+
         while not adapter.sent_messages:
             await asyncio.sleep(0.005)
-        await adapter.emit(reply_event(1, "hi", author_id=42))  # wrong author
+        now = datetime.now(UTC)
+        await adapter.emit(
+            _dc.replace(reply_event(1, "hi", author_id=42), received_at=now)
+        )  # wrong author
         await adapter.emit(
             MessageCreatedEvent(
                 account_id=ACCOUNT,
@@ -113,8 +122,12 @@ async def test_await_reply_deduplicates_by_message_id() -> None:
     async def twice() -> None:
         while not adapter.sent_messages:
             await asyncio.sleep(0.005)
-        await adapter.emit(duplicate)
-        await adapter.emit(duplicate)  # duplicate logical trigger
+        import dataclasses as _dc
+
+        now = datetime.now(UTC)
+        fresh = _dc.replace(duplicate, received_at=now)
+        await adapter.emit(fresh)
+        await adapter.emit(fresh)  # duplicate logical trigger
 
     task = asyncio.create_task(twice())
     reply = await await_mudae_reply(
@@ -197,35 +210,54 @@ def make_registry(store: TaskStateStore) -> TaskRegistry:
 def context_for(
     registry_task: str, adapter: MockAdapter, config: dict[str, Any] | None = None
 ) -> TaskContext:
+    if config is None:
+        config = {
+            "channel": CHANNEL,
+            "author_id": MUDAE,
+            "reply_timeout_seconds": 1.0,
+        }
+        if registry_task != "rt":  # rt has no username key (no attribution there)
+            config["username"] = "ExampleUser"
     return TaskContext(
         account_id=ACCOUNT,
         task_id=registry_task,
-        config=config or {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0},
+        config=config,
         adapter=adapter,
         credentials=None,
     )
 
 
 class Emitter:
-    """Deterministically emits scripted replies after each send."""
+    """Deterministically emits scripted replies after each send.
+
+    Events are (re)stamped with a fresh ``received_at`` AT EMIT TIME —
+    fixtures construct events eagerly, and the waiter's temporal
+    correlation rejects messages whose received_at predates the send
+    (a deliberately-stale fixture keeps its old stamp for negative
+    tests via ``stamp_received_at=False``)."""
 
     def __init__(self, adapter: MockAdapter) -> None:
         self.adapter = adapter
         self.script: list[list[Any]] = []
         self.task: asyncio.Task[None] | None = None
 
-    def on_send(self, *events_per_send: Any) -> "Emitter":
+    def on_send(self, *events_per_send: Any, stamp_received_at: bool = True) -> "Emitter":
         self.script.append(list(events_per_send))
+        self.stamp = stamp_received_at
         if self.task is None:
             self.task = asyncio.create_task(self._run())
         return self
 
     async def _run(self) -> None:
+        import dataclasses as _dc
+
         index = 0
         while index < len(self.script):
             while len(self.adapter.sent_messages) <= index:
                 await asyncio.sleep(0.005)
             for event in self.script[index]:
+                if getattr(self, "stamp", True):
+                    event = _dc.replace(event, received_at=datetime.now(UTC))
                 await self.adapter.emit(event)
             index += 1
 
@@ -275,7 +307,10 @@ async def test_mu_available_clears_deadline() -> None:
     Emitter(adapter).on_send(
         reply_event(
             12,
-            "**u**, you __can__ claim right now! The next claim reset is in **2h 5** min.",
+            (
+                "**ExampleUser**, you __can__ claim right now! "
+                "The next claim reset is in **2h 5** min."
+            ),
         )
     )
     outcome = await registry.execute(context_for("mu", adapter))
@@ -311,7 +346,11 @@ async def test_rt_cooldown_reply_teaches_deadline() -> None:
     store = TaskStateStore(":memory:")
     await store.open()
     registry = make_registry(store)
-    outcome = await registry.execute(context_for("rt", adapter))
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+        )
+    )
     learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
     assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
     assert outcome.retry_at == learned
@@ -331,7 +370,11 @@ async def test_rt_use_is_followed_by_rtu_check() -> None:
     store = TaskStateStore(":memory:")
     await store.open()
     registry = make_registry(store)
-    outcome = await registry.execute(context_for("rt", adapter))
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+        )
+    )
     assert [m.content for m in adapter.sent_messages] == ["$rt", "$rtu"]
     learned = anchor_deadline(timedelta(hours=2, minutes=59), now=NOW)
     assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
@@ -356,10 +399,12 @@ async def emit_after_reaction(adapter: MockAdapter, *events: Any) -> None:
     """Deterministic orchestration: emit follow-ups after the claim
     reaction has been recorded (the confirmation arrives in response to
     the reaction, not to the roll)."""
+    import dataclasses as _dc
+
     while not adapter.reactions:
         await asyncio.sleep(0.005)
     for event in events:
-        await adapter.emit(event)
+        await adapter.emit(_dc.replace(event, received_at=datetime.now(UTC)))
 
 
 async def test_roll_claimable_card_reacts_once_and_parses_confirmation() -> None:
@@ -461,15 +506,30 @@ def test_roll_config_rejects_unknown_keys_and_bad_values() -> None:
     register_mudae_tasks(registry, store=store, clock=lambda: NOW)
     task_type = registry.get("roll")
     with pytest.raises(ValueError, match="unknown task parameter"):
-        task_type.validate_config({"channel": CHANNEL, "author_id": MUDAE, "surprise": 1})
+        task_type.validate_config(
+            {"channel": CHANNEL, "author_id": MUDAE, "username": "ExampleUser", "surprise": 1}
+        )
     with pytest.raises(ValueError, match="channel"):
-        task_type.validate_config({"channel": -5, "author_id": MUDAE})
+        task_type.validate_config({"channel": -5, "author_id": MUDAE, "username": "ExampleUser"})
     with pytest.raises(ValueError, match="author_id.*required|author_id"):
-        task_type.validate_config({"channel": CHANNEL})  # author_id is required
+        task_type.validate_config(
+            {"channel": CHANNEL, "username": "ExampleUser"}
+        )  # author_id required
     with pytest.raises(ValueError, match="reply_timeout"):
         task_type.validate_config(
-            {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 0}
+            {
+                "channel": CHANNEL,
+                "author_id": MUDAE,
+                "username": "ExampleUser",
+                "reply_timeout_seconds": 0,
+            }
         )
+    with pytest.raises(ValueError, match="username"):
+        task_type.validate_config({"channel": CHANNEL, "author_id": MUDAE})  # required
+    with pytest.raises(ValueError, match="unknown task parameter"):
+        registry.get("rt").validate_config(
+            {"channel": CHANNEL, "author_id": MUDAE, "username": "ExampleUser"}
+        )  # rt has no username key (no attribution there)
 
 
 async def test_roll_owned_card_is_never_reacted_to() -> None:
@@ -548,7 +608,9 @@ async def test_learned_deadline_cap_rejects_implausible_durations() -> None:
     """Audit cap: a reply reporting >48h is untrusted — recoverable, and
     NOTHING persisted (never fabricated, never parked for weeks)."""
     adapter = MockAdapter()
-    Emitter(adapter).on_send(reply_event(15, "**u**, you can't claim for another **999h 59** min."))
+    Emitter(adapter).on_send(
+        reply_event(15, "**ExampleUser**, you can't claim for another **999h 59** min.")
+    )
     store, outcome = await run_mu(adapter)
     assert outcome.status.value == "failed_recoverable"
     assert "implausible" in outcome.message
@@ -562,7 +624,11 @@ async def test_lookup_tasks_default_to_conservative_interval() -> None:
     adapter = MockAdapter()
     Emitter(adapter).on_send(
         reply_event(
-            16, "**u**, you __can__ claim right now! The next claim reset is in **2h 5** min."
+            16,
+            (
+                "**ExampleUser**, you __can__ claim right now! "
+                "The next claim reset is in **2h 5** min."
+            ),
         )
     )
     store, outcome = await run_mu(adapter)
@@ -582,7 +648,11 @@ async def test_rt_available_after_use_schedules_conservative_recheck() -> None:
     store = TaskStateStore(":memory:")
     await store.open()
     registry = make_registry(store)
-    outcome = await registry.execute(context_for("rt", adapter))
+    outcome = await registry.execute(
+        context_for(
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+        )
+    )
     assert outcome.message == "rt reportedly available after use; re-checking later"
     assert outcome.retry_at == NOW + timedelta(seconds=300.0)  # NOT 2s
     await store.close()
@@ -647,3 +717,136 @@ async def test_rival_pair_with_captured_character_is_not_our_confirmation() -> N
     # audit-11 F1: prove WHICH confirmation ended the wait — the rival's
     # bare pair (61) was skipped; ours (62) matched.
     assert rival_bare.message.id == 61 and ours_bare.message.id == 62
+
+
+# CI review finding 1: attribution against OUR account identity
+
+
+async def test_rival_claiming_the_same_character_is_not_our_confirmation() -> None:
+    """The reviewer's exact case: another user claims the SAME character
+    first — the pair matches our card but the USERNAME is the rival's:
+    never accepted as our claim (previously only the character was
+    checked)."""
+    adapter = MockAdapter()
+    card = reply_event(80, "", embeds=(CARD_EMBED,))
+    rival_same_character = reply_event(
+        81, "「**Rival**」added「**Ena Shinonome**」into the collection"
+    )
+    Emitter(adapter).on_send(card)
+    follow = asyncio.create_task(emit_after_reaction(adapter, rival_same_character))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    with pytest.raises(UncertainOutcomeError, match="confirmation lost"):
+        await registry.execute(context_for("roll", adapter))
+    await follow
+    assert len(adapter.reactions) == 1  # we reacted once; the rival's pair
+    # was NOT our confirmation -> uncertain (the reaction may have applied)
+
+
+async def test_claim_cooldown_addressed_to_another_user_is_rejected() -> None:
+    """A claim-line addressed to a DIFFERENT username (e.g. another
+    account's $mu reply in the same channel) never teaches OUR claim
+    deadline."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(
+        reply_event(82, "**Rival**, you can't claim for another **1h 42** min.")
+    )
+    store, outcome = await run_mu(adapter)
+    assert outcome.status.value == "failed_recoverable"
+    assert "not addressed to this account" in outcome.message
+    assert await store.mudae_deadlines(ACCOUNT) == {}  # nothing learned
+    await store.close()
+
+
+async def test_roll_early_cooldown_addressed_to_rival_is_not_learned() -> None:
+    """Same attribution rule on the roll confirmation path: a rival's
+    early-claim cooldown arriving in our window is skipped (keep
+    waiting) — our reaction's outcome stays uncertain rather than
+    learning the rival's deadline."""
+    adapter = MockAdapter()
+    card = reply_event(83, "", embeds=(CARD_EMBED,))
+    rival_cooldown = reply_event(84, "**Rival**, you can't claim for another **3** min.")
+    Emitter(adapter).on_send(card)
+    follow = asyncio.create_task(emit_after_reaction(adapter, rival_cooldown))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    with pytest.raises(UncertainOutcomeError, match="confirmation lost"):
+        await registry.execute(context_for("roll", adapter))
+    await follow
+    assert await store.mudae_deadlines(ACCOUNT) == {}  # rival's deadline NOT learned
+    await store.close()
+
+
+# CI review finding 2: temporal correlation to the current command
+
+
+async def test_stale_reply_from_a_previous_command_is_ignored() -> None:
+    """A message whose received_at predates the current command's send
+    (a slow-delivered leftover of a PREVIOUS operation — e.g. delivered
+    during our rate-limit wait) is rejected; the fresh reply matches."""
+    adapter = LatencyAdapter(delay=0.05)
+    stale = dataclasses.replace(
+        reply_event(90, RT_COOLDOWN_REPLY), received_at=datetime.now(UTC) - timedelta(seconds=30)
+    )
+    fresh_reply = reply_event(91, CLAIM_COOLDOWN_REPLY)
+
+    async def emitter() -> None:
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await adapter.emit(stale)  # stale delivered DURING our send window
+        # The fresh reply is stamped AT DELIVERY (real replies are).
+        await adapter.emit(dataclasses.replace(fresh_reply, received_at=datetime.now(UTC)))
+
+    task = asyncio.create_task(emitter())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$mu", timeout=2.0, author_id=MUDAE
+    )
+    await task
+    assert reply is not None
+    assert reply.message.id == 91  # the stale 90 was temporally rejected
+
+
+async def test_stale_reply_alone_times_out_to_bounded_requery() -> None:
+    """Only-stale traffic: the wait yields None (bounded re-query), never
+    a wrong learn."""
+    adapter = LatencyAdapter(delay=0.05)
+    stale = dataclasses.replace(
+        reply_event(92, RT_COOLDOWN_REPLY),
+        received_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+
+    async def emitter() -> None:
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        await adapter.emit(stale)
+
+    task = asyncio.create_task(emitter())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$rtu", timeout=0.2, author_id=MUDAE
+    )
+    await task
+    assert reply is None
+
+
+# CI review finding 3: bounded reply buffering
+
+
+async def test_waiter_queue_saturation_fails_fast_to_loss() -> None:
+    """Overflowing the match queue triggers the loss path (fast None)
+    instead of unbounded growth."""
+    adapter = MockAdapter()
+
+    async def flood() -> None:
+        while not adapter.sent_messages:
+            await asyncio.sleep(0.005)
+        for i in range(200):  # far beyond the 64-slot bound
+            await adapter.emit(reply_event(1000 + i, f"chatter {i}"))
+
+    task = asyncio.create_task(flood())
+    reply = await await_mudae_reply(
+        adapter, channel_id=CHANNEL, command="$mu", timeout=2.0, author_id=MUDAE
+    )
+    await task
+    assert reply is None  # saturated -> loss path (bounded re-query upstream)
