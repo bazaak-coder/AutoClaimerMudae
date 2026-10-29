@@ -166,19 +166,21 @@ class _Waiter:
             )
 
     def _on_reaction(self, event: Any) -> None:
-        """Reaction mode: exactly OUR message, by the bot, with the
-        expected emoji — a stale check mark on an older message never
-        confirms the current operation (CI review finding 5)."""
+        """Reaction mode: capture the bot's expected-emoji reactions in
+        the channel, BOUNDED — including those arriving BEFORE the
+        target message id is bound (Mudae may react before
+        ``send_message`` returns; discarding them was the early-reaction
+        race). Exact-message-id qualification happens at ``wait()`` time
+        (the id is only known after the send resolves); a stale check
+        mark on an older message is buffered, then rejected by id."""
         if not isinstance(event, RawReactionAddedEvent):
             return
         assert self._reaction_target is not None
-        message_id, bot_user_id, emoji = self._reaction_target
-        if message_id == 0:
-            return  # not yet bound to our message: nothing can confirm
-        if event.message_id != message_id:
-            return  # reaction on a DIFFERENT (older) message: not ours
+        _target_id, bot_user_id, emoji = self._reaction_target
+        if event.channel_id != self._channel_id:
+            return  # reaction in another channel: not ours
         if event.user_id != bot_user_id:
-            return  # not the bot's reaction
+            return  # not the bot's reaction (another user's check mark)
         if _emoji_name(event.emoji) != emoji:
             return
         if self._not_before is not None and event.received_at < self._not_before:
@@ -203,7 +205,12 @@ class _Waiter:
         await self._lost.wait()
 
     async def wait(self, timeout: float) -> MudaeReply | None:
-        """Return the NEXT buffered/live match, or None on timeout/loss.
+        """Return the NEXT qualifying match, or None on timeout/loss.
+
+        Reaction mode qualifies captured candidates against the BOUND
+        message id: buffered chatter (reactions on other messages,
+        captured before/after binding) is drained and skipped until the
+        qualifying event is found or the budget expires.
 
         Loss precedence: when the reply stream is known incomplete
         (saturation or dispatcher loss), None is returned even if a
@@ -213,6 +220,24 @@ class _Waiter:
         orphaned queue getter could otherwise consume a later message
         after the handler was cancelled.
         """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            reply = await self._wait_once(remaining)
+            if self._reaction_target is None:
+                return reply  # message mode: first match qualifies
+            if reply is None:
+                return None  # timeout or loss: conservative
+            target_id = self._reaction_target[0]
+            if target_id != 0 and reply.message.message_id == target_id:
+                return reply  # the qualifying confirmation
+            # Non-qualifying chatter (wrong message id): keep draining
+            # within the remaining budget.
+
+    async def _wait_once(self, timeout: float) -> MudaeReply | None:
+        """One bounded get-or-loss race (internal)."""
         getter: asyncio.Future[Any] | None = None
         loss_waiter: asyncio.Task[None] | None = None
         try:
