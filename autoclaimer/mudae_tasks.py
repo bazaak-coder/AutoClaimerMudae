@@ -51,7 +51,10 @@ _MAX_INTERVAL = 86400.0
 _LOOKUP_INTERVAL = 300.0
 
 _COMMON_KEYS = {"channel", "author_id", "reply_timeout_seconds", "round_interval_seconds"}
-_ROLL_KEYS = _COMMON_KEYS | {"command", "claim", "claim_emoji"}
+#: mu/roll verify the reply's ADDRESSEE against the configured account
+#: username (CI review finding 1: attribution must check OUR identity).
+_ATTRIBUTED_KEYS = _COMMON_KEYS | {"username"}
+_ROLL_KEYS = _ATTRIBUTED_KEYS | {"command", "claim", "claim_emoji"}
 
 
 @dataclass(frozen=True)
@@ -62,20 +65,31 @@ class MudaeReply:
     result: ParseResult
 
 
+#: CI review finding 3: bounded reply buffering. Overflow fails fast to
+#: the bounded re-query path (never silent, never unbounded growth).
+_MATCH_QUEUE_MAX = 64
+
+
 class _Waiter:
     """Persistent subscribe-with-predicate matcher (audit-hardened).
 
-    Fixes verified by the 20-agent audit wave:
+    Fixes verified by the 20-agent audit wave and the CI review:
 
     - ``begin()`` subscribes BEFORE the triggering act (send / claim
       reaction) — a reply racing the operation's own await is matched,
       not silently dispatched to zero subscribers.
-    - Matches accumulate in an unbounded-drain queue: a burst delivered
-      back-to-back by one pump tick is fully buffered — a finished
-      ``wait()`` never swallows the next matching event (each ``wait()``
-      returns the next match; the confirmation loop drains them).
-    - One subscription for a whole dialogue (no per-candidate
-      subscribe/unsubscribe churn); ``end()`` always unsubscribes.
+    - **Temporal correlation** (CI review finding 2): candidates whose
+      ``received_at`` predates ``not_before`` (captured immediately
+      before the send) are rejected — a slow-delivered leftover from a
+      PREVIOUS command can never be mistaken for this command's reply.
+      Residual ambiguity (a delayed previous reply arriving genuinely
+      after our send) is unresolvable without message correlation ids;
+      semantic validation at each call site bounds its effect.
+    - Matches accumulate in a BOUNDED queue (64): a finished ``wait()``
+      never swallows burst-delivered follow-ups; saturation fails fast
+      to the loss path.
+    - One subscription for a whole dialogue (no per-candidate churn);
+      ``end()`` always unsubscribes.
     - Event-loss during a wait fails fast to the bounded re-query path.
     """
 
@@ -86,12 +100,14 @@ class _Waiter:
         channel_id: int,
         author_id: int | None,
         exclude_message_ids: Iterable[int] | None,
+        not_before: datetime | None = None,
     ) -> None:
         self._adapter = adapter
         self._channel_id = channel_id
         self._author_id = author_id
         self._seen = set(exclude_message_ids) if exclude_message_ids is not None else set()
-        self._matches: asyncio.Queue[MessageCreatedEvent] = asyncio.Queue()
+        self._not_before = not_before
+        self._matches: asyncio.Queue[MessageCreatedEvent] = asyncio.Queue(_MATCH_QUEUE_MAX)
         self._lost = asyncio.Event()
         self._unsubscribe: Callable[[], None] | None = None
 
@@ -116,8 +132,15 @@ class _Waiter:
             return
         if self._author_id is not None and message.author_id != self._author_id:
             return
+        if self._not_before is not None and event.received_at < self._not_before:
+            return  # predates the operation: a previous command's leftover
         self._seen.add(message.id)  # duplicates of a matched id never re-match
-        self._matches.put_nowait(event)
+        try:
+            self._matches.put_nowait(event)
+        except asyncio.QueueFull:
+            # Saturated: fail fast to the bounded re-query path rather
+            # than growing memory or silently dropping (CI finding 3).
+            self._lost.set()
 
     def _on_loss(self, count: int) -> None:
         # The awaited reply may have been one of the lost events: fail
@@ -143,6 +166,12 @@ class _Waiter:
                 return_when=asyncio.FIRST_COMPLETED,
                 timeout=timeout,
             )
+            if self._lost.is_set():
+                # A loss was signaled (saturation or dispatcher loss):
+                # the reconciliation path takes precedence over buffered
+                # chatter (CI review finding 3).
+                getter.cancel()
+                return None
             if getter.done() and not getter.cancelled():
                 event = getter.result()
                 return MudaeReply(message=event.message, result=parse_mudae(event.message))
@@ -177,6 +206,7 @@ async def await_mudae_reply(
         channel_id=channel_id,
         author_id=author_id,
         exclude_message_ids=exclude_message_ids,
+        not_before=utc_now(),  # captured before the send: stale leftovers rejected
     )
     waiter.begin()
     try:
@@ -219,18 +249,27 @@ async def await_mudae_event(
 @dataclass(frozen=True)
 class _TaskConfig:
     channel: int
-    author_id: int | None
+    author_id: int
     reply_timeout: float
     round_interval: float
+    username: str = ""  # account identity for reply attribution (mu/roll)
     command: str = "$wa"
     claim: bool = True
     claim_emoji: str = "❤️"
 
 
-def _validated(config: Any, *, allow_roll_keys: bool, interval_default: float = 2.0) -> _TaskConfig:
+def _validated(
+    config: Any,
+    *,
+    allow_roll_keys: bool,
+    interval_default: float = 2.0,
+    require_username: bool = False,
+) -> _TaskConfig:
     if not isinstance(config, dict):
         raise ValueError("task parameters must be an object")
-    allowed = _ROLL_KEYS if allow_roll_keys else _COMMON_KEYS
+    allowed = (
+        _ROLL_KEYS if allow_roll_keys else _ATTRIBUTED_KEYS if require_username else _COMMON_KEYS
+    )
     unknown = sorted(set(config) - allowed)
     if unknown:
         raise ValueError(f"unknown task parameter(s): {', '.join(unknown)}")
@@ -249,6 +288,18 @@ def _validated(config: Any, *, allow_roll_keys: bool, interval_default: float = 
             "(required: replies are matched by author)"
         )
 
+    # CI review finding 1: mu/roll verify the reply's ADDRESSEE against
+    # the configured account username — attribution against OUR identity,
+    # not the reply's own content.
+    username = config.get("username", "")
+    if require_username:
+        if not isinstance(username, str) or not username.strip():
+            raise ValueError(
+                "parameter 'username' must be this account's Discord username "
+                "(required: replies are attributed by username)"
+            )
+        username = username.strip()
+
     def bounded(name: str, default: float, maximum: float) -> float:
         value = config.get(name, default)
         if type(value) not in (int, float) or not 0 < float(value) <= maximum:
@@ -260,6 +311,7 @@ def _validated(config: Any, *, allow_roll_keys: bool, interval_default: float = 
         author_id=author_id,
         reply_timeout=bounded("reply_timeout_seconds", 10.0, _MAX_TIMEOUT),
         round_interval=bounded("round_interval_seconds", interval_default, _MAX_INTERVAL),
+        username=username,
     )
     if allow_roll_keys:
         command = config.get("command", cfg.command)
@@ -278,6 +330,7 @@ def _validated(config: Any, *, allow_roll_keys: bool, interval_default: float = 
             author_id=cfg.author_id,
             reply_timeout=cfg.reply_timeout,
             round_interval=cfg.round_interval,
+            username=cfg.username,
             command=command,
             claim=claim,
             claim_emoji=emoji,
@@ -345,10 +398,20 @@ def _make_mu_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
     def validate(config: Any) -> None:
-        _validated(config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
+        _validated(
+            config,
+            allow_roll_keys=False,
+            interval_default=_LOOKUP_INTERVAL,
+            require_username=True,
+        )
 
     async def handler(context: TaskContext) -> TaskOutcome:
-        cfg = _validated(context.config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
+        cfg = _validated(
+            context.config,
+            allow_roll_keys=False,
+            interval_default=_LOOKUP_INTERVAL,
+            require_username=True,
+        )
         now = clock()
         deadline = (await store.mudae_deadlines(context.account_id)).get(MudaeStateKind.CLAIM)
         if deadline is not None and deadline > now:
@@ -366,6 +429,10 @@ def _make_mu_handler(
         status = claim_status(reply.result)
         if status is None:
             return _recoverable("$mu reply not recognized")  # T8: no fabricated state
+        # CI review finding 1: the claim line is ADDRESSED to a username —
+        # it must be THIS account's, or the reply is someone else's state.
+        if status.username != cfg.username:
+            return _recoverable("$mu reply is not addressed to this account")
         if status.available:
             await store.clear_mudae_deadline(context.account_id, MudaeStateKind.CLAIM)
             return _round("claim available", clock() + timedelta(seconds=cfg.round_interval))
@@ -385,7 +452,9 @@ def _make_rt_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
     def validate(config: Any) -> None:
-        _validated(config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
+        _validated(
+            config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL
+        )  # rt: NO username key (the parser captures no addressee on $rt/$rtu)
 
     async def handler(context: TaskContext) -> TaskOutcome:
         cfg = _validated(context.config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
@@ -451,11 +520,15 @@ def _make_roll_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
     def validate(config: Any) -> None:
-        _validated(config, allow_roll_keys=True)
+        _validated(
+            config,
+            allow_roll_keys=True,
+            require_username=True,
+        )
 
     async def handler(context: TaskContext) -> TaskOutcome:
 
-        cfg = _validated(context.config, allow_roll_keys=True)
+        cfg = _validated(context.config, allow_roll_keys=True, require_username=True)
         deadlines = await store.mudae_deadlines(context.account_id)
         now = clock()
         window = deadlines.get(MudaeStateKind.ROLLS)
@@ -532,7 +605,7 @@ def _make_roll_handler(
                         candidate = await confirmation.wait(remaining)
                         if candidate is None:
                             break
-                        early = _early_claim_cooldown(candidate)
+                        early = _early_claim_cooldown(candidate, cfg.username)
                         if early is not None:
                             try:
                                 learned = _learn_deadline(early, now=clock())
@@ -546,7 +619,7 @@ def _make_roll_handler(
                             early_cooldown = True
                             break
                         if candidate.result.family is MessageFamily.CLAIM and _pair_matches(
-                            candidate.message.content, card_name
+                            candidate.message.content, card_name, cfg.username
                         ):
                             ours = candidate
                             break
@@ -572,22 +645,23 @@ def _make_roll_handler(
     return validate, handler
 
 
-def _early_claim_cooldown(candidate: MudaeReply) -> timedelta | None:
+def _early_claim_cooldown(candidate: MudaeReply, account_username: str) -> timedelta | None:
     """The candidate's claim cooldown iff it is OUR early-claim reply.
 
-    Attribution (audit fixes): the addressee username — when the pair /
-    claim line carries one — must match the account's own username
-    (plumbed as the ``username`` task parameter); and the
-    "__can__ claim right now" variant (``available=True``) is a RESET
-    time, never a cooldown — not accepted here.
+    Attribution (CI review finding 1): the claim line's ADDRESSEE —
+    extracted from the reply text — must equal the CONFIGURED account
+    username (never the reply's own captured copy: that compared the
+    reply against itself). The "__can__ claim right now" variant
+    (``available=True``) is a RESET time, never a cooldown — rejected.
     """
+    addressee = _pair_username(candidate)
     for cooldown in candidate.result.cooldowns:
         if cooldown.kind is not CooldownKind.CLAIM or cooldown.remaining is None:
             continue
         if cooldown.metadata.get("available") is True:
             continue  # reset-time variant, not an early-claim cooldown
-        if cooldown.username is not None and _pair_username(candidate) != cooldown.username:
-            continue  # someone else's claim line
+        if addressee != account_username:
+            continue  # addressed to someone else
         return cooldown.remaining
     return None
 
@@ -604,21 +678,22 @@ def _pair_username(candidate: MudaeReply) -> str | None:
     return None
 
 
-def _pair_matches(content: str, card_name: str | None) -> bool:
-    """Does a claim-pair message confirm OUR card?
+def _pair_matches(content: str, card_name: str | None, account_username: str) -> bool:
+    """Does a claim-pair message confirm OUR account's claim of OUR card?
 
-    The character name is extracted from the message text using the
-    owner-confirmed template (the vendored rule only exposes it when the
-    optional no-space kakera-suffix group matches, which the
-    owner-confirmed format does not — audit-verified). When no pair
-    shape is present the message is not a confirmation at all.
+    CI review finding 1: BOTH halves of the pair are verified — the
+    claiming username must be THIS account's, and the character must
+    match our card. The pair shape is extracted from the owner-confirmed
+    template (the vendored rule's capture misses the owner's format).
     """
     pair = _pair_from_content(content)
     if pair is None:
         return False
-    character = pair[1]
+    username, character = pair
+    if username != account_username:
+        return False  # another account's claim — even of the same character
     if card_name and character != card_name:
-        return False  # another claimer's character
+        return False  # our username but a different card: not this claim
     return True
 
 
