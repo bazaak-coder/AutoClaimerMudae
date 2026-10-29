@@ -51,6 +51,7 @@ from .config import resolve_task_config
 from .credentials import CredentialProvider
 from .models import AccountProfile, AccountsConfig, AppConfig, ConfigValidationError
 from .persistence import (
+    DatabaseBusyError,
     PersistenceError,
     StateTransitionError,
     TaskInstanceRecord,
@@ -220,6 +221,49 @@ class WorkerManager:
             return
         self._started = True
         await self._store.recover_interrupted()
+        # Audit fix (agents.md section 17.2.1): validate resolved task
+        # parameters against the registry BEFORE spawning workers — a
+        # deterministic configuration defect is a startup/task-config
+        # failure, never a mid-run handler crash. Fail-soft per instance:
+        # the invalid instance is abandoned; unrelated work continues.
+        for account_id in list(self._enabled):
+            if not self._enabled[account_id]:
+                continue
+            profile = self._profile(account_id)
+            if profile is None:
+                continue
+            for task_id in profile.tasks:
+                try:
+                    resolved = resolve_task_config(self._app_config, profile, task_id)
+                except ConfigValidationError:
+                    continue  # handled at execution via _terminal_without_claim
+                try:
+                    self._registry.validate_config(task_id, resolved.parameters)
+                except Exception as exc:
+                    logger.error(
+                        "task parameters rejected at startup; instance will fail without executing",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": task_id,
+                            "operation": "startup.validate",
+                            "outcome": "invalid_parameters",
+                        },
+                    )
+                    try:
+                        await self._store.create_instance(account_id, task_id)
+                        record = await self._store.get_instance_by_ids(account_id, task_id)
+                        await self._terminal_without_claim(
+                            record, f"invalid task parameters at startup: {exc}"
+                        )
+                    except PersistenceError:
+                        logger.exception(
+                            "could not abandon invalid instance at startup",
+                            extra={
+                                "account_id": account_id,
+                                "task_id": task_id,
+                                "operation": "startup.validate",
+                            },
+                        )
         # Adopt still-active persisted cooldowns BEFORE any worker can act:
         # server-directed deadlines must survive restarts (audit F1; a
         # no-op when the limiter has no store attached).
@@ -492,6 +536,30 @@ class WorkerManager:
                 return
             except asyncio.CancelledError:
                 raise  # uncertain outcome: instance stays running
+            except PersistenceError as exc:
+                # Audit fix: a persistence fault raised INSIDE a handler
+                # (deadline read/write) is a transient infrastructure
+                # condition (§17.2.5 typed errors) — bounded recoverable
+                # retry, never a terminal kill of a recurring task.
+                logger.error(
+                    "task handler hit a persistence error; recoverable",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "persistence_error",
+                    },
+                    exc_info=True,
+                )
+                await self._record(
+                    record.id,
+                    TaskOutcome(
+                        TaskStatus.FAILED_RECOVERABLE,
+                        message=f"persistence error: {type(exc).__name__}: {exc}",
+                    ),
+                    retry_at=None,
+                )
+                return
             except Exception as exc:
                 logger.exception(
                     "task handler crashed",
@@ -551,7 +619,7 @@ class WorkerManager:
                 # Milestone 7 (recurring tasks): a successful ROUND with
                 # a learned deadline stays alive — rescheduled with a
                 # fresh attempt window instead of going terminal.
-                await self._store.reschedule_success(record.id, outcome, outcome.retry_at)
+                await self._reschedule(record.id, outcome, outcome.retry_at)
                 logger.info(
                     "task round succeeded; rescheduled at learned deadline",
                     extra={
@@ -598,6 +666,26 @@ class WorkerManager:
             await self._store.record_success(instance_id, outcome)
         else:
             await self._store.record_failure(instance_id, outcome, retry_at=retry_at)
+
+    async def _reschedule(self, instance_id: int, outcome: TaskOutcome, retry_at: datetime) -> None:
+        """Reschedule a recurring round, with one bounded retry.
+
+        Audit fix: a transient ``DatabaseBusyError`` after the durable
+        claim previously stranded the row in ``running`` until restart.
+        One retry (idempotent on success — ``reschedule_success`` treats
+        an identical re-record as a no-op) survives transient contention;
+        a second failure propagates to the worker loop guard (log +
+        backoff; the row recovers on restart via ``recover_interrupted``).
+        """
+        try:
+            await self._store.reschedule_success(instance_id, outcome, retry_at)
+        except DatabaseBusyError:
+            logger.warning(
+                "reschedule hit a busy database; retrying once",
+                extra={"operation": "task.record", "outcome": "busy_retry"},
+            )
+            await asyncio.sleep(0.5)
+            await self._store.reschedule_success(instance_id, outcome, retry_at)
 
     def _retry_delay(self, attempts: int, account_id: int, task_id: str) -> float:
         policy = policy_for(self._app_config, self._accounts, account_id, task_id)
@@ -790,9 +878,6 @@ class WorkerManager:
             records.extend(await self._store.list_instances_by_account(account_id, state))
         records.sort(key=self._order)
         return tuple(records)
-
-    async def task_status(self, instance_id: int) -> TaskInstanceRecord:
-        return await self._store.get_instance(instance_id)
 
     async def status(self) -> ManagerStatus:
         infos = []
