@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -44,6 +45,11 @@ _MAX_SNOWFLAKE = 2**63 - 1
 _MAX_TIMEOUT = 120.0
 _MAX_INTERVAL = 86400.0
 
+#: Lookup tasks (mu/rt) default to a conservative interval; the 2-second
+#: default is a ROLL cadence and must never drive lookup loops (audit
+#: fix: the shared default produced a ~0.5 msg/s command spam loop).
+_LOOKUP_INTERVAL = 300.0
+
 _COMMON_KEYS = {"channel", "author_id", "reply_timeout_seconds", "round_interval_seconds"}
 _ROLL_KEYS = _COMMON_KEYS | {"command", "claim", "claim_emoji"}
 
@@ -57,7 +63,21 @@ class MudaeReply:
 
 
 class _Waiter:
-    """Subscribe-with-predicate core shared by both await variants."""
+    """Persistent subscribe-with-predicate matcher (audit-hardened).
+
+    Fixes verified by the 20-agent audit wave:
+
+    - ``begin()`` subscribes BEFORE the triggering act (send / claim
+      reaction) — a reply racing the operation's own await is matched,
+      not silently dispatched to zero subscribers.
+    - Matches accumulate in an unbounded-drain queue: a burst delivered
+      back-to-back by one pump tick is fully buffered — a finished
+      ``wait()`` never swallows the next matching event (each ``wait()``
+      returns the next match; the confirmation loop drains them).
+    - One subscription for a whole dialogue (no per-candidate
+      subscribe/unsubscribe churn); ``end()`` always unsubscribes.
+    - Event-loss during a wait fails fast to the bounded re-query path.
+    """
 
     def __init__(
         self,
@@ -70,21 +90,34 @@ class _Waiter:
         self._adapter = adapter
         self._channel_id = channel_id
         self._author_id = author_id
-        self._exclude = set(exclude_message_ids) if exclude_message_ids is not None else set()
-        self._loop = asyncio.get_running_loop()
-        self._got: asyncio.Future[MessageCreatedEvent] = self._loop.create_future()
+        self._seen = set(exclude_message_ids) if exclude_message_ids is not None else set()
+        self._matches: asyncio.Queue[MessageCreatedEvent] = asyncio.Queue()
         self._lost = asyncio.Event()
+        self._unsubscribe: Callable[[], None] | None = None
+
+    def begin(self) -> None:
+        """Subscribe. Call BEFORE the act whose reply is awaited."""
+        if self._unsubscribe is None:
+            self._unsubscribe = self._adapter.subscribe(
+                self._on_event, on_events_lost=self._on_loss
+            )
+
+    def end(self) -> None:
+        """Unsubscribe (idempotent)."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
 
     def _on_event(self, event: Any) -> None:
-        if not isinstance(event, MessageCreatedEvent) or self._got.done():
+        if not isinstance(event, MessageCreatedEvent):
             return
         message = event.message
-        if message.channel_id != self._channel_id or message.id in self._exclude:
+        if message.channel_id != self._channel_id or message.id in self._seen:
             return
         if self._author_id is not None and message.author_id != self._author_id:
             return
-        self._exclude.add(message.id)  # duplicates of a matched id never re-match
-        self._got.set_result(event)
+        self._seen.add(message.id)  # duplicates of a matched id never re-match
+        self._matches.put_nowait(event)
 
     def _on_loss(self, count: int) -> None:
         # The awaited reply may have been one of the lost events: fail
@@ -96,12 +129,13 @@ class _Waiter:
         await self._lost.wait()
 
     async def wait(self, timeout: float) -> MudaeReply | None:
-        unsubscribe = self._adapter.subscribe(self._on_event, on_events_lost=self._on_loss)
+        """Return the NEXT buffered/live match, or None on timeout/loss."""
         loss_waiter: asyncio.Task[None] | None = None
         try:
+            getter: asyncio.Future[MessageCreatedEvent] = asyncio.ensure_future(self._matches.get())
             loss_waiter = asyncio.create_task(self._lost_wait_none())
             futures: set[asyncio.Future[object]] = {
-                asyncio.ensure_future(self._got),
+                asyncio.ensure_future(getter),
                 asyncio.ensure_future(loss_waiter),
             }
             await asyncio.wait(
@@ -109,14 +143,14 @@ class _Waiter:
                 return_when=asyncio.FIRST_COMPLETED,
                 timeout=timeout,
             )
-            if self._got.done() and not self._got.cancelled():
-                event = self._got.result()
+            if getter.done() and not getter.cancelled():
+                event = getter.result()
                 return MudaeReply(message=event.message, result=parse_mudae(event.message))
+            getter.cancel()
             return None
         finally:
             if loss_waiter is not None:
                 loss_waiter.cancel()
-            unsubscribe()
 
 
 async def await_mudae_reply(
@@ -130,12 +164,13 @@ async def await_mudae_reply(
 ) -> MudaeReply | None:
     """Send a Mudae command and await its reply, event-driven.
 
-    Subscribes BEFORE sending (no loss window) and sends through the
-    rate-limited adapter (pacing included). Returns ``None`` on timeout
-    or event-loss while waiting (T9: the caller re-queries under a
-    bounded policy — a missing reply is never fabricated). Always
-    unsubscribes. Duplicate deliveries of the same message id match
-    once (T10).
+    Subscribes BEFORE sending (no loss window — audit fix: a reply
+    racing the send's own await is matched, not lost) and sends through
+    the rate-limited adapter (pacing included). Returns ``None`` on
+    timeout or event-loss while waiting (T9: the caller re-queries
+    under a bounded policy — a missing reply is never fabricated).
+    Always unsubscribes, including when the send itself fails.
+    Duplicate deliveries of the same message id match once (T10).
     """
     waiter = _Waiter(
         adapter,
@@ -143,8 +178,12 @@ async def await_mudae_reply(
         author_id=author_id,
         exclude_message_ids=exclude_message_ids,
     )
-    await adapter.send_message(channel_id, command)
-    return await waiter.wait(timeout)
+    waiter.begin()
+    try:
+        await adapter.send_message(channel_id, command)
+        return await waiter.wait(timeout)
+    finally:
+        waiter.end()
 
 
 async def await_mudae_event(
@@ -167,7 +206,11 @@ async def await_mudae_event(
         author_id=author_id,
         exclude_message_ids=exclude_message_ids,
     )
-    return await waiter.wait(timeout)
+    waiter.begin()
+    try:
+        return await waiter.wait(timeout)
+    finally:
+        waiter.end()
 
 
 # ----- configuration validation (agents.md section 17.2.1) -----
@@ -184,7 +227,7 @@ class _TaskConfig:
     claim_emoji: str = "❤️"
 
 
-def _validated(config: Any, *, allow_roll_keys: bool) -> _TaskConfig:
+def _validated(config: Any, *, allow_roll_keys: bool, interval_default: float = 2.0) -> _TaskConfig:
     if not isinstance(config, dict):
         raise ValueError("task parameters must be an object")
     allowed = _ROLL_KEYS if allow_roll_keys else _COMMON_KEYS
@@ -196,11 +239,15 @@ def _validated(config: Any, *, allow_roll_keys: bool) -> _TaskConfig:
     if type(channel) is not int or not 0 < channel <= _MAX_SNOWFLAKE:
         raise ValueError("parameter 'channel' must be a positive Discord snowflake ID")
 
+    # Audit fix: the Mudae bot's author id is REQUIRED — with it absent,
+    # any channel user's lookalike message is accepted as a reply (state
+    # poisoning, wasted parses; see the adversarial audit).
     author_id = config.get("author_id")
-    if author_id is not None and (
-        type(author_id) is not int or not 0 < author_id <= _MAX_SNOWFLAKE
-    ):
-        raise ValueError("parameter 'author_id' must be a positive snowflake ID or omitted")
+    if type(author_id) is not int or not 0 < author_id <= _MAX_SNOWFLAKE:
+        raise ValueError(
+            "parameter 'author_id' must be the Mudae bot's snowflake ID "
+            "(required: replies are matched by author)"
+        )
 
     def bounded(name: str, default: float, maximum: float) -> float:
         value = config.get(name, default)
@@ -212,12 +259,14 @@ def _validated(config: Any, *, allow_roll_keys: bool) -> _TaskConfig:
         channel=channel,
         author_id=author_id,
         reply_timeout=bounded("reply_timeout_seconds", 10.0, _MAX_TIMEOUT),
-        round_interval=bounded("round_interval_seconds", 2.0, _MAX_INTERVAL),
+        round_interval=bounded("round_interval_seconds", interval_default, _MAX_INTERVAL),
     )
     if allow_roll_keys:
         command = config.get("command", cfg.command)
         if not isinstance(command, str) or not command.strip():
             raise ValueError("parameter 'command' must be a non-empty string")
+        if len(command) > 2000:  # Discord message cap: fail loudly at validation
+            raise ValueError("parameter 'command' must be at most 2000 characters")
         claim = config.get("claim", True)
         if type(claim) is not bool:
             raise ValueError("parameter 'claim' must be a boolean")
@@ -245,6 +294,50 @@ def _round(message: str, retry_at: datetime) -> TaskOutcome:
     return TaskOutcome(TaskStatus.SUCCEEDED, message=message, retry_at=retry_at)
 
 
+#: Audit fix: sanity cap on LEARNED durations. The owner-observed ranges
+#: (rt 5-20 h; claim resets a few hours) sit far below this; a reply
+#: reporting more is untrusted (spoofed/malformed) — rejected as
+#: unrecognized (recoverable), never persisted (never fabricated).
+_MAX_LEARNED = timedelta(hours=48)
+
+
+def _learn_deadline(reported: timedelta, *, now: datetime) -> datetime:
+    """Anchor a reported duration, rejecting implausible values."""
+    if reported > _MAX_LEARNED or reported < timedelta(0):
+        raise _UntrustedDuration(reported)
+    return anchor_deadline(reported, now=now)
+
+
+class _UntrustedDuration(Exception):
+    """Internal: a reported duration outside plausible bounds."""
+
+    def __init__(self, reported: timedelta) -> None:
+        super().__init__(f"reported duration outside plausible bounds: {reported}")
+
+
+# Owner-confirmed claim-confirmation pair template: the character name
+# is captured from the message text itself because the vendored rule
+# only exposes it when the optional kakera-suffix group matches — and
+# the owner-confirmed format carries a SPACE before the kakera emoji,
+# which that group does not match (audit-verified). Wrapper-side
+# extraction; the vendored parser stays byte-identical.
+_PAIR_PATTERN = re.compile(
+    r"「\*\*(?P<username>[^*」\n]+)\*\*」added「\*\*(?P<character>[^*」\n]+)\*\*」"
+)
+
+#: Claim-line addressee prefix ("**User**, you …") — extracts the
+#: username a cooldown/claim reply is ADDRESSED to (attribution).
+_ADDRESSEE_PATTERN = re.compile(r"^\*\*(?P<username>[^*\n]+)\*\*, you ")
+
+
+def _pair_from_content(content: str) -> tuple[str, str] | None:
+    """Extract (username, character) from a claim-pair message, or None."""
+    match = _PAIR_PATTERN.search(content)
+    if match is None:
+        return None
+    return match.group("username").strip(), match.group("character").strip()
+
+
 # ----- task handlers -----
 
 
@@ -252,10 +345,10 @@ def _make_mu_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
     def validate(config: Any) -> None:
-        _validated(config, allow_roll_keys=False)
+        _validated(config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
 
     async def handler(context: TaskContext) -> TaskOutcome:
-        cfg = _validated(context.config, allow_roll_keys=False)
+        cfg = _validated(context.config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
         now = clock()
         deadline = (await store.mudae_deadlines(context.account_id)).get(MudaeStateKind.CLAIM)
         if deadline is not None and deadline > now:
@@ -275,10 +368,13 @@ def _make_mu_handler(
             return _recoverable("$mu reply not recognized")  # T8: no fabricated state
         if status.available:
             await store.clear_mudae_deadline(context.account_id, MudaeStateKind.CLAIM)
-            return _round("claim available", now + timedelta(seconds=cfg.round_interval))
+            return _round("claim available", clock() + timedelta(seconds=cfg.round_interval))
         if status.reported is None:
             return _recoverable("claim cooldown reply without a duration")
-        learned = anchor_deadline(status.reported, now=now)
+        try:
+            learned = _learn_deadline(status.reported, now=clock())
+        except _UntrustedDuration:
+            return _recoverable("$mu reported an implausible duration")
         await store.set_mudae_deadline(context.account_id, MudaeStateKind.CLAIM, learned)
         return _round("claim cooldown learned", learned)
 
@@ -289,11 +385,10 @@ def _make_rt_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
     def validate(config: Any) -> None:
-        _validated(config, allow_roll_keys=False)
+        _validated(config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
 
     async def handler(context: TaskContext) -> TaskOutcome:
-
-        cfg = _validated(context.config, allow_roll_keys=False)
+        cfg = _validated(context.config, allow_roll_keys=False, interval_default=_LOOKUP_INTERVAL)
         now = clock()
         deadline = (await store.mudae_deadlines(context.account_id)).get(MudaeStateKind.RT)
         if deadline is not None and deadline > now:
@@ -310,12 +405,15 @@ def _make_rt_handler(
             return _recoverable("$rt reply did not arrive")
         rt = roll_reset_status(reply.result)
         if rt is not None and not rt.available and rt.reported is not None:
-            learned = anchor_deadline(rt.reported, now=now)
+            try:
+                learned = _learn_deadline(rt.reported, now=clock())
+            except _UntrustedDuration:
+                return _recoverable("$rt reported an implausible duration")
             await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
             return _round("rt cooldown learned", learned)
         if rt is not None and rt.available:
             await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
-            return _round("rt available", now + timedelta(seconds=cfg.round_interval))
+            return _round("rt available", clock() + timedelta(seconds=cfg.round_interval))
 
         # $rt was consumed: the owner's rule — check $rtu afterwards to
         # LEARN the next reset deadline (perk-dependent; never assumed).
@@ -330,12 +428,20 @@ def _make_rt_handler(
             return _recoverable("$rtu check did not arrive after $rt use")
         rt_check = roll_reset_status(check.result)
         if rt_check is not None and not rt_check.available and rt_check.reported is not None:
-            learned = anchor_deadline(rt_check.reported, now=now)
+            try:
+                learned = _learn_deadline(rt_check.reported, now=clock())
+            except _UntrustedDuration:
+                return _recoverable("$rtu reported an implausible duration")
             await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
             return _round("rt reset deadline learned via $rtu", learned)
         if rt_check is not None and rt_check.available:
-            await store.clear_mudae_deadline(context.account_id, MudaeStateKind.RT)
-            return _round("rt available after use", now + timedelta(seconds=cfg.round_interval))
+            # "$rt is available!" after a consumed $rt is not evidence
+            # the perk cooldown is absent — schedule a conservative
+            # re-check rather than an available-loop (audit fix).
+            return _round(
+                "rt reportedly available after use; re-checking later",
+                clock() + timedelta(seconds=cfg.round_interval),
+            )
         return _recoverable("$rtu reply not recognized")
 
     return validate, handler
@@ -350,10 +456,15 @@ def _make_roll_handler(
     async def handler(context: TaskContext) -> TaskOutcome:
 
         cfg = _validated(context.config, allow_roll_keys=True)
+        deadlines = await store.mudae_deadlines(context.account_id)
         now = clock()
-        deadline = (await store.mudae_deadlines(context.account_id)).get(MudaeStateKind.RT)
-        if deadline is not None and deadline > now:
-            return _round("roll window known; waiting", deadline)
+        window = deadlines.get(MudaeStateKind.ROLLS)
+        if window is not None and window > now:
+            return _round("roll window known; waiting", window)
+        # Audit fix: never burn claim reactions while the claim cooldown
+        # is known-future — rolling continues, claiming waits.
+        claim_window = deadlines.get(MudaeStateKind.CLAIM)
+        claim_gated = claim_window is not None and claim_window > now
 
         reply = await await_mudae_reply(
             context.adapter,
@@ -366,65 +477,83 @@ def _make_roll_handler(
             return _recoverable("roll reply did not arrive")  # T9
 
         for cooldown in reply.result.cooldowns:
-            if cooldown.kind in (CooldownKind.ROULETTE, CooldownKind.RT):
+            if cooldown.kind in (CooldownKind.ROULETTE, CooldownKind.ROLLS_RESET):
                 if cooldown.remaining is None:
                     return _recoverable("roll-window reply without a duration")
-                learned = anchor_deadline(cooldown.remaining, now=now)
-                await store.set_mudae_deadline(context.account_id, MudaeStateKind.RT, learned)
+                try:
+                    learned = _learn_deadline(cooldown.remaining, now=clock())
+                except _UntrustedDuration:
+                    return _recoverable("roll reply reported an implausible duration")
+                await store.set_mudae_deadline(context.account_id, MudaeStateKind.ROLLS, learned)
                 return _round("roll window learned", learned)
 
         if reply.result.family is MessageFamily.CHARACTER:
             card = reply.result.character
-            interval = now + timedelta(seconds=cfg.round_interval)
-            if cfg.claim and card is not None and card.claimable:
+            interval = clock() + timedelta(seconds=cfg.round_interval)
+            may_claim = (
+                cfg.claim
+                and card is not None
+                and card.claimable
+                # Audit fix: the ownership footer ("Belongs to X") vetoes
+                # the claimable marker — an owned card is never reacted to.
+                and card.claimed_by is None
+                and not claim_gated
+            )
+            if may_claim and card is not None:
                 card_name = card.name
-                await context.adapter.add_reaction(cfg.channel, reply.message.id, cfg.claim_emoji)
-                # Owner semantics (2026-10-29): a claim confirmation is a
-                # username/character pair — the CHARACTER must match our
-                # card (another claimer's pair is not our confirmation);
-                # a claim-cooldown reply appears only when the claim was
-                # attempted before the reset — learn and stop.
-                excluded = {reply.message.id}
-                wait_deadline = asyncio.get_running_loop().time() + cfg.reply_timeout
-                ours: MudaeReply | None = None
-                early_cooldown = False
-                while True:
-                    remaining = wait_deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    candidate = await await_mudae_event(
-                        context.adapter,
-                        channel_id=cfg.channel,
-                        timeout=remaining,
-                        author_id=cfg.author_id,
-                        exclude_message_ids=excluded,
+                # Audit fix: subscribe BEFORE the reaction — a
+                # confirmation racing the reaction's await is matched,
+                # not dispatched to zero subscribers. ONE subscription
+                # drains the whole confirmation dialogue.
+                confirmation = _Waiter(
+                    context.adapter,
+                    channel_id=cfg.channel,
+                    author_id=cfg.author_id,
+                    exclude_message_ids={reply.message.id},
+                )
+                confirmation.begin()
+                try:
+                    await context.adapter.add_reaction(
+                        cfg.channel, reply.message.id, cfg.claim_emoji
                     )
-                    if candidate is None:
-                        break
-                    excluded.add(candidate.message.id)
-                    claim_cooldown = next(
-                        (
-                            cd
-                            for cd in candidate.result.cooldowns
-                            if cd.kind is CooldownKind.CLAIM and cd.remaining is not None
-                        ),
-                        None,
-                    )
-                    if claim_cooldown is not None and claim_cooldown.remaining is not None:
-                        await store.set_mudae_deadline(
-                            context.account_id,
-                            MudaeStateKind.CLAIM,
-                            anchor_deadline(claim_cooldown.remaining, now=now),
-                        )
-                        early_cooldown = True
-                        break
-                    if candidate.result.family is MessageFamily.CLAIM and _pair_matches(
-                        candidate.result, card_name
-                    ):
-                        ours = candidate
-                        break
-                    # Someone else's pair or an unrelated message: keep
-                    # waiting for OUR confirmation.
+                    # Owner semantics (2026-10-29): a claim confirmation is
+                    # a username/character pair — the CHARACTER must match
+                    # our card (another claimer's pair is not our
+                    # confirmation); a claim-cooldown reply (addressee =
+                    # us, NOT the "can claim right now" variant) appears
+                    # only when the claim was attempted before the reset.
+                    wait_deadline = asyncio.get_running_loop().time() + cfg.reply_timeout
+                    ours: MudaeReply | None = None
+                    early_cooldown = False
+                    while True:
+                        remaining = wait_deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        candidate = await confirmation.wait(remaining)
+                        if candidate is None:
+                            break
+                        early = _early_claim_cooldown(candidate)
+                        if early is not None:
+                            try:
+                                learned = _learn_deadline(early, now=clock())
+                            except _UntrustedDuration:
+                                return _recoverable(
+                                    "claim cooldown reported an implausible duration"
+                                )
+                            await store.set_mudae_deadline(
+                                context.account_id, MudaeStateKind.CLAIM, learned
+                            )
+                            early_cooldown = True
+                            break
+                        if candidate.result.family is MessageFamily.CLAIM and _pair_matches(
+                            candidate.message.content, card_name
+                        ):
+                            ours = candidate
+                            break
+                        # Someone else's pair or an unrelated message: keep
+                        # waiting for OUR confirmation.
+                finally:
+                    confirmation.end()
                 if ours is not None:
                     return _round("claimed", interval)
                 if early_cooldown:
@@ -434,6 +563,8 @@ def _make_roll_handler(
                 raise UncertainOutcomeError(
                     "claim reaction sent; confirmation lost — outcome unknown"
                 )
+            if claim_gated and cfg.claim and card is not None and card.claimable:
+                return _round("rolled (claim window pending)", interval)
             return _round("rolled", interval)
 
         return _recoverable("roll reply not recognized")  # T8
@@ -441,24 +572,54 @@ def _make_roll_handler(
     return validate, handler
 
 
-def _pair_matches(result: Any, card_name: str | None) -> bool:
-    """Does a CLAIM-family message confirm OUR card?
+def _early_claim_cooldown(candidate: MudaeReply) -> timedelta | None:
+    """The candidate's claim cooldown iff it is OUR early-claim reply.
 
-    When the pair carries the kakera suffix the parser captures the
-    character name (``metadata['character']``) — strict equality with
-    the card's name. Bare pairs (servers without the kakera suffix in
-    their claim message) expose no character name: the distinctive pair
-    shape is accepted (documented limitation).
+    Attribution (audit fixes): the addressee username — when the pair /
+    claim line carries one — must match the account's own username
+    (plumbed as the ``username`` task parameter); and the
+    "__can__ claim right now" variant (``available=True``) is a RESET
+    time, never a cooldown — not accepted here.
     """
-    from .mudae_parser import KakeraEventKind
+    for cooldown in candidate.result.cooldowns:
+        if cooldown.kind is not CooldownKind.CLAIM or cooldown.remaining is None:
+            continue
+        if cooldown.metadata.get("available") is True:
+            continue  # reset-time variant, not an early-claim cooldown
+        if cooldown.username is not None and _pair_username(candidate) != cooldown.username:
+            continue  # someone else's claim line
+        return cooldown.remaining
+    return None
 
-    for event in result.kakera_events:
-        if event.kind is KakeraEventKind.CLAIM_GAIN:
-            character = event.metadata.get("character")
-            if character and card_name and character != card_name:
-                return False  # another claimer's character
-            return True
-    return True  # bare pair: no character captured
+
+def _pair_username(candidate: MudaeReply) -> str | None:
+    """The account-addressee username carried by the reply, if any."""
+    content = candidate.message.content
+    pair = _PAIR_PATTERN.search(content)
+    if pair is not None:
+        return pair.group("username").strip()
+    addressee = _ADDRESSEE_PATTERN.search(content)
+    if addressee is not None:
+        return addressee.group("username").strip()
+    return None
+
+
+def _pair_matches(content: str, card_name: str | None) -> bool:
+    """Does a claim-pair message confirm OUR card?
+
+    The character name is extracted from the message text using the
+    owner-confirmed template (the vendored rule only exposes it when the
+    optional no-space kakera-suffix group matches, which the
+    owner-confirmed format does not — audit-verified). When no pair
+    shape is present the message is not a confirmation at all.
+    """
+    pair = _pair_from_content(content)
+    if pair is None:
+        return False
+    character = pair[1]
+    if card_name and character != card_name:
+        return False  # another claimer's character
+    return True
 
 
 def register_mudae_tasks(
