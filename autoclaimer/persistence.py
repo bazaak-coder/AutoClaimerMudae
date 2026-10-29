@@ -682,6 +682,33 @@ class TaskStateStore:
             (account_id, kind.value),
         )
 
+    async def reschedule_success(
+        self, instance_id: int, outcome: TaskOutcome, retry_at: datetime
+    ) -> TaskInstanceRecord:
+        """Record a SUCCESSFUL round of a RECURRING task and schedule
+        the next one (milestone 7).
+
+        ``running -> waiting`` with ``next_attempt_at = retry_at`` and
+        the attempt count RESET: each recurring round is a fresh window,
+        never bounded by the transient-retry limit. Only the executing
+        (claimed/running) row may be rescheduled.
+        """
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'waiting', last_outcome = ?, "
+            "next_attempt_at = ?, attempt_count = 0, updated_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (_outcome_json(outcome), _format_ts(retry_at), now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            raise StateTransitionError(
+                f"Cannot reschedule task instance {instance_id} from state "
+                f"'{current.status.value}' (recurring success requires 'running')."
+            )
+        return await self.get_instance(instance_id)
+
     async def mudae_deadlines(self, account_id: int) -> dict[MudaeStateKind, datetime]:
         """Learned deadlines for one account ({kind: deadline}).
 

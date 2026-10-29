@@ -104,6 +104,24 @@ class InteractionResult:
 
 
 @dataclass(frozen=True)
+class EmbedText:
+    """Text fields of one embed, carried through inbound events.
+
+    Mudae speaks in embeds (character cards: author=character,
+    description=stats/kakera, footer=markers); the adapter preserves
+    the per-field text so the parser's source-targeted rules
+    (embed_author/embed_title/embed_description/embed_footer) keep
+    matching exactly as they do on the raw library objects. No embed
+    objects or metadata cross the adapter boundary.
+    """
+
+    author_name: str | None = None
+    title: str | None = None
+    description: str | None = None
+    footer: str | None = None
+
+
+@dataclass(frozen=True)
 class ChannelMessage:
     """A message observed on the platform."""
 
@@ -113,6 +131,7 @@ class ChannelMessage:
     content: str
     has_components: bool = False
     created_at: datetime | None = None
+    embeds: tuple[EmbedText, ...] = ()
 
 
 # ----- normalized inbound events -----

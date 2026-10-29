@@ -547,6 +547,21 @@ class WorkerManager:
             )
             return
         if outcome.status is TaskStatus.SUCCEEDED:
+            if outcome.retry_at is not None:
+                # Milestone 7 (recurring tasks): a successful ROUND with
+                # a learned deadline stays alive — rescheduled with a
+                # fresh attempt window instead of going terminal.
+                await self._store.reschedule_success(record.id, outcome, outcome.retry_at)
+                logger.info(
+                    "task round succeeded; rescheduled at learned deadline",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "rescheduled",
+                    },
+                )
+                return
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
             # Worker-level retries are bounded by the resolved policy's

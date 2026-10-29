@@ -96,6 +96,7 @@ from .adapters import (
     ChannelInfo,
     ChannelMessage,
     CooldownError,
+    EmbedText,
     EventConsumer,
     EventDispatcher,
     InteractionResult,
@@ -700,7 +701,35 @@ def _to_channel_message(message: Any) -> ChannelMessage:
         content=message.content or "",
         has_components=bool(getattr(message, "components", None)),
         created_at=getattr(message, "created_at", None),
+        embeds=_embed_texts(getattr(message, "embeds", None)),
     )
+
+
+def _embed_texts(embeds: Any) -> tuple[EmbedText, ...]:
+    """Harvest per-field embed text (nested library and flat DTO shapes).
+
+    Only text crosses the boundary; non-text embed data (colors, images,
+    fields arrays) is deliberately dropped — parsing needs words.
+    """
+
+    def text(value: Any) -> str | None:
+        return value if isinstance(value, str) and value.strip() else None
+
+    harvested: list[EmbedText] = []
+    for embed in embeds or ():
+        embed_author = getattr(embed, "author", None)
+        embed_footer = getattr(embed, "footer", None)
+        entry = EmbedText(
+            author_name=text(
+                getattr(embed_author, "name", None) or getattr(embed, "author_name", None)
+            ),
+            title=text(getattr(embed, "title", None)),
+            description=text(getattr(embed, "description", None)),
+            footer=text(getattr(embed_footer, "text", None) or getattr(embed, "footer_text", None)),
+        )
+        if any((entry.author_name, entry.title, entry.description, entry.footer)):
+            harvested.append(entry)
+    return tuple(harvested)
 
 
 def _to_channel_info(channel: Any) -> ChannelInfo:
