@@ -16,7 +16,7 @@ from autoclaimer.adapters import (
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.mudae import anchor_deadline
 from autoclaimer.mudae_tasks import _Waiter, await_mudae_reply, register_mudae_tasks
-from autoclaimer.persistence import MudaeStateKind, TaskStateStore
+from autoclaimer.persistence import MudaeStateKind, TaskStateStore, utc_now
 from autoclaimer.registry import TaskContext, TaskRegistry
 
 ACCOUNT = 271485504361996288
@@ -1078,3 +1078,229 @@ async def test_repeated_zero_duration_does_not_hot_loop() -> None:
     # deadline ever equals 'now' (which would be immediately due).
     assert all(r == NOW + timedelta(seconds=300.0) for r in retry_ats)
     assert sent_total == 3  # one $mu per round, no extras
+
+
+# $rt reaction-confirmation protocol (spec round 4): deterministic races
+
+
+class GatedSendAdapter(MockAdapter):
+    """Send records the message, then BLOCKS on a gate before returning —
+    forcing the early-reaction race deterministically (the message id is
+    knowable: MockAdapter ids are sequential from _FIRST_ID+1)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    async def send_message(self, channel_id: int, content: str) -> Any:
+
+        result = await super().send_message(channel_id, content)
+        await self.gate.wait()  # blocked: recorded but not returned
+        return result
+
+
+async def test_reaction_during_blocked_send_confirms_after_binding() -> None:
+    """Spec §7.2 (the early-reaction race): Mudae's ✅ arrives while
+    send_message is still blocked — BEFORE the id exists for the caller.
+    The pre-registered subscription captures it; after the send returns
+    and binds the ACTUAL id, the buffered reaction confirms."""
+    adapter = GatedSendAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(0, MUDAE, "\u2705"),
+    )
+    waiter.begin()
+    sending = asyncio.create_task(waiter_send(waiter, adapter))
+    # While the send is blocked (recorded, id not yet returned), the bot
+    # reacts — with the id the mock will return (sequential ids).
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    rt_message_id = _FIRST_ID + 1
+    await asyncio.sleep(0.05)  # ensure the send recorded + waiter queued
+    await adapter.emit(reaction_event(rt_message_id))
+    adapter.gate.set()  # release the send; the id binds
+    reply = await sending
+    waiter.end()
+    assert reply is not None
+    assert reply.message.message_id == rt_message_id  # exact id matched
+
+
+async def waiter_send(waiter: _Waiter, adapter: GatedSendAdapter) -> Any:
+    sent = await adapter.send_message(CHANNEL, "$rt")
+    waiter.bind_target_message(sent.message_id)
+    return await waiter.wait(2.0)
+
+
+async def test_buffered_reaction_for_other_message_is_rejected() -> None:
+    """Spec §7.3: a reaction captured during the blocked send targets a
+    DIFFERENT message — never confirms; the qualifying one (after
+    binding) does."""
+    adapter = GatedSendAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(0, MUDAE, "\u2705"),
+    )
+    waiter.begin()
+    sending = asyncio.create_task(waiter_send(waiter, adapter))
+    from autoclaimer.mock_adapter import _FIRST_ID
+
+    await asyncio.sleep(0.05)
+    await adapter.emit(reaction_event(_FIRST_ID - 100))  # buffered: wrong id
+    adapter.gate.set()
+    await asyncio.sleep(0.02)
+    await adapter.emit(reaction_event(_FIRST_ID + 1))  # the real one
+    reply = await sending
+    waiter.end()
+    assert reply is not None
+    assert reply.message.message_id == _FIRST_ID + 1  # exact id, not the buffered other
+
+
+async def test_check_mark_from_non_bot_user_is_ignored() -> None:
+    """Spec §7.4: a ✅ on the right message from ANOTHER USER never
+    confirms (identity check)."""
+    adapter = MockAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(55, MUDAE, "\u2705"),
+    )
+    waiter.begin()
+    waiter.bind_target_message(55)
+    await adapter.emit(reaction_event(55, user_id=987654))  # not the bot
+    reply = await waiter.wait(0.2)
+    waiter.end()
+    assert reply is None  # ignored: wrong user identity
+
+
+async def test_reaction_in_other_channel_is_ignored() -> None:
+    """Spec §7.5: the right reaction on the right message in ANOTHER
+    channel never confirms."""
+    from autoclaimer.adapters import RawReactionAddedEvent
+
+    adapter = MockAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(56, MUDAE, "\u2705"),
+    )
+    waiter.begin()
+    waiter.bind_target_message(56)
+    await adapter.emit(
+        RawReactionAddedEvent(
+            account_id=ACCOUNT,
+            received_at=datetime.now(UTC),
+            channel_id=111222,  # a different channel
+            message_id=56,
+            user_id=MUDAE,
+            emoji="\u2705",
+        )
+    )
+    reply = await waiter.wait(0.2)
+    waiter.end()
+    assert reply is None
+
+
+async def test_reaction_buffer_overflow_recovers_conservatively() -> None:
+    """Spec §7.9a: overflowing the bounded reaction buffer marks the
+    result unreliable → None (conservative), never a wrong confirm."""
+    adapter = MockAdapter()
+    waiter = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(0, MUDAE, "\u2705"),
+    )
+    waiter.begin()
+    for i in range(100):  # far beyond the 64-slot bound
+        await adapter.emit(reaction_event(5000 + i))  # bot ✅s, wrong ids
+    waiter.bind_target_message(5100)
+    reply = await waiter.wait(0.3)
+    waiter.end()
+    assert reply is None  # saturated → unreliable → conservative None
+
+
+async def test_event_delivery_continues_while_outbound_send_is_delayed() -> None:
+    """Spec §7.13: inbound dispatch is NOT blocked by the outbound send
+    (the rate-limiter/pacing separation): while $rt's send is gated,
+    an unrelated subscriber still receives a message event."""
+    adapter = GatedSendAdapter()
+    received: list[Any] = []
+
+    async def subscriber(event: Any) -> None:
+        received.append(event)
+
+    unsubscribe = adapter.subscribe(subscriber)
+    confirmation = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(0, MUDAE, "\u2705"),
+    )
+    confirmation.begin()
+
+    async def send_and_confirm() -> None:
+        sent = await adapter.send_message(CHANNEL, "$rt")  # blocks on gate
+        confirmation.bind_target_message(sent.message_id)
+
+    task = asyncio.create_task(send_and_confirm())
+    await asyncio.sleep(0.05)  # send recorded, blocked
+    chatter = reply_event(70, "unrelated chatter", author_id=MUDAE)
+    import dataclasses as _dc
+
+    await adapter.emit(_dc.replace(chatter, received_at=datetime.now(UTC)))
+    await asyncio.sleep(0.05)
+    assert len(received) == 1  # the dispatcher delivered during the delay
+    adapter.gate.set()
+    await task
+    confirmation.end()
+    unsubscribe()
+
+
+async def test_subscription_active_before_send_begins() -> None:
+    """Spec §7.1: the reaction subscription is registered BEFORE the
+    $rt send starts (the waiter's subscriber exists while the send is
+    still gated)."""
+    adapter = GatedSendAdapter()
+    before = adapter._events.stats().subscriber_count  # noqa: SLF001
+    confirmation = _Waiter(
+        adapter,
+        channel_id=CHANNEL,
+        author_id=MUDAE,
+        exclude_message_ids=None,
+        not_before=utc_now(),
+        reaction_target=(0, MUDAE, "\u2705"),
+    )
+    confirmation.begin()
+    during_send = asyncio.get_running_loop().create_future()
+
+    async def send() -> None:
+        during_send.set_result(
+            adapter._events.stats().subscriber_count  # noqa: SLF001
+        )
+        await adapter.send_message(CHANNEL, "$rt")  # blocks
+
+    task = asyncio.create_task(send())
+    count_inside_send = await during_send
+    adapter.gate.set()
+    await task
+    confirmation.end()
+    assert before == 0
+    assert count_inside_send >= 1  # subscribed before/inside the send
