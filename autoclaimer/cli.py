@@ -309,11 +309,13 @@ class CliSession:
     async def _cmd_pause(self, args: list[str]) -> str:
         if not args:
             return self._controller.pause_all()
+        self._exact_args(args, 1)  # audit BUG-003: no silently ignored ids
         return self._controller.pause_account(self._account_arg(args[0]))
 
     async def _cmd_resume(self, args: list[str]) -> str:
         if not args:
             return self._controller.resume_all()
+        self._exact_args(args, 1)
         return self._controller.resume_account(self._account_arg(args[0]))
 
     async def _cmd_enable(self, args: list[str]) -> str:

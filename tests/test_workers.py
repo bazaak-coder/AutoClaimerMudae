@@ -1127,3 +1127,63 @@ async def test_unregistered_task_type_skips_without_poisoning(tmp_path: Path) ->
     with pytest.raises(UnknownInstanceError):
         await store.get_instance_by_ids(ACCOUNT, "ghost")  # never created
     await store.close()
+
+
+# External audit BUG-001: failed startup is retryable
+
+
+async def test_start_can_retry_after_recovery_failure(tmp_path: Path) -> None:
+    from autoclaimer.persistence import DatabaseBusyError
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry.register(
+        TaskType(
+            id="job",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    original = store.recover_interrupted
+    calls = [0]
+
+    async def flaky_recovery() -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise DatabaseBusyError("simulated lock")
+        return await original()
+
+    store.recover_interrupted = flaky_recovery  # type: ignore[method-assign]
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    with pytest.raises(DatabaseBusyError):
+        await manager.start()
+    # Retry after the transient failure: startup completes, work runs.
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+    assert calls[0] == 2
+    await store.close()

@@ -219,10 +219,25 @@ class WorkerManager:
     # ----- lifecycle -----
 
     async def start(self) -> None:
-        """Recover interrupted work, materialize instances, start workers."""
+        """Recover interrupted work, materialize instances, start workers.
+
+        External audit BUG-001 fix: startup state is transactional —
+        ``_started`` flips True only after the whole initialization
+        sequence succeeds; a failure (e.g. transient ``DatabaseBusyError``
+        in ``recover_interrupted``) leaves the manager startable again
+        instead of silently no-op-ing every retry.
+        """
         if self._started:
             return
+        try:
+            await self._start_sequence()
+        except BaseException:
+            # Re-raise after cleanup: callers see the failure and may
+            # retry (the manager is NOT marked started).
+            raise
         self._started = True
+
+    async def _start_sequence(self) -> None:
         await self._store.recover_interrupted()
         # Audit fix (agents.md section 17.2.1): validate resolved task
         # parameters against the registry BEFORE spawning workers — a
