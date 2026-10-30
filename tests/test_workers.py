@@ -67,6 +67,7 @@ async def build_harness(
     max_in_flight = [0]
     counters: dict[tuple[int, str], int] = {}
     block_events: dict[tuple[int, str], asyncio.Event] = {}
+    barrier_events: dict[tuple[str, str], asyncio.Event] = {}
     adapters = {profile.id: MockAdapter() for profile in accounts.accounts}
 
     async def run_behavior(context: TaskContext) -> TaskOutcome:
@@ -74,6 +75,17 @@ async def build_harness(
         key = (context.account_id, context.task_id)
         if behavior == "slow":
             await asyncio.sleep(0.05)
+            return TaskOutcome(TaskStatus.SUCCEEDED)
+        if behavior == "concurrent_barrier":
+            # Deterministic overlap (CI-flake fix): the barrier LATCHES —
+            # the second arrival sets an event both wait on. A while-loop
+            # on in_flight would race with the first handler's decrement.
+            both_running = barrier_events.setdefault(
+                ("__barrier__", "__concurrent__"), asyncio.Event()
+            )
+            if in_flight[0] >= 2:
+                both_running.set()
+            await both_running.wait()
             return TaskOutcome(TaskStatus.SUCCEEDED)
         if behavior == "block":
             event = block_events.setdefault(key, asyncio.Event())
@@ -182,7 +194,7 @@ async def test_tasks_are_sequential_within_one_account(tmp_path: Path) -> None:
 async def test_accounts_run_concurrently(tmp_path: Path) -> None:
     h = await build_harness(
         tmp_path,
-        tasks_raw={"job": task("slow")},
+        tasks_raw={"job": task("concurrent_barrier")},
         accounts_raw=[{"id": ACCOUNT, "tasks": ["job"]}, {"id": OTHER, "tasks": ["job"]}],
     )
     async with h.manager:
