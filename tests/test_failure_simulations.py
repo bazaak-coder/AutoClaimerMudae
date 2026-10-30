@@ -250,25 +250,34 @@ async def _account_stopped(manager: WorkerManager) -> bool:
 # --- T11: back-dated schedules are due immediately ---
 
 
-async def test_t11_backdated_schedule_is_due_now(tmp_path: Path) -> None:
-    clock = FakeClockFixed(BASE_TIME)
-    store = TaskStateStore(tmp_path / "state.db", clock=clock)
-    await store.open()
-    try:
-        record = await store.create_instance(ACCOUNT, "probe")
-        backdated = BASE_TIME - timedelta(hours=1)
-        await store.schedule_attempt(record.id, backdated)
-        waiting = await store.get_instance(record.id)
-        assert waiting.status is TaskInstanceState.WAITING
-        due = await store.due_instances()
-        assert record.id in [r.id for r in due]  # past deadline = due now
-    finally:
-        await store.close()
-
-
 class FakeClockFixed:
     def __init__(self, now: datetime) -> None:
         self.now = now
 
     def __call__(self) -> datetime:
         return self.now
+
+
+async def test_t11_backdated_outcome_deadline_is_due_now(tmp_path: Path) -> None:
+    """T11 (re-homed after schedule_attempt removal): a back-dated
+    LEARNED deadline means due-now — the worker clamps expired retry_at
+    values to the wall clock instead of computing a negative wait."""
+
+    clock = FakeClockFixed(BASE_TIME)
+    store = TaskStateStore(tmp_path / "state.db", clock=clock)
+    await store.open()
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+        claimed = await store.claim(record.id)
+        from autoclaimer.registry import TaskOutcome, TaskStatus
+
+        backdated = BASE_TIME - timedelta(hours=1)
+        await store.record_failure(
+            claimed.id,
+            TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message="learned", retry_at=backdated),
+            retry_at=backdated,
+        )
+        due = await store.due_instances()
+        assert claimed.id in [r.id for r in due]  # past deadline = due now
+    finally:
+        await store.close()

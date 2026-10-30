@@ -67,6 +67,7 @@ async def build_harness(
     max_in_flight = [0]
     counters: dict[tuple[int, str], int] = {}
     block_events: dict[tuple[int, str], asyncio.Event] = {}
+    barrier_events: dict[tuple[str, str], asyncio.Event] = {}
     adapters = {profile.id: MockAdapter() for profile in accounts.accounts}
 
     async def run_behavior(context: TaskContext) -> TaskOutcome:
@@ -74,6 +75,17 @@ async def build_harness(
         key = (context.account_id, context.task_id)
         if behavior == "slow":
             await asyncio.sleep(0.05)
+            return TaskOutcome(TaskStatus.SUCCEEDED)
+        if behavior == "concurrent_barrier":
+            # Deterministic overlap (CI-flake fix): the barrier LATCHES —
+            # the second arrival sets an event both wait on. A while-loop
+            # on in_flight would race with the first handler's decrement.
+            both_running = barrier_events.setdefault(
+                ("__barrier__", "__concurrent__"), asyncio.Event()
+            )
+            if in_flight[0] >= 2:
+                both_running.set()
+            await both_running.wait()
             return TaskOutcome(TaskStatus.SUCCEEDED)
         if behavior == "block":
             event = block_events.setdefault(key, asyncio.Event())
@@ -182,7 +194,7 @@ async def test_tasks_are_sequential_within_one_account(tmp_path: Path) -> None:
 async def test_accounts_run_concurrently(tmp_path: Path) -> None:
     h = await build_harness(
         tmp_path,
-        tasks_raw={"job": task("slow")},
+        tasks_raw={"job": task("concurrent_barrier")},
         accounts_raw=[{"id": ACCOUNT, "tasks": ["job"]}, {"id": OTHER, "tasks": ["job"]}],
     )
     async with h.manager:
@@ -696,7 +708,12 @@ async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) 
             handler=learns_deadline,
         )
     )
-    store = TaskStateStore(tmp_path / "state.db")
+    store = TaskStateStore(
+        tmp_path / "state.db",
+        clock=lambda: datetime(2026, 10, 29, 12, 0, 0, tzinfo=UTC),  # frozen WITH the wall:
+        # the learned 13:00 deadline is never due, so the next round
+        # cannot fire (audit-11 F3 fix — no real-clock race).
+    )
     await store.open()
     limiter = RateLimiter(store=store)
     manager = WorkerManager(
@@ -886,4 +903,72 @@ async def test_naive_retry_at_on_permanent_failure_keeps_terminal(tmp_path: Path
     assert record.status is TaskInstanceState.FAILED  # terminal, not running
     assert record.last_outcome is not None
     assert "timezone-naive" in record.last_outcome.message
+    await store.close()
+
+
+# Milestone 7: recurring tasks
+
+
+async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) -> None:
+    """A recurring handler returns SUCCEEDED + a learned deadline: the
+    round is recorded as a success, the instance is rescheduled (waiting,
+    fresh attempt window) instead of going terminal — and the next round
+    executes at the deadline."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    calls: list[int] = []
+    learned = _dt(2026, 10, 29, 13, 0, 0, tzinfo=_UTC)
+
+    async def recurring(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        if len(calls) == 1:
+            return TaskOutcome(TaskStatus.SUCCEEDED, message="round done", retry_at=learned)
+        return TaskOutcome(TaskStatus.FAILED_PERMANENT, message="stop marker")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"roll": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["roll"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="roll",
+            description="Recurring round.",
+            validate_config=lambda config: None,
+            handler=recurring,
+        )
+    )
+    frozen = _dt(2026, 10, 29, 12, 0, 0, tzinfo=_UTC)
+    store = TaskStateStore(tmp_path / "state.db", clock=lambda: frozen)
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+        wall=lambda: frozen,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "roll", TaskInstanceState.WAITING)
+    # Frozen clock: the learned 13:00 deadline is NOT due, so exactly ONE
+    # round ran (audit-11 F3 fix — the second round is now impossible,
+    # where the old real-clock store let it race and terminally flip).
+    assert len(calls) == 1
+    record = await store.get_instance_by_ids(ACCOUNT, "roll")
+    assert record.status is TaskInstanceState.WAITING  # alive, not terminal
+    assert record.attempt_count == 0  # fresh window for the next round
+    assert record.next_attempt_at == learned
+    assert record.last_outcome is not None
+    assert record.last_outcome.status is TaskStatus.SUCCEEDED
     await store.close()

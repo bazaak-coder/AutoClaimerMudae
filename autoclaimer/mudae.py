@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from .adapters import ChannelMessage, MessageCreatedEvent
@@ -78,12 +79,35 @@ def parse_mudae(
     :class:`InvalidMessageError` for ``None`` or objects exposing no
     message attributes at all.
 
+    ``ChannelMessage.embeds`` (:class:`~autoclaimer.adapters.EmbedText`)
+    are re-shaped into parseable embed objects — Mudae speaks in embeds
+    (author=character, description=stats, footer=markers), and the
+    parser's source-targeted rules keep matching exactly as they do on
+    raw library messages.
+
     Deterministic by construction: no clock, network, filesystem, or
     database access (``account_username`` is echoed context only).
     """
     if isinstance(message, MessageCreatedEvent):
         message = message.message
+    if isinstance(message, ChannelMessage) and message.embeds:
+        message = _embed_shim(message)
     return _parser().parse(message, account_username=account_username)
+
+
+def _embed_shim(message: ChannelMessage) -> Any:
+    """Rebuild parseable embed objects from the preserved field texts."""
+
+    def embed_of(embed: Any) -> Any:
+        author = SimpleNamespace(name=embed.author_name) if embed.author_name else None
+        footer = SimpleNamespace(text=embed.footer) if embed.footer else None
+        return SimpleNamespace(
+            author=author, title=embed.title, description=embed.description, footer=footer
+        )
+
+    return SimpleNamespace(
+        content=message.content, embeds=[embed_of(e) for e in message.embeds], components=()
+    )
 
 
 @dataclass(frozen=True)

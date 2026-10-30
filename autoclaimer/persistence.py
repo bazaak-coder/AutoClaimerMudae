@@ -43,7 +43,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _BUSY_TIMEOUT_MS = 5000
 
 _MIGRATIONS: dict[int, str] = {
@@ -91,6 +91,21 @@ _MIGRATIONS: dict[int, str] = {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (account_id, kind)
     );
+    """,
+    4: """
+    -- Audit fix: split the hourly roll-quota window from the $rt perk
+    -- window. SQLite CHECK constraints are immutable: rebuild the table
+    -- with the widened kind set and copy existing rows.
+    CREATE TABLE mudae_state_v4 (
+        account_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('claim', 'rt', 'rolls')),
+        deadline TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, kind)
+    );
+    INSERT INTO mudae_state_v4 SELECT account_id, kind, deadline, updated_at FROM mudae_state;
+    DROP TABLE mudae_state;
+    ALTER TABLE mudae_state_v4 RENAME TO mudae_state;
     """,
 }
 
@@ -131,12 +146,17 @@ class MudaeStateKind(Enum):
 
     ``CLAIM``: the claim cooldown deadline (learned from ``$mu`` /
     claim-line replies via the claim-timer rule).
-    ``RT``: the ``$rt`` rolls-reset deadline (learned from ``$rtu``
+    ``RT``: the ``$rt`` perk-reset deadline (learned from ``$rtu``
     replies; perk-dependent 5h-20h — never assumed, always looked up).
+    ``ROLLS``: the hourly roll-quota window (roulette-limit replies;
+    distinct from ``RT`` so a 5-20 h perk window can never silence the
+    hourly rolls and vice versa — audit fix for the shared-slot
+    conflation).
     """
 
     CLAIM = "claim"
     RT = "rt"
+    ROLLS = "rolls"
 
 
 RESUMABLE_STATES = frozenset({TaskInstanceState.PENDING, TaskInstanceState.WAITING})
@@ -145,7 +165,6 @@ TERMINAL_STATES = frozenset(
 )
 
 _CLAIMABLE = (TaskInstanceState.PENDING, TaskInstanceState.WAITING)
-_CANCELLABLE = (TaskInstanceState.PENDING, TaskInstanceState.RUNNING, TaskInstanceState.WAITING)
 
 
 @dataclass(frozen=True)
@@ -474,44 +493,6 @@ class TaskStateStore:
             instance_id, target, outcome, from_states=("running",), retry_at=retry_at
         )
 
-    async def cancel(self, instance_id: int) -> TaskInstanceRecord:
-        """pending|running|waiting -> cancelled (terminal states are refused)."""
-        now = _format_ts(self._clock())
-        changed = await self._run(
-            self._update_sync,
-            "UPDATE task_instances SET status = 'cancelled', updated_at = ?, "
-            "next_attempt_at = NULL WHERE id = ? AND status IN ('pending', 'running', 'waiting')",
-            (now, instance_id),
-        )
-        if changed == 0:
-            current = await self.get_instance(instance_id)
-            raise StateTransitionError(
-                f"Cannot cancel task instance {instance_id} from state '{current.status.value}'."
-            )
-        return await self.get_instance(instance_id)
-
-    async def set_cooldown(
-        self, instance_id: int, until: datetime, scope: str
-    ) -> TaskInstanceRecord:
-        """Persist a wall-clock UTC cooldown deadline and its scope."""
-        changed = await self._run(
-            self._update_sync,
-            "UPDATE task_instances SET cooldown_until = ?, cooldown_scope = ?, updated_at = ? "
-            "WHERE id = ?",
-            (_format_ts(until), scope, _format_ts(self._clock()), instance_id),
-        )
-        if changed == 0:
-            raise UnknownInstanceError(f"No task instance with id {instance_id}.")
-        return await self.get_instance(instance_id)
-
-    async def cooldown_remaining(self, instance_id: int) -> timedelta | None:
-        """Remaining cooldown from the persisted UTC deadline; None when expired/absent."""
-        record = await self.get_instance(instance_id)
-        if record.cooldown_until is None:
-            return None
-        remaining = record.cooldown_until - self._clock()
-        return remaining if remaining > timedelta(0) else None
-
     async def recover_interrupted(self) -> int:
         """Startup recovery: running -> pending for rows orphaned by a shutdown."""
         changed = await self._run(
@@ -559,33 +540,6 @@ class TaskStateStore:
             (_outcome_json(TaskOutcome(TaskStatus.FAILED_PERMANENT, message)), now, account_id),
         )
         return changed
-
-    async def schedule_attempt(self, instance_id: int, at: datetime) -> TaskInstanceRecord:
-        """Schedule the next attempt at an ABSOLUTE UTC deadline.
-
-        Milestone 4 (retry ownership): the Mudae task layer calls this
-        with deadlines LEARNED from parsed replies (anchored via
-        ``autoclaimer.mudae.anchor_deadline``) — never with fabricated or
-        transport-backoff values. ``pending|waiting -> waiting`` with
-        ``next_attempt_at = at`` (a fresh schedule replaces an earlier
-        one: latest observation wins, mirroring ``mudae_state``).
-        Terminal rows reject the transition; ``running`` rows belong to
-        their executing worker and are rejected too. Naive datetimes are
-        refused by ``_format_ts``.
-        """
-        now = _format_ts(self._clock())
-        changed = await self._run(
-            self._update_sync,
-            "UPDATE task_instances SET status = 'waiting', next_attempt_at = ?, "
-            "updated_at = ? WHERE id = ? AND status IN ('pending', 'waiting')",
-            (_format_ts(at), now, instance_id),
-        )
-        if changed == 0:
-            current = await self.get_instance(instance_id)
-            raise StateTransitionError(
-                f"Cannot schedule task instance {instance_id} from state '{current.status.value}'."
-            )
-        return await self.get_instance(instance_id)
 
     # ----- scope cooldowns (rate limiter persistence) -----
 
@@ -654,9 +608,16 @@ class TaskStateStore:
         A fresh lookup REPLACES the stored value: the reply is the
         current truth (an ``$rtu`` check after ``$rt`` use supersedes any
         previously assumed deadline). Naive datetimes are rejected at
-        this boundary (``_format_ts``).
+        this boundary (``_format_ts``). Expired rows for other kinds are
+        pruned opportunistically (audit hygiene, mirrors
+        ``set_scope_cooldown``).
         """
         now = _format_ts(self._clock())
+        await self._run(
+            self._update_sync,
+            "DELETE FROM mudae_state WHERE deadline <= ? AND account_id = ?",
+            (now, account_id),
+        )
         await self._run(
             self._update_sync,
             "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
@@ -681,6 +642,42 @@ class TaskStateStore:
             "DELETE FROM mudae_state WHERE account_id = ? AND kind = ?",
             (account_id, kind.value),
         )
+
+    async def reschedule_success(
+        self, instance_id: int, outcome: TaskOutcome, retry_at: datetime
+    ) -> TaskInstanceRecord:
+        """Record a SUCCESSFUL round of a RECURRING task and schedule
+        the next one (milestone 7).
+
+        ``running -> waiting`` with ``next_attempt_at = retry_at`` and
+        the attempt count RESET: each recurring round is a fresh window,
+        never bounded by the transient-retry limit. Only the executing
+        (claimed/running) row may be rescheduled.
+        """
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'waiting', last_outcome = ?, "
+            "next_attempt_at = ?, attempt_count = 0, updated_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (_outcome_json(outcome), _format_ts(retry_at), now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            if (
+                current.status is TaskInstanceState.WAITING
+                and current.last_outcome is not None
+                and current.last_outcome.status == outcome.status
+                and current.last_outcome.message == outcome.message
+                and current.next_attempt_at == retry_at
+                and current.attempt_count == 0
+            ):
+                return current  # idempotent re-record of the same round (audit fix)
+            raise StateTransitionError(
+                f"Cannot reschedule task instance {instance_id} from state "
+                f"'{current.status.value}' (recurring success requires 'running')."
+            )
+        return await self.get_instance(instance_id)
 
     async def mudae_deadlines(self, account_id: int) -> dict[MudaeStateKind, datetime]:
         """Learned deadlines for one account ({kind: deadline}).

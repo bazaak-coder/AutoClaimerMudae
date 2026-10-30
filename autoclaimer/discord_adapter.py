@@ -96,6 +96,7 @@ from .adapters import (
     ChannelInfo,
     ChannelMessage,
     CooldownError,
+    EmbedText,
     EventConsumer,
     EventDispatcher,
     InteractionResult,
@@ -499,10 +500,19 @@ class DiscordAdapter:
 
     # ----- PlatformAdapter operations -----
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
         await self._ensure_ready()
         await self._pace(self._send_jitter_range)
         channel = self._channel(channel_id)
+        # The send boundary AFTER outbound pacing (review fix): invoked
+        # immediately before the library call — anything arriving before
+        # this moment cannot be a reply to THIS message. Residual
+        # ambiguity: the microscopic window between this callback and
+        # the wire itself (documented).
+        if on_dispatch is not None:
+            on_dispatch()
         try:
             message = await channel.send(content)
         except discord.DiscordException as exc:
@@ -563,6 +573,8 @@ class DiscordAdapter:
 
     async def _on_message(self, message: Any) -> None:
         """Bridge: ``on_message`` -> normalized MessageCreatedEvent."""
+        if not self._events.has_subscribers:
+            return  # audit perf: skip normalization when nobody listens
         try:
             await self._events.dispatch(
                 MessageCreatedEvent(
@@ -700,7 +712,37 @@ def _to_channel_message(message: Any) -> ChannelMessage:
         content=message.content or "",
         has_components=bool(getattr(message, "components", None)),
         created_at=getattr(message, "created_at", None),
+        embeds=_embed_texts(getattr(message, "embeds", None)),
     )
+
+
+def _embed_texts(embeds: Any) -> tuple[EmbedText, ...]:
+    """Harvest per-field embed text (nested library and flat DTO shapes).
+
+    Only text crosses the boundary; non-text embed data (colors, images,
+    fields arrays) is deliberately dropped — parsing needs words.
+    """
+
+    def text(value: Any) -> str | None:
+        return value if isinstance(value, str) and value.strip() else None
+
+    harvested: list[EmbedText] = []
+    if embeds is not None and not hasattr(embeds, "__iter__"):
+        embeds = ()  # non-iterable attr: degrade, never drop the message (audit F15)
+    for embed in embeds or ():
+        embed_author = getattr(embed, "author", None)
+        embed_footer = getattr(embed, "footer", None)
+        entry = EmbedText(
+            author_name=text(
+                getattr(embed_author, "name", None) or getattr(embed, "author_name", None)
+            ),
+            title=text(getattr(embed, "title", None)),
+            description=text(getattr(embed, "description", None)),
+            footer=text(getattr(embed_footer, "text", None) or getattr(embed, "footer_text", None)),
+        )
+        if any((entry.author_name, entry.title, entry.description, entry.footer)):
+            harvested.append(entry)
+    return tuple(harvested)
 
 
 def _to_channel_info(channel: Any) -> ChannelInfo:

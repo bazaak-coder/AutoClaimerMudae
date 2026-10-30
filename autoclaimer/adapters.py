@@ -104,6 +104,24 @@ class InteractionResult:
 
 
 @dataclass(frozen=True)
+class EmbedText:
+    """Text fields of one embed, carried through inbound events.
+
+    Mudae speaks in embeds (character cards: author=character,
+    description=stats/kakera, footer=markers); the adapter preserves
+    the per-field text so the parser's source-targeted rules
+    (embed_author/embed_title/embed_description/embed_footer) keep
+    matching exactly as they do on the raw library objects. No embed
+    objects or metadata cross the adapter boundary.
+    """
+
+    author_name: str | None = None
+    title: str | None = None
+    description: str | None = None
+    footer: str | None = None
+
+
+@dataclass(frozen=True)
 class ChannelMessage:
     """A message observed on the platform."""
 
@@ -113,6 +131,7 @@ class ChannelMessage:
     content: str
     has_components: bool = False
     created_at: datetime | None = None
+    embeds: tuple[EmbedText, ...] = ()
 
 
 # ----- normalized inbound events -----
@@ -388,6 +407,11 @@ class EventDispatcher:
                 },
             )
 
+    @property
+    def has_subscribers(self) -> bool:
+        """True when at least one live subscription exists (bridge fast-path)."""
+        return bool(self._subscribers)
+
     def stats(self) -> EventDispatcherStats:
         """Read-only snapshot: subscriber count, lost-event totals, and
         live queue pressure per subscription (keyed by subscribe handle)."""
@@ -560,8 +584,17 @@ class EventDispatcherStats:
 class PlatformAdapter(Protocol):
     """Minimum asynchronous operations the framework needs from a platform."""
 
-    async def send_message(self, channel_id: int, content: str) -> SentMessage:
-        """Send *content* to *channel_id* and return the sent message."""
+    async def send_message(
+        self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
+    ) -> SentMessage:
+        """Send *content* to *channel_id* and return the sent message.
+
+        ``on_dispatch`` (optional) is invoked the moment the message is
+        issued on the wire — after any readiness/pacing wait, before the
+        send resolves — the reliable send-boundary anchor for reply
+        correlation. Adapters without a pacing phase invoke it
+        immediately before returning.
+        """
         ...
 
     async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:

@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 3  # v3: mudae_state added
+        assert version_row[0] == s.schema_version == 4  # v4: ROLLS kind split
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -118,7 +118,7 @@ async def test_v1_database_is_migrated_to_current(tmp_path: Path) -> None:
         assert len(rows) == 1
         version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == migrated.schema_version == 3  # v3: mudae_state added
+        assert version_row[0] == migrated.schema_version == 4  # v4: ROLLS kind split
     finally:
         await migrated.close()
 
@@ -263,17 +263,6 @@ async def test_record_failure_without_retry_is_terminal(store: TaskStateStore) -
         await store.claim(failed.id)
 
 
-async def test_cancel_from_active_states_only(store: TaskStateStore) -> None:
-    record = await seed(store)
-    cancelled = await store.cancel(record.id)
-    assert cancelled.status is TaskInstanceState.CANCELLED
-    with pytest.raises(StateTransitionError, match="cancel"):
-        await store.cancel(record.id)  # terminal stays terminal
-
-
-# --- timestamps ---
-
-
 async def test_timestamps_are_utc_and_advance(store: TaskStateStore) -> None:
     clock = FakeClock()
     s = await make_store(clock=clock)
@@ -316,31 +305,6 @@ async def test_due_instances_respect_retry_times(store: TaskStateStore) -> None:
 
 
 # --- cooldowns (wall-clock across restarts) ---
-
-
-async def test_cooldown_remaining_uses_wall_clock(tmp_path: Path) -> None:
-    clock = FakeClock()
-    path = tmp_path / "state.db"
-    s = await make_store(path, clock=clock)
-    try:
-        record = await s.create_instance(ACCOUNT, "claim_test")
-        await s.set_cooldown(record.id, clock() + timedelta(seconds=30), scope="account")
-        assert await s.cooldown_remaining(record.id) == timedelta(seconds=30)
-    finally:
-        await s.close()
-
-    # Restart the process: wall-clock deadlines keep working.
-    restarted_clock = FakeClock(start=BASE_TIME + timedelta(seconds=20))
-    resumed = await make_store(path, clock=restarted_clock)
-    try:
-        assert await resumed.cooldown_remaining(record.id) == timedelta(seconds=10)
-        restarted_clock.advance(11)
-        assert await resumed.cooldown_remaining(record.id) is None
-    finally:
-        await resumed.close()
-
-
-# --- restart recovery ---
 
 
 async def test_running_rows_are_recovered_on_restart(tmp_path: Path) -> None:
@@ -396,7 +360,15 @@ async def test_transaction_commits_and_rolls_back_atomically(store: TaskStateSto
 
     with pytest.raises(RuntimeError, match="boom"):
         async with store.transaction():
-            await store.cancel(record_a.id)
+            # A mutating call valid for the RUNNING row (audit-B4 claim
+            # failure semantics exercise the same path).
+            from autoclaimer.registry import TaskOutcome, TaskStatus
+
+            await store.record_failure(
+                record_a.id,
+                TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message="tx probe"),
+                retry_at=None,
+            )
             raise RuntimeError("boom")
     assert (await store.get_instance(record_a.id)).status is TaskInstanceState.RUNNING
 
@@ -633,64 +605,6 @@ async def test_mudae_deadlines_contain_corrupt_rows(
 # --- domain-scheduled retries (milestone 4: retry ownership) ---
 
 
-async def test_schedule_attempt_sets_waiting_until_absolute_deadline(tmp_path: Path) -> None:
-    """The Mudae task layer schedules retries from LEARNED deadlines
-    (parsed replies anchored to UTC) — not transport backoff. The
-    instance stays waiting and not due until the deadline passes."""
-    store = await make_store(tmp_path / "state.db")
-    clock = store._clock
-    assert isinstance(clock, FakeClock)
-    try:
-        record = await store.create_instance(1, "roll")
-        await store.schedule_attempt(record.id, _future(3600))
-        waiting = await store.get_instance(record.id)
-        assert waiting.status is TaskInstanceState.WAITING
-        assert waiting.next_attempt_at == _future(3600)
-
-        due = await store.due_instances()
-        assert record.id not in [r.id for r in due]  # not due yet
-
-        clock.advance(3601)  # deadline passes -> claimable again
-        due = await store.due_instances()
-        assert record.id in [r.id for r in due]
-    finally:
-        await store.close()
-
-
-async def test_schedule_attempt_replaces_previous_schedule(tmp_path: Path) -> None:
-    """Fresher domain information replaces an earlier deadline (an $rtu
-    re-check supersedes the previous assumption)."""
-    store = await make_store(tmp_path / "state.db")
-    try:
-        record = await store.create_instance(1, "roll")
-        await store.schedule_attempt(record.id, _future(7200))
-        await store.schedule_attempt(record.id, _future(1800))  # re-learned
-        waiting = await store.get_instance(record.id)
-        assert waiting.next_attempt_at == _future(1800)
-    finally:
-        await store.close()
-
-
-async def test_schedule_attempt_rejects_naive_and_terminal(tmp_path: Path) -> None:
-    store = await make_store(tmp_path / "state.db")
-    try:
-        record = await store.create_instance(1, "roll")
-        with pytest.raises(PersistenceError, match="timezone-naive"):
-            await store.schedule_attempt(record.id, datetime(2026, 10, 29, 12, 0, 0))
-
-        succeeded = await store.claim(record.id)
-        from autoclaimer.registry import TaskOutcome, TaskStatus
-
-        await store.record_success(succeeded.id, TaskOutcome(TaskStatus.SUCCEEDED, message="done"))
-        with pytest.raises(StateTransitionError):
-            await store.schedule_attempt(succeeded.id, _future(60))
-    finally:
-        await store.close()
-
-
-# Consolidated review #5: an available $rtu lookup clears a stale deadline
-
-
 async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
     """Persist a future RT deadline, then learn '$rt is available!':
     the clear operation removes the stale deadline — later reads cannot
@@ -714,5 +628,107 @@ async def test_clear_mudae_deadline_removes_stale_rt(tmp_path: Path) -> None:
 
         await store.clear_mudae_deadline(1, MudaeStateKind.RT)  # no-op
         assert MudaeStateKind.RT not in await store.mudae_deadlines(1)
+    finally:
+        await store.close()
+
+
+# Milestone 7: recurring tasks — success rescheduling
+
+
+async def test_reschedule_success_resets_attempts_and_waits(tmp_path: Path) -> None:
+    """A recurring round that SUCCEEDED with a learned deadline keeps
+    the instance alive: running -> waiting, attempt count reset (each
+    round is a fresh window), outcome recorded for observability."""
+    from autoclaimer.registry import TaskOutcome, TaskStatus
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        claimed = await store.claim(record.id)
+        assert claimed.attempt_count == 1
+        outcome = TaskOutcome(TaskStatus.SUCCEEDED, message="rolled", retry_at=_future(3600))
+        rescheduled = await store.reschedule_success(record.id, outcome, _future(3600))
+        assert rescheduled.status is TaskInstanceState.WAITING
+        assert rescheduled.attempt_count == 0  # fresh window
+        assert rescheduled.next_attempt_at == _future(3600)
+        assert rescheduled.last_outcome is not None
+        assert rescheduled.last_outcome.status is TaskStatus.SUCCEEDED
+
+        with pytest.raises(StateTransitionError):
+            # Only the running (claimed) row may be rescheduled.
+            await store.reschedule_success(record.id, outcome, _future(60))
+    finally:
+        await store.close()
+
+
+# Audit hardening: v3 -> v4 (ROLLS kind split) and v4 row survival
+
+
+async def test_v3_mudae_state_migrates_to_v4_keeping_rows(tmp_path: Path) -> None:
+    """A v3 database (claim/rt only) migrates to v4 with rows intact and
+    the widened kind CHECK accepting 'rolls'."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    db = tmp_path / "state.db"
+    store = TaskStateStore(db, clock=FakeClock())
+    await store.open()
+    await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(3600))
+    await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(1800))
+    await store.close()
+
+    conn = sqlite3.connect(db)  # roll back to v3
+    conn.execute("PRAGMA user_version = 3")
+    conn.commit()
+    conn.close()
+
+    store2 = TaskStateStore(db, clock=FakeClock())
+    await store2.open()
+    try:
+        assert store2.schema_version == 4
+        deadlines = await store2.mudae_deadlines(1)
+        assert deadlines[MudaeStateKind.RT] == _future(3600)
+        assert deadlines[MudaeStateKind.CLAIM] == _future(1800)
+        await store2.set_mudae_deadline(1, MudaeStateKind.ROLLS, _future(59))  # new kind OK
+        assert (await store2.mudae_deadlines(1))[MudaeStateKind.ROLLS] == _future(59)
+    finally:
+        await store2.close()
+
+
+async def test_reschedule_success_is_idempotent_on_identical_retry(tmp_path: Path) -> None:
+    """Audit fix: mirror _record_terminal's idempotent re-record — an
+    at-least-once retry of the same recurring-round commit must not
+    raise (the worker's record-retry path depends on it)."""
+    from autoclaimer.registry import TaskOutcome, TaskStatus
+
+    store = await make_store(tmp_path / "state.db")
+    try:
+        record = await store.create_instance(1, "roll")
+        await store.claim(record.id)
+        outcome = TaskOutcome(TaskStatus.SUCCEEDED, message="round done", retry_at=_future(60))
+        first = await store.reschedule_success(record.id, outcome, _future(60))
+        again = await store.reschedule_success(record.id, outcome, _future(60))
+        assert again.status is TaskInstanceState.WAITING
+        assert again.next_attempt_at == first.next_attempt_at
+        assert again.attempt_count == 0
+    finally:
+        await store.close()
+
+
+async def test_mudae_state_prunes_expired_rows(tmp_path: Path) -> None:
+    """Audit hygiene: expired mudae_state rows are pruned on write (like
+    scope_cooldowns) — stale deadlines do not accumulate."""
+    from autoclaimer.persistence import MudaeStateKind
+
+    store = await make_store(tmp_path / "state.db")
+    clock = store._clock  # noqa: SLF001
+    assert isinstance(clock, FakeClock)
+    try:
+        await store.set_mudae_deadline(1, MudaeStateKind.CLAIM, _future(600))
+        clock.advance(3600)  # deadline now long past
+        await store.set_mudae_deadline(1, MudaeStateKind.RT, _future(600))
+        conn = store._connection()  # noqa: SLF001
+        rows = conn.execute("SELECT kind FROM mudae_state WHERE account_id = 1").fetchall()
+        kinds = {row[0] for row in rows}
+        assert kinds == {"rt"}  # expired claim row pruned
     finally:
         await store.close()
