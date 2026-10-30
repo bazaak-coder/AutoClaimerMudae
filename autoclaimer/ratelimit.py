@@ -33,6 +33,8 @@ no enforcement evasion, threshold probing, or account rotation.
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -43,11 +45,17 @@ from typing import TypeVar
 
 from .adapters import CooldownError, RecoverableAdapterError
 from .models import AccountsConfig, AppConfig, RateLimitPolicy
-from .persistence import TaskStateStore, utc_now
+from .persistence import PersistenceError, TaskStateStore, utc_now
+
+logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
 GLOBAL_SCOPE = "global"
+
+#: Ceiling for any single recorded cooldown (repo-sweep: hostile
+#: Retry-After headers clamped; real Mudae windows are 5-20 h).
+_MAX_COOLDOWN_SECONDS = 86400.0
 
 
 def account_scope(account_id: int) -> str:
@@ -211,7 +219,17 @@ class RateLimiter:
                 raise ValueError("until must be a timezone-aware datetime")
             deadline = until
         elif retry_after_seconds is not None:
-            deadline = self._wall() + timedelta(seconds=retry_after_seconds)
+            # Repo-sweep fix: a hostile/corrupt Retry-After header can be
+            # inf/NaN/1e309 — timedelta(seconds=…) would raise inside
+            # this recording path, bypassing the retry machinery and
+            # failing the task permanently. Clamp to a sane ceiling.
+            try:
+                seconds = float(retry_after_seconds)
+            except (TypeError, ValueError):
+                seconds = 1.0
+            if not math.isfinite(seconds) or seconds < 0:
+                seconds = 1.0
+            deadline = self._wall() + timedelta(seconds=min(seconds, _MAX_COOLDOWN_SECONDS))
         else:
             raise ValueError("Provide exactly one of retry_after_seconds or until.")
         async with self._cooldown_lock:
@@ -221,7 +239,19 @@ class RateLimiter:
                 server_directed = server_directed or existing.server_directed
             self._cooldowns[scope] = _CooldownEntry(deadline, server_directed)
         if self._store is not None:
-            await self._store.set_scope_cooldown(scope, deadline, server_directed=server_directed)
+            # Repo-sweep fix: a transient store failure here previously
+            # escaped, discarded the CooldownError the caller was
+            # handling, and terminally killed the task — the in-memory
+            # record (which gates this process) still stands.
+            try:
+                await self._store.set_scope_cooldown(
+                    scope, deadline, server_directed=server_directed
+                )
+            except PersistenceError:
+                logger.warning(
+                    "could not persist scope cooldown; in-memory stands",
+                    extra={"operation": "ratelimit.record_cooldown", "outcome": "store_error"},
+                )
         return deadline
 
     async def load_persisted_cooldowns(self) -> None:
@@ -337,6 +367,11 @@ class RateLimiter:
             # still gate the operation (no bypass via queue position).
             await self._wait_for_cooldowns(scopes)
             await self._pace(account, effective.min_interval_seconds)
+            # Repo-sweep fix: a cooldown recorded while THIS waiter slept
+            # its reserved pace slot was never re-checked (the post-permit
+            # check happens before the sleep) — one more gate here closes
+            # the last bypass window.
+            await self._wait_for_cooldowns(scopes)
             yield OperationLease(scopes=tuple(sorted(set(scopes))), policy=effective)
         finally:
             if acquired:
