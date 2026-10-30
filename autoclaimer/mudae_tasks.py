@@ -800,6 +800,15 @@ def _make_roll_handler(
                     return _recoverable("roll-window reply without a duration")
                 try:
                     learned = _learn_deadline(cooldown.remaining, now=clock())
+                except _ZeroDuration:
+                    # BUG-001 (external audit): zero remaining = the roll
+                    # window is READY — clear and recheck at the interval,
+                    # never a permanent task failure.
+                    await store.clear_mudae_deadline(context.account_id, MudaeStateKind.ROLLS)
+                    return _round(
+                        "roll window ready now",
+                        clock() + timedelta(seconds=cfg.round_interval),
+                    )
                 except _UntrustedDuration:
                     return _recoverable("roll reply reported an implausible duration")
                 await store.set_mudae_deadline(context.account_id, MudaeStateKind.ROLLS, learned)
@@ -854,6 +863,16 @@ def _make_roll_handler(
                         if early is not None:
                             try:
                                 learned = _learn_deadline(early, now=clock())
+                            except _ZeroDuration:
+                                # BUG-001 (external audit): zero remaining =
+                                # the claim cooldown is over — clear it and
+                                # end the round at the interval, never a
+                                # permanent task failure.
+                                await store.clear_mudae_deadline(
+                                    context.account_id, MudaeStateKind.CLAIM
+                                )
+                                early_cooldown = True
+                                break
                             except _UntrustedDuration:
                                 return _recoverable(
                                     "claim cooldown reported an implausible duration"
