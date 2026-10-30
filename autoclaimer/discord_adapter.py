@@ -109,7 +109,7 @@ from .adapters import (
     SentMessage,
     UncertainOutcomeError,
 )
-from .credentials import CredentialProvider
+from .credentials import CredentialProvider, CredentialProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,16 @@ class DiscordAdapter:
                 # (transient close codes, network loss) reach this rebuild.
                 self._reset_for_restart()
             self._register_bridges()
-            token = self._credentials.get_token(self._account_id)
+            # Repo-sweep fix: a contract-following provider raises
+            # CredentialProviderError — missing/dead credentials are
+            # ACCOUNT-FATAL (the documented policy), not a generic
+            # per-instance permanent failure.
+            try:
+                token = self._credentials.get_token(self._account_id)
+            except CredentialProviderError as exc:
+                fatal = AccountFatalError(f"credential provider: {exc}")
+                self._latch_fatal(fatal)  # is_healthy flips; account stops
+                raise fatal from exc
             try:
                 await self._client.login(token)
             except discord.DiscordException as exc:

@@ -25,6 +25,7 @@ Commands (REPL)::
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -32,6 +33,8 @@ from typing import Any
 from .adapters import AdapterError, PlatformAdapter
 from .credentials import CredentialProvider
 from .logging_setup import redact_text
+
+logger = logging.getLogger(__name__)
 from .models import AccountsConfig, AppConfig
 from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
 from .ratelimit import RateLimiter, RateLimitError
@@ -61,6 +64,7 @@ class AutoClaimerController:
         self._accounts = accounts
         self._store = store
         self._limiter = limiter
+        self._credentials = credentials
         self._manager = WorkerManager(
             registry=registry,
             store=store,
@@ -92,14 +96,27 @@ class AutoClaimerController:
         return "framework stopped (graceful)"
 
     async def shutdown(self) -> None:
-        """Stop workers and close the store; idempotent."""
+        """Stop workers and close the store; idempotent.
+
+        Repo-sweep fixes: the credential provider's ``close()`` hook is
+        finally honored (providers holding keyring/session handles leak
+        otherwise), and a persistence failure during store close is
+        logged instead of escaping the REPL's finally block."""
         if self._closed:
             return
         self._closed = True
         try:
             await self._manager.stop()
         finally:
-            await self._store.close()  # always released (N7)
+            if self._credentials is not None:
+                try:
+                    self._credentials.close()
+                except Exception:
+                    logger.exception("credential provider close failed")
+            try:
+                await self._store.close()  # always released (N7)
+            except Exception:
+                logger.exception("store close failed during shutdown")
 
     # ----- account controls (valid before start) -----
 
