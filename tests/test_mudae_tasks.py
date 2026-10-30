@@ -1644,3 +1644,49 @@ async def test_simultaneous_cooldown_text_wins_over_reaction() -> None:
     assert (await store.mudae_deadlines(ACCOUNT))[MudaeStateKind.RT] == learned
     assert [m.content for m in adapter.sent_messages] == ["$rt"]  # no $rtu
     await store.close()
+
+
+# External audit (BUG-001): zero-duration roll cooldowns never fail the task
+
+
+async def test_roll_zero_quota_duration_reschedules_instead_of_failing() -> None:
+    """BUG-001: a recognized roll-quota reply with **0** min left means
+    the window is READY — clear ROLLS, reschedule at the interval, task
+    alive (the exception previously escaped and the worker recorded a
+    PERMANENT failure)."""
+    adapter = MockAdapter()
+    Emitter(adapter).on_send(
+        reply_event(
+            42, "**ExampleUser**, the roulette is limited to 2 uses per hour. **0** min left."
+        )
+    )
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.status.value == "succeeded"
+    assert outcome.message == "roll window ready now"
+    assert outcome.retry_at == NOW + timedelta(seconds=2.0)  # roll interval
+    assert MudaeStateKind.ROLLS not in await store.mudae_deadlines(ACCOUNT)  # never learned
+    await store.close()
+
+
+async def test_roll_zero_early_claim_duration_reschedules_instead_of_failing() -> None:
+    """BUG-001 (early-claim path): an attributed claim cooldown reporting
+    zero remaining clears the CLAIM deadline and ends the round at the
+    interval — never an escaped exception."""
+    adapter = MockAdapter()
+    card = reply_event(85, "", embeds=(CARD_EMBED,))
+    zero_cooldown = reply_event(86, "**ExampleUser**, you can't claim for another **0** min.")
+    Emitter(adapter).on_send(card)
+    follow = asyncio.create_task(emit_after_reaction(adapter, zero_cooldown))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    await follow
+    assert outcome.status.value == "succeeded"
+    assert "cooldown" in outcome.message
+    assert MudaeStateKind.CLAIM not in await store.mudae_deadlines(ACCOUNT)  # never learned
+    assert outcome.retry_at is not None and outcome.retry_at > NOW  # interval, not now
+    await store.close()
