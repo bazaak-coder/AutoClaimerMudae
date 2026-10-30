@@ -240,6 +240,37 @@ class WorkerManager:
                     resolved = resolve_task_config(self._app_config, profile, task_id)
                 except ConfigValidationError:
                     continue  # handled at execution via _terminal_without_claim
+                # Repo-sweep fix: `enabled: false` (task definition or
+                # account override) is now CONSUMED — disabled assignments
+                # materialize nothing and never execute (previously the
+                # flag was parsed and silently ignored).
+                if not resolved.enabled:
+                    logger.info(
+                        "task disabled by configuration; skipping",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": task_id,
+                            "operation": "startup.validate",
+                            "outcome": "disabled",
+                        },
+                    )
+                    continue
+                # Repo-sweep fix: an UNREGISTERED task type is a wiring
+                # gap, not a parameter defect — do NOT create-and-fail
+                # the instance (terminal rows are never re-created, so
+                # the previous behavior permanently poisoned state.db for
+                # the repo's own demo config).
+                if task_id not in self._registry:
+                    logger.error(
+                        "task type not registered; skipping materialization",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": task_id,
+                            "operation": "startup.validate",
+                            "outcome": "unregistered_task_type",
+                        },
+                    )
+                    continue
                 try:
                     self._registry.validate_config(task_id, resolved.parameters)
                 except Exception as exc:
@@ -362,6 +393,20 @@ class WorkerManager:
         if profile is None:
             return
         for task_id in profile.tasks:
+            try:
+                resolved = resolve_task_config(self._app_config, profile, task_id)
+            except ConfigValidationError:
+                # Startup validation already failed the instance; nothing
+                # to materialize here.
+                continue
+            # Repo-sweep fix: `enabled: false` (task or override) is
+            # consumed at materialization — disabled assignments never
+            # get an instance row, on start() or on runtime enable.
+            if not resolved.enabled:
+                continue
+            # Unregistered task types are a wiring gap, never a row.
+            if task_id not in self._registry:
+                continue
             await self._store.create_instance(account_id, task_id)
 
     def _profile(self, account_id: int) -> AccountProfile | None:
@@ -635,15 +680,20 @@ class WorkerManager:
                 return
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
-            # Worker-level retries are bounded by the resolved policy's
-            # retry_limit; beyond it the instance fails permanently (audit B8).
-            policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
-            if claimed.attempt_count >= policy.retry_limit + 1:
+            # Worker-level retries are bounded by the RESOLVED TASK
+            # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
+            # task → override chain was computed, test-asserted, and
+            # then ignored — the ratelimit-layer policy bound was used
+            # instead); beyond it the instance fails permanently (audit B8).
+            resolved_limit = resolve_task_config(
+                self._app_config, profile, record.task_id
+            ).retry_limit
+            if claimed.attempt_count >= resolved_limit + 1:
                 await self._record(
                     record.id,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"worker retry limit ({policy.retry_limit}) exhausted",
+                        message=f"worker retry limit ({resolved_limit}) exhausted",
                     ),
                     retry_at=None,
                 )

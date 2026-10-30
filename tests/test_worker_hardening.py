@@ -283,10 +283,13 @@ async def test_recoverable_forever_eventually_fails_permanently(tmp_path: Path) 
             "version": 1,
             "settings": {"shutdown_timeout_seconds": 2},
             "ratelimit": {
-                "retry_limit": 1,
                 "backoff_base_seconds": 0.01,
                 "backoff_cap_seconds": 0.01,
             },
+            # Repo-sweep fix: the WORKER-level retry bound comes from the
+            # resolved task config (task_defaults → task → override),
+            # not the ratelimit layer.
+            "task_defaults": {"retry_limit": 1},
             "tasks": {"job": {"parameters": {}}},
         }
     )

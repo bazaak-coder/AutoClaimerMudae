@@ -972,3 +972,158 @@ async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) ->
     assert record.last_outcome is not None
     assert record.last_outcome.status is TaskStatus.SUCCEEDED
     await store.close()
+
+
+# Repo-sweep: enabled=false is consumed; unregistered types never poison state
+
+
+async def test_disabled_task_never_materializes_or_executes(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {
+                "on_task": {"parameters": {}},
+                "off_task": {"enabled": False, "parameters": {}},
+            },
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["on_task", "off_task"]}]}, app
+    )
+    registry = TaskRegistry()
+    for tid in ("on_task", "off_task"):
+        registry.register(
+            TaskType(
+                id=tid,
+                description=f"Probe {tid}.",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "on_task", TaskInstanceState.SUCCEEDED)
+    await asyncio.sleep(0.05)
+    from autoclaimer.persistence import UnknownInstanceError
+
+    with pytest.raises(UnknownInstanceError):
+        await store.get_instance_by_ids(ACCOUNT, "off_task")  # no row
+    assert calls == [1]  # only on_task executed
+    await store.close()
+
+
+async def test_disabled_by_account_override_never_executes(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {
+            "version": 1,
+            "accounts": [
+                {"id": ACCOUNT, "tasks": ["job"], "overrides": {"job": {"enabled": False}}}
+            ],
+        },
+        app,
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await asyncio.sleep(0.2)
+    assert calls == []  # override honored
+    assert await store.due_instances(ACCOUNT) == ()  # nothing materialized
+    await store.close()
+
+
+async def test_unregistered_task_type_skips_without_poisoning(tmp_path: Path) -> None:
+    """Startup with a config referencing an unregistered task type: the
+    instance is NOT created-and-failed (terminal rows never re-create —
+    the demo config previously bricked state.db on first run)."""
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"known": {"parameters": {}}, "ghost": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["known", "ghost"]}]}, app
+    )
+    registry = TaskRegistry()
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry.register(
+        TaskType(
+            id="known",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "known", TaskInstanceState.SUCCEEDED)
+    from autoclaimer.persistence import UnknownInstanceError
+
+    with pytest.raises(UnknownInstanceError):
+        await store.get_instance_by_ids(ACCOUNT, "ghost")  # never created
+    await store.close()
