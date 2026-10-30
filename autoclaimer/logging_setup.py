@@ -27,13 +27,22 @@ _REDACTED_TOKEN = "[REDACTED-TOKEN]"
 _REDACTED_VALUE = "[REDACTED]"
 
 _WEBHOOK_RE = re.compile(r"https?://discord(?:app)?\.com/api/webhooks/\S+")
-# Discord-style token shape: three dot-separated base64url segments
-# (short user-ID segments included — the 20-char floor missed short IDs).
-_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{20,}\b")
+# Discord-style token shape: three dot-separated base64url segments.
+# Wide windows (audit fix): the middle cap {6,10} let 11+ char middle
+# segments escape entirely; short first segments (small snowflakes) and
+# 19-char third segments likewise — all widened with only a lower bound.
+_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+# Key-value credential matcher (audit fix): the value side consumes the
+# REST OF THE LINE — "Authorization: Bearer <secret>" previously
+# redacted only the word "Bearer", leaking the secret itself; and bare
+# "Bearer <secret>" lines (no separator) are redacted whole.
 _KEY_VALUE_RE = re.compile(
     r"(?i)\b(authorization|token|password|passwd|secret|cookie|session"
-    r"|session_id|api_key|apikey|client_secret|credential)\b['\"]?\s*[:=]\s*\S+"
+    r"|session_id|api_key|apikey|api-key|x-api-key|access_token|refresh_token"
+    r"|bot_token|discord_token|client_secret|private_key|credential"
+    r"|auth)\b['\"]?\s*[:=]\s*[^\n]*"
 )
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
 
 _STRUCTURED_FIELDS = ("account_id", "task_id", "operation", "outcome", "scope")
 
@@ -47,7 +56,31 @@ def redact_text(text: str) -> str:
         key = match.group(0).split(":", 1)[0].split("=", 1)[0].rstrip(" '\"")
         return f"{key}={_REDACTED_VALUE}"
 
-    return _KEY_VALUE_RE.sub(_redact_kv, text)
+    text = _KEY_VALUE_RE.sub(_redact_kv, text)
+    return _BEARER_RE.sub(lambda m: m.group(0).split()[0] + " " + _REDACTED_VALUE, text)
+
+
+class _RedactingRotatingFileHandler(RotatingFileHandler):
+    """Rotation failures must never dump raw records to stderr.
+
+    CPython's ``Handler.handleError`` prints ``Message: {record.msg!r}``
+    and ``Arguments: {record.args}`` UNREDACTED (audit fix: a full disk
+    leaked every subsequent record raw to stderr). Redact the payload
+    before delegating.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        try:
+            # Replace the raw pieces CPython prints with the fully
+            # redacted FORMATTED line — bare args (an opaque secret with
+            # no recognizable shape) would otherwise survive piecewise
+            # redaction (verified by the regression test).
+            record.msg = self.format(record)
+            record.args = None
+        except Exception:  # pragma: no cover - formatting already failed
+            record.msg = redact_text(str(record.msg))
+            record.args = None
+        super().handleError(record)
 
 
 class StructuredRedactingFormatter(logging.Formatter):
@@ -86,7 +119,7 @@ def setup_logging(
     log_path = Path(settings.log_file)
     if log_path.parent and not log_path.parent.exists():
         log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(
+    file_handler = _RedactingRotatingFileHandler(
         log_path,
         maxBytes=settings.max_bytes,
         backupCount=settings.backup_count,
@@ -104,7 +137,11 @@ def setup_logging(
 
     # Third-party library logs (discord.*) must pass the same redaction;
     # route them through this logger instead of the unredacted root.
+    # Leveled too (audit fix): without setLevel the effective level came
+    # from the unconfigured root (WARNING), silently dropping discord
+    # INFO/DEBUG regardless of settings.level.
     discord_logger = logging.getLogger("discord")
     discord_logger.handlers = list(logger.handlers)
+    discord_logger.setLevel(settings.level.upper())
     discord_logger.propagate = False
     return logger
