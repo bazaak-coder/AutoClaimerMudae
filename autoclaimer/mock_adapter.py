@@ -136,13 +136,24 @@ class MockAdapter:
             on_dispatch()
         return sent
 
-    async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
+    async def add_reaction(
+        self,
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         self._record(
             "add_reaction",
             {"channel_id": channel_id, "message_id": message_id, "emoji": emoji},
         )
         await self._next_outcome("add_reaction")
         self.reactions.append((channel_id, message_id, emoji))
+        # The wire boundary (BUG-005, mirroring send_message): traffic
+        # from here on genuinely answers THIS reaction.
+        if on_dispatch is not None:
+            on_dispatch()
 
     async def press_component(
         self, channel_id: int, message_id: int, component_id: str

@@ -597,8 +597,22 @@ class PlatformAdapter(Protocol):
         """
         ...
 
-    async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
-        """React to a message with *emoji*."""
+    async def add_reaction(
+        self,
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> None:
+        """React to a message with *emoji*.
+
+        ``on_dispatch`` (BUG-005 fix) fires immediately before the HTTP
+        request — the reaction's WIRE BOUNDARY, mirroring
+        ``send_message``. Callers correlating replies to the reaction
+        reject traffic arriving before it (it cannot answer this
+        operation).
+        """
         ...
 
     async def press_component(

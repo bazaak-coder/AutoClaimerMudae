@@ -129,10 +129,19 @@ class RateLimitedAdapter:
             lambda: self._inner.send_message(channel_id, content, on_dispatch=on_dispatch),
         )
 
-    async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
+    async def add_reaction(
+        self,
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         await self._run(
             "add_reaction",
-            lambda: self._inner.add_reaction(channel_id, message_id, emoji),
+            lambda: self._inner.add_reaction(
+                channel_id, message_id, emoji, on_dispatch=on_dispatch
+            ),
         )
 
     async def press_component(

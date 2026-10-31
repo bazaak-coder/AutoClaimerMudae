@@ -1690,3 +1690,107 @@ async def test_roll_zero_early_claim_duration_reschedules_instead_of_failing() -
     assert MudaeStateKind.CLAIM not in await store.mudae_deadlines(ACCOUNT)  # never learned
     assert outcome.retry_at is not None and outcome.retry_at > NOW  # interval, not now
     await store.close()
+
+
+# BUG-005 (external audit batch 4): the claim confirmation must not accept
+# traffic that predates the reaction's DISPATCH boundary.
+
+
+async def test_claim_ignores_confirmation_arriving_before_reaction_dispatch() -> None:
+    """A delayed duplicate of a PREVIOUS round's claim pair arrives while
+    the reaction operation is still pacing (not yet on the wire). It must
+    never satisfy THIS round's confirmation."""
+    adapter = MockAdapter()
+    card = reply_event(71, "", embeds=(CARD_EMBED,))
+    stale = reply_event(72, CLAIM_CONFIRMATION)  # delayed duplicate
+    Emitter(adapter).on_send(card)
+    real_add_reaction = adapter.add_reaction
+
+    async def add_reaction_with_pacing_traffic(
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: object = None,
+    ) -> None:
+        # Pre-wire traffic: the stale pair lands during the pacing wait,
+        # i.e. after the waiter subscribed but BEFORE the reaction request.
+        await adapter.emit(dataclasses.replace(stale, received_at=datetime.now(UTC)))
+        await asyncio.sleep(0.01)  # let the waiter's callback run
+        import inspect
+        from collections.abc import Callable
+        from typing import cast
+
+        if "on_dispatch" in inspect.signature(real_add_reaction).parameters:
+            await real_add_reaction(
+                channel_id,
+                message_id,
+                emoji,
+                on_dispatch=cast("Callable[[], None] | None", on_dispatch),
+            )
+        else:  # pre-fix adapter contract (fail-first compatibility)
+            await real_add_reaction(channel_id, message_id, emoji)
+
+    adapter.add_reaction = add_reaction_with_pacing_traffic  # type: ignore[method-assign]
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    with pytest.raises(UncertainOutcomeError, match="confirmation lost"):
+        await registry.execute(
+            context_for(
+                "roll",
+                adapter,
+                {
+                    "channel": CHANNEL,
+                    "author_id": MUDAE,
+                    "username": "ExampleUser",
+                    "reply_timeout_seconds": 0.1,
+                },
+            )
+        )
+    assert len(adapter.reactions) == 1  # the reaction itself still fired
+    await store.close()
+
+
+async def test_claim_accepts_confirmation_after_reaction_dispatch() -> None:
+    """Control: the SAME pair arriving after the reaction reaches the wire
+    is a valid confirmation (the gate must not over-reject)."""
+    adapter = MockAdapter()
+    card = reply_event(73, "", embeds=(CARD_EMBED,))
+    stale = reply_event(74, CLAIM_CONFIRMATION)  # pre-dispatch: ignored
+    fresh = reply_event(75, CLAIM_CONFIRMATION)  # post-dispatch: ours
+    Emitter(adapter).on_send(card)
+    real_add_reaction = adapter.add_reaction
+
+    async def add_reaction_with_pacing_traffic(
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: object = None,
+    ) -> None:
+        import inspect
+        from collections.abc import Callable
+        from typing import cast
+
+        await adapter.emit(dataclasses.replace(stale, received_at=datetime.now(UTC)))
+        await asyncio.sleep(0.01)
+        if "on_dispatch" in inspect.signature(real_add_reaction).parameters:
+            await real_add_reaction(
+                channel_id,
+                message_id,
+                emoji,
+                on_dispatch=cast("Callable[[], None] | None", on_dispatch),
+            )
+        else:  # pre-fix adapter contract (fail-first compatibility)
+            await real_add_reaction(channel_id, message_id, emoji)
+        # Post-wire: the genuine confirmation for THIS reaction.
+        await adapter.emit(dataclasses.replace(fresh, received_at=datetime.now(UTC)))
+
+    adapter.add_reaction = add_reaction_with_pacing_traffic  # type: ignore[method-assign]
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.message == "claimed"
+    await store.close()
