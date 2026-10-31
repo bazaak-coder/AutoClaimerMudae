@@ -138,6 +138,24 @@ class UnsupportedSchemaVersionError(PersistenceError):
     """The database schema version is newer than this code supports."""
 
 
+@dataclass(frozen=True)
+class IntegrityFinding:
+    """One problem found by the read-only integrity diagnostic.
+
+    Severity ``error``: the database or a row is unusable/undecodable.
+    Severity ``warning``: suspicious but harmless to operation (e.g.
+    leftovers from a removed account). Hints are actionable and NEVER
+    involve automatic deletion — potentially recoverable user data is
+    only ever touched by an explicit operator action.
+    """
+
+    severity: str  # "error" | "warning"
+    table: str
+    key: str
+    problem: str
+    hint: str
+
+
 class UnknownInstanceError(PersistenceError):
     """No task instance exists for the given identifier."""
 
@@ -662,6 +680,140 @@ class TaskStateStore:
                     f"'{current.status.value}'."
                 )
         return await self.get_instance(instance_id)
+
+    async def integrity_report(
+        self, known_account_ids: set[int] | None = None
+    ) -> tuple[IntegrityFinding, ...]:
+        """Read-only database diagnostic (roadmap item 2 — P0).
+
+        Never writes, never deletes, never repairs: every problem is
+        reported as an actionable finding for the operator. Covers:
+
+        - ``PRAGMA integrity_check`` (page-level corruption),
+        - undecodable task rows (corrupt JSON outcomes, malformed
+          timestamps, unsupported status values),
+        - malformed ``scope_cooldowns`` rows,
+        - malformed ``mudae_state`` rows,
+        - orphaned references: task/credential rows for accounts absent
+          from *known_account_ids* (when supplied by the caller, e.g.
+          from the parsed accounts.json).
+        """
+        findings: list[IntegrityFinding] = []
+
+        def _scan_rows(conn: sqlite3.Connection, out: list[IntegrityFinding]) -> None:
+            # 1. SQLite-level integrity.
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            problems = [str(r[0]) for r in rows if str(r[0]).lower() != "ok"]
+            if problems:
+                out.append(
+                    IntegrityFinding(
+                        severity="error",
+                        table="database",
+                        key="-",
+                        problem="; ".join(problems[:5]),
+                        hint="Restore state.db from a backup (see docs/running.md: "
+                        "Database diagnostics and recovery).",
+                    )
+                )
+            # 2. Task rows the application cannot decode.
+            for row in conn.execute(
+                "SELECT id, account_id, task_id FROM task_instances ORDER BY id"
+            ):
+                try:
+                    full = conn.execute(
+                        "SELECT * FROM task_instances WHERE id = ?", (row[0],)
+                    ).fetchone()
+                    _row_to_record(full)
+                except PersistenceError as exc:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="task_instances",
+                            key=f"id={row[0]} account={row[1]} task={row[2]!r}",
+                            problem=str(exc),
+                            hint="Quarantine the row (sqlite3 CLI) or restore the "
+                            "backup; runtime queries already skip it.",
+                        )
+                    )
+            # 3. Malformed cooldown rows.
+            for row in conn.execute("SELECT scope, deadline, server_directed FROM scope_cooldowns"):
+                try:
+                    _parse_ts(row[1])
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="scope_cooldowns",
+                            key=f"scope={row[0]!r}",
+                            problem=f"malformed deadline {row[1]!r}",
+                            hint="Delete the row with the sqlite3 CLI; the limiter "
+                            "re-learns cooldowns from the server.",
+                        )
+                    )
+                if row[2] not in (0, 1):
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="scope_cooldowns",
+                            key=f"scope={row[0]!r}",
+                            problem=f"server_directed flag is {row[2]!r} (expected 0/1)",
+                            hint="Delete the row with the sqlite3 CLI.",
+                        )
+                    )
+            # 4. Malformed mudae_state rows.
+            for row in conn.execute("SELECT account_id, kind, deadline FROM mudae_state"):
+                try:
+                    _parse_ts(row[2])
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="mudae_state",
+                            key=f"account={row[0]} kind={row[1]!r}",
+                            problem=f"malformed deadline {row[2]!r}",
+                            hint="Delete the row with the sqlite3 CLI; the task "
+                            "re-learns the window on its next round.",
+                        )
+                    )
+            # 5. Orphaned account references (needs the caller's account set).
+            if known_account_ids is not None:
+                for row in conn.execute(
+                    "SELECT DISTINCT account_id FROM task_instances "
+                    "UNION SELECT account_id FROM account_credentials"
+                ):
+                    if row[0] not in known_account_ids:
+                        out.append(
+                            IntegrityFinding(
+                                severity="warning",
+                                table="task_instances/account_credentials",
+                                key=f"account={row[0]}",
+                                problem="account is not present in accounts.json",
+                                hint="Leftovers from a removed account. Rows are "
+                                "harmless; remove them explicitly (sqlite3 CLI / "
+                                "'credential delete') if the account is gone for good.",
+                            )
+                        )
+
+        def _scan_sync() -> None:
+            conn = self._connection()
+            try:
+                _scan_rows(conn, findings)
+            except sqlite3.Error as exc:
+                # Heavy corruption can make even the diagnostic's own
+                # queries fail: that IS the finding, never a crash.
+                findings.append(
+                    IntegrityFinding(
+                        severity="error",
+                        table="database",
+                        key="-",
+                        problem=f"sqlite could not complete the scan: {exc}",
+                        hint="Restore state.db from a backup (see docs/running.md: "
+                        "Database diagnostics and recovery).",
+                    )
+                )
+
+        await self._call_threaded(_scan_sync)
+        return tuple(findings)
 
     async def fail_account_queue(self, account_id: int, message: str) -> int:
         """Bulk ``pending|waiting -> failed`` for one account's instances.

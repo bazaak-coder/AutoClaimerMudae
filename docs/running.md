@@ -142,6 +142,39 @@ exactly one claimer wins at a time (claim is an atomic compare-and-set) and
 terminal rows are never re-claimable. Full kill-signal coverage at the
 process boundary (SIGTERM/SIGINT handling) is roadmap item 10.
 
+### Database diagnostics and recovery
+
+The interactive CLI command **`integrity`** runs a strictly read-only
+diagnostic over `state.db`:
+
+- `PRAGMA integrity_check` (page-level corruption),
+- every `task_instances` row decoded (corrupt outcome JSON, malformed
+  timestamps, unsupported statuses),
+- `scope_cooldowns` and `mudae_state` row validation,
+- orphaned account references (rows for accounts absent from
+  `accounts.json` — reported as warnings; leftovers are harmless).
+
+Findings are printed with actionable hints. **Nothing is ever modified,
+repaired, or deleted automatically** — potentially recoverable data is only
+touched by an explicit operator action.
+
+**Recovery procedure:**
+
+1. Stop the application (so nothing races your repair).
+2. Run `integrity` and read each finding's hint.
+3. Page-level corruption (`database` findings): restore `state.db` from a
+   backup. There is no in-place repair for a damaged disk image; the
+   rollback journal already recovered everything it could at open.
+4. Malformed rows (per-row findings): remove or fix the specific row with
+   the `sqlite3` CLI — e.g.
+   `DELETE FROM scope_cooldowns WHERE scope = 'account:9';`. Deleted
+   cooldowns/state windows are safely re-learned from Mudae on the next
+   round; deleted task rows are re-created from configuration at startup.
+5. Orphaned account rows (warnings): harmless; remove explicitly only if
+   the account is gone for good (`credential delete <id>` for tokens,
+   `sqlite3` for task rows).
+6. Restart and re-run `integrity` — expect `OK`.
+
 Verified by test: startup recovery, retry-schedule persistence, restart
 during active work, transaction cancellation at every boundary. Full
 kill-signal coverage (SIGTERM/SIGINT/forced) is a tracked roadmap item

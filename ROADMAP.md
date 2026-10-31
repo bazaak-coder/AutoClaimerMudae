@@ -41,18 +41,20 @@ Investigate database behavior under abrupt process termination, rather than rely
 
 **Dependencies:** Existing SQLite persistence and runtime recovery implementation.
 
-### [ ] 2. Database Integrity Checks
+### [x] 2. Database Integrity Checks
 
 Add safeguards for detecting database corruption and inconsistent persisted state.
 
 **Acceptance criteria:**
 
-- [ ] Run `PRAGMA integrity_check` through a diagnostic operation.
-- [ ] Detect orphaned task and account references.
-- [ ] Detect invalid or unsupported persisted states.
-- [ ] Provide actionable diagnostic output.
-- [ ] Never automatically delete potentially recoverable user data.
-- [ ] Document a recovery procedure.
+- [x] Run `PRAGMA integrity_check` through a diagnostic operation. — `integrity` CLI command → `TaskStateStore.integrity_report()`; heavy corruption that fails the scan itself is contained as a finding, never a crash
+- [x] Detect orphaned task and account references. — rows for accounts absent from accounts.json (warnings with hints; opt-in via the caller's account set)
+- [x] Detect invalid or unsupported persisted states. — corrupt outcome JSON, malformed timestamps, invalid cooldown flags/state rows
+- [x] Provide actionable diagnostic output. — severity + table + key + problem + a concrete hint per finding
+- [x] Never automatically delete potentially recoverable user data. — the diagnostic is strictly read-only (asserted by tests)
+- [x] Document a recovery procedure. — `docs/running.md` → "Database diagnostics and recovery"
+
+**Completed:** 2026-10-31 (`tests/test_integrity.py` — 6 scenarios incl. page corruption, CLI surface, and read-only assertions).
 
 **Dependencies:** SQLite persistence layer.
 

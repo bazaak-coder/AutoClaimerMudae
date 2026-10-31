@@ -173,6 +173,20 @@ class AutoClaimerController:
         count = await self._credential_store.rotate()
         return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
 
+    async def integrity_report(self) -> list[str]:
+        """Read-only database diagnostic (roadmap item 2)."""
+        known = {account.id for account in self._accounts.accounts}
+        findings = await self._store.integrity_report(known_account_ids=known)
+        if not findings:
+            return ["integrity: OK — database, task rows, cooldowns, and state rows are consistent"]
+        lines = [f"integrity: {len(findings)} finding(s) (nothing was modified)"]
+        for finding in findings:
+            lines.append(
+                f"  [{finding.severity}] {finding.table} {finding.key}: "
+                f"{finding.problem}\n    → {finding.hint}"
+            )
+        return lines
+
     # ----- account controls (valid before start) -----
 
     def known_account(self, account_id: int) -> bool:
@@ -509,6 +523,11 @@ class CliSession:
             "expected set, has, delete, accounts, rotate, or generate-key"
         )
 
+    async def _cmd_integrity(self, args: list[str]) -> list[str]:
+        """Read-only database diagnostic: reports findings, modifies nothing."""
+        self._exact_args(args, 0)
+        return await self._controller.integrity_report()
+
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
             return TaskInstanceState(raw)
@@ -530,6 +549,7 @@ class CliSession:
         "errors": _cmd_errors,
         "status": _cmd_status,
         "credential": _cmd_credential,
+        "integrity": _cmd_integrity,
     }
 
 
@@ -550,6 +570,7 @@ USAGE = """commands:
   credential accounts             accounts with stored credentials
   credential rotate               re-encrypt all credentials under the primary key
   credential generate-key         print a fresh Fernet key (first-time setup only)
+  integrity                       read-only database diagnostic (never modifies data)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 
