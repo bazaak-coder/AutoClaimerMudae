@@ -121,6 +121,27 @@ session.
 | Crash mid-transaction | SQLite rollback-journal recovery; per-step migrations are transactional; startup shape-verification rejects tampered schemas. |
 | Restart between rounds | Learned Mudae windows, cooldowns, and retry schedules persist in `state.db` and resume on schedule. |
 
+### Crash recovery by interruption point (verified by SIGKILL tests)
+
+AutoClaimer runs SQLite's **rollback journal** (not WAL — the shared-memory
+mapping is unreliable in the target environment; recovery semantics below
+are the hot-journal model, pinned by test). Abrupt termination
+(`SIGKILL` — no cleanup of any kind runs) has exactly these outcomes,
+each covered by `tests/test_crash_recovery.py`:
+
+| Interruption point | On-disk state after kill | Behavior at next start |
+|---|---|---|
+| During an open write transaction | Hot journal present; uncommitted changes not in the database | Next `open()` rolls the journal back — the row is exactly as before; the store is fully usable. |
+| After a committed state update | Change durable (journal checkpointed) | The acknowledged change survives; nothing is lost. |
+| During task claiming (claim committed, no outcome yet) | Row stranded `running` with the attempt burned | `recover_interrupted()` flips it to `pending` (attempt count preserved); it becomes due exactly once. |
+| During completion (success write mid-transaction) | Claim durable, completion rolled back | Row returns to `pending` and re-executes — documented **at-least-once** semantics; a phantom success is impossible. |
+| Any other persisted status | — | Only `running` is touched by recovery; `pending`/`waiting`/terminal rows are exactly as persisted. |
+
+Duplicate-execution guarantees: a recovered row is claimable again, but
+exactly one claimer wins at a time (claim is an atomic compare-and-set) and
+terminal rows are never re-claimable. Full kill-signal coverage at the
+process boundary (SIGTERM/SIGINT handling) is roadmap item 10.
+
 Verified by test: startup recovery, retry-schedule persistence, restart
 during active work, transaction cancellation at every boundary. Full
 kill-signal coverage (SIGTERM/SIGINT/forced) is a tracked roadmap item
