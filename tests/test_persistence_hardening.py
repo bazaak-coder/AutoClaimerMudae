@@ -290,3 +290,120 @@ async def test_transaction_boundary_survives_repeated_cancellation(tmp_path: Pat
         assert (await store.get_instance(record.id)).status is TaskInstanceState.RUNNING
     finally:
         await store.close()
+
+
+# BUG-006 (external consolidated audit): cancellation must never break the
+# single-connection serialization — matrix completion for the plain-write
+# and close paths (transaction-body and BEGIN already covered above).
+
+
+async def test_cancelled_plain_write_serializes_against_next_op(tmp_path: Path) -> None:
+    """Cancel an ordinary (non-transactional) write mid-op; the NEXT
+    operation must not enter the connection until the abandoned write
+    finishes (the asyncio lock releasing early is not a license to
+    overlap the still-running thread call)."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "overlap_probe")
+        entered = threading.Event()
+        release = threading.Event()
+        first_done = threading.Event()
+        second_entered = threading.Event()
+        overlapped = threading.Event()
+        original = store._call_threaded  # noqa: SLF001
+        real_update = store._update_sync  # noqa: SLF001
+        real_fetch = store._fetchone_sync  # noqa: SLF001
+
+        def slow_update(sql: str, params: object) -> object:
+            if str(sql).startswith("UPDATE task_instances SET status = 'running'"):
+                entered.set()
+                assert release.wait(5.0)
+                result = real_update(sql, params)  # type: ignore[arg-type]
+                first_done.set()
+                return result
+            return real_update(sql, params)  # type: ignore[arg-type]
+
+        def probing_fetch(sql: str, params: object) -> object:
+            if str(sql).startswith("SELECT"):
+                second_entered.set()
+                if not first_done.is_set():
+                    overlapped.set()  # entered while the abandoned op ran
+            return real_fetch(sql, params)  # type: ignore[arg-type]
+
+        async def routed(fn: object, *args: object) -> object:
+            from collections.abc import Callable
+            from typing import Any, cast
+
+            if args and str(args[0]).startswith("UPDATE"):
+                return await original(slow_update, *args)
+            if args and str(args[0]).startswith("SELECT"):
+                return await original(probing_fetch, *args)
+            return await original(cast("Callable[..., Any]", fn), *args)
+
+        store._call_threaded = routed  # type: ignore[assignment,method-assign]
+        store._update_sync = slow_update  # type: ignore[assignment,method-assign]
+        store._fetchone_sync = probing_fetch  # type: ignore[assignment,method-assign]
+
+        cancelled_write = asyncio.create_task(store.claim(record.id))
+        assert await asyncio.to_thread(entered.wait, 5.0)
+        cancelled_write.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_write  # asyncio lock released; thread still busy
+
+        reader = asyncio.create_task(store.get_instance(record.id))
+        await asyncio.sleep(0.1)  # ample time to (wrongly) enter early
+        assert not second_entered.is_set(), "next op overlapped the abandoned write"
+        release.set()
+        record_after = await reader
+        assert await asyncio.to_thread(first_done.wait, 5.0)
+        assert not overlapped.is_set()
+        # The abandoned claim completed in the background (autocommit).
+        assert record_after.status is TaskInstanceState.RUNNING
+        assert record_after.attempt_count == 1
+    finally:
+        await store.close()
+
+
+async def test_close_waits_for_in_flight_operation(tmp_path: Path) -> None:
+    """close() must not close the connection underneath an in-flight
+    call: it waits for the abandoned op to drain, which then completes
+    normally instead of dying on a closed connection."""
+    store = await open_store(tmp_path)
+    record = await store.create_instance(ACCOUNT, "close_probe")
+    entered = threading.Event()
+    release = threading.Event()
+    op_done = threading.Event()
+    original = store._call_threaded  # noqa: SLF001
+
+    async def routed(fn: object, *args: object) -> object:
+        from collections.abc import Callable
+        from typing import Any, cast
+
+        if args and str(args[0]).startswith("UPDATE task_instances SET status = 'running'"):
+
+            def slow() -> object:
+                entered.set()
+                assert release.wait(5.0)
+                result = cast("Callable[..., Any]", fn)(*args)
+                op_done.set()
+                return result
+
+            return await original(slow)
+        return await original(cast("Callable[..., Any]", fn), *args)
+
+    store._call_threaded = routed  # type: ignore[assignment,method-assign]
+
+    cancelled_write = asyncio.create_task(store.claim(record.id))
+    assert await asyncio.to_thread(entered.wait, 5.0)
+    cancelled_write.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_write
+
+    closer = asyncio.create_task(store.close())
+    await asyncio.sleep(0.1)
+    assert not closer.done(), "close() completed while an op was still in flight"
+    release.set()
+    await closer
+    # The abandoned op finished cleanly (no closed-underneath failure).
+    assert await asyncio.to_thread(op_done.wait, 5.0)
+    await store.close()  # idempotent
