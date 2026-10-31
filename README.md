@@ -1,5 +1,10 @@
 # AutoClaimer — Phase 1: project foundation
 
+> **Application documentation:** usage, architecture, configuration,
+> credentials, and running instructions live in
+> [`docs/`](docs/index.md). This README remains the development-oriented
+> phase log and module status table.
+
 AutoClaimer is a lightweight, standalone Python framework for configuring and
 scheduling tasks across multiple Discord accounts (targeting the Mudae bot).
 This phase implements the typed configuration layer only. It intentionally
