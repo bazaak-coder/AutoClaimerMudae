@@ -407,3 +407,63 @@ async def test_close_waits_for_in_flight_operation(tmp_path: Path) -> None:
     # The abandoned op finished cleanly (no closed-underneath failure).
     assert await asyncio.to_thread(op_done.wait, 5.0)
     await store.close()  # idempotent
+
+
+# ChatGPT PR #6 review: cancellation during the BEGIN await itself must
+# not leak an open transaction (the abandoned BEGIN still executes).
+
+
+async def test_cancellation_during_begin_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """Cancel the task while its BEGIN IMMEDIATE is mid-op.
+
+    The abandoned BEGIN still executes in the worker thread. Without a
+    drain-and-rollback in the cancellation path, the connection is left
+    inside an open transaction and the NEXT transaction's BEGIN fails
+    with "cannot start a transaction within a transaction"."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "begin_probe")
+        began = threading.Event()
+        release = threading.Event()
+        begin_done = threading.Event()
+        original = store._call_threaded  # noqa: SLF001
+
+        async def orchestrated(fn: object, *args: object) -> object:
+            from collections.abc import Callable
+            from typing import Any, cast
+
+            if args and str(args[0]).startswith("BEGIN IMMEDIATE"):
+
+                def blocked_begin() -> object:
+                    began.set()
+                    assert release.wait(5.0)
+                    result = cast("Callable[..., Any]", fn)(*args)
+                    begin_done.set()  # the abandoned BEGIN HAS executed
+                    return result
+
+                return await original(blocked_begin)
+            return await original(cast("Callable[..., Any]", fn), *args)
+
+        store._call_threaded = orchestrated  # type: ignore[assignment,method-assign]
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+
+        task = asyncio.create_task(txn_body())
+        assert await asyncio.to_thread(began.wait, 5.0)
+        task.cancel()  # cancellation lands on the BEGIN await
+        release.set()  # the abandoned BEGIN now executes for real
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(begin_done.wait, 5.0)
+
+        # No leaked transaction: a FRESH transaction must BEGIN cleanly
+        # (and its write must actually commit — not join a zombie txn).
+        async with store.transaction():
+            await store.claim(record.id)
+        row = await store.get_instance(record.id)
+        assert row.status is TaskInstanceState.RUNNING
+        assert row.attempt_count == 1
+    finally:
+        await store.close()

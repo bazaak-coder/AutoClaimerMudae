@@ -443,6 +443,19 @@ class TaskStateStore:
                 await self._call_threaded(self._connection().execute, "BEGIN IMMEDIATE")
             except BaseException:
                 self._txn_owner.reset(token)
+                # PR #6 review edge case: cancellation never stops the
+                # abandoned ``to_thread`` call — the BEGIN may still
+                # EXECUTE after this coroutine unwinds, leaking an open
+                # transaction (the next BEGIN would fail; plain writes
+                # would silently join the zombie). The guarded ROLLBACK
+                # drains it in every ordering: queued behind the BEGIN
+                # on the connection guard if it has not run yet,
+                # rolling it back if it has, and harmlessly erroring
+                # only if no transaction is active.
+                try:
+                    await self._call_threaded(self._connection().execute, "ROLLBACK")
+                except sqlite3.Error:
+                    logger.exception("rollback after cancelled BEGIN also failed")
                 raise
             try:
                 yield
