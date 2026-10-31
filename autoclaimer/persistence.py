@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -231,6 +232,11 @@ class TaskStateStore:
         self._txn_owner: ContextVar[object | None] = ContextVar(
             "autoclaimer_txn_owner", default=None
         )
+        # Thread-level connection guard (repo-sweep cancellation fix):
+        # serializes every connection call across worker threads so an
+        # abandoned (cancelled-await) threaded op can never interleave
+        # with a later boundary or write. See ``_call_threaded``.
+        self._conn_guard = threading.RLock()
 
     # ----- lifecycle -----
 
@@ -259,7 +265,12 @@ class TaskStateStore:
                 await asyncio.to_thread(self._verify_shape_sync, self._conn)
             except (sqlite3.Error, PersistenceError) as exc:
                 if self._conn is not None:
-                    await asyncio.to_thread(self._conn.close)
+                    # Guarded close (repo-sweep): waits for any in-flight
+                    # call to drain instead of closing underneath it.
+                    try:
+                        await self._call_threaded(self._conn.close)
+                    except PersistenceError:
+                        logger.exception("connection close after failed open also failed")
                     self._conn = None
                 if isinstance(exc, sqlite3.Error):
                     raise _map_sqlite_error(exc) from exc
@@ -269,7 +280,9 @@ class TaskStateStore:
         """Close the connection; safe to call more than once."""
         async with self._lock:
             if self._conn is not None:
-                await asyncio.to_thread(self._conn.close)
+                # Guarded (repo-sweep): an abandoned in-flight call must
+                # finish before the connection closes underneath it.
+                await self._call_threaded(self._conn.close)
                 self._conn = None
 
     @property
@@ -338,8 +351,28 @@ class TaskStateStore:
     # ----- execution helpers -----
 
     async def _call_threaded(self, fn: Callable[..., _T], *args: Any) -> _T:
+        """Run *fn* on a worker thread, serialized by a CONNECTION GUARD.
+
+        Repo-sweep fix (ChatGPT unranked risk, promoted by deterministic
+        repro): cancelling the awaiting coroutine does NOT stop the
+        underlying ``to_thread`` operation — the asyncio lock releases
+        (or a transaction's ROLLBACK runs) while the abandoned call is
+        still in flight. That let a cancelled transaction's write land
+        afterwards in AUTOCOMMIT mode (orphaned write) and let the next
+        BEGIN race an abandoned ROLLBACK ("cannot start a transaction
+        within a transaction"). Acquiring a thread-level guard around
+        EVERY connection call establishes happens-before ordering:
+        boundaries never start until prior calls finish, and later
+        callers wait for abandoned calls to drain — cancellation can
+        abandon an await, never the connection's serialization.
+        """
+
+        def guarded() -> _T:
+            with self._conn_guard:
+                return fn(*args)
+
         try:
-            return await asyncio.to_thread(fn, *args)
+            return await asyncio.to_thread(guarded)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
 

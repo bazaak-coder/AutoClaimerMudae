@@ -1,7 +1,9 @@
 """Batch 3 regression tests (Phase 9 persistence hardening)."""
 
 import asyncio
+import itertools
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -157,3 +159,134 @@ def test_error_mapping_unchanged() -> None:
         _map_sqlite_error(sqlite3.OperationalError("database is locked")),
         PersistenceError,
     )
+
+
+# Repo-sweep: cancellation vs threaded SQLite ops (ChatGPT unranked risk)
+
+
+async def test_cancellation_mid_transaction_never_orphans_writes(tmp_path: Path) -> None:
+    """Cancel a transaction while its threaded write is mid-op.
+
+    The abandoned thread call must never outlive the rollback: with the
+    original code the ROLLBACK completed first and the late write landed
+    in AUTOCOMMIT mode — a cancelled transaction's write persisted."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "orphan_probe")
+        started = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        original = store._call_threaded  # noqa: SLF001
+
+        async def slow_claim(fn: object, *args: object) -> object:
+            if args and str(args[0]).startswith("UPDATE task_instances SET status = 'running'"):
+
+                def blocked() -> object:
+                    from collections.abc import Callable
+                    from typing import Any, cast
+
+                    started.set()
+                    assert release.wait(5.0)
+                    result = cast("Callable[..., Any]", fn)(*args)
+                    done.set()
+                    return result
+
+                return await original(blocked)
+            from collections.abc import Callable
+            from typing import Any, cast
+
+            return await original(cast("Callable[..., Any]", fn), *args)
+
+        store._call_threaded = slow_claim  # type: ignore[assignment,method-assign]
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+
+        task = asyncio.create_task(txn_body())
+        assert await asyncio.to_thread(started.wait, 5.0)
+        task.cancel()
+        # Let the cancellation reach the rollback boundary.
+        await asyncio.sleep(0.1)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(done.wait, 5.0)  # abandoned op fully applied
+        row = await store.get_instance(record.id)
+        assert row.status is TaskInstanceState.PENDING, "orphaned write persisted"
+        assert row.attempt_count == 0
+    finally:
+        await store.close()
+
+
+async def test_transaction_boundary_survives_repeated_cancellation(tmp_path: Path) -> None:
+    """A cancel while ROLLBACK is mid-flight must not let the NEXT
+    transaction race it.
+
+    Deterministic interleave: transaction 2 issues BEGIN IMMEDIATE while
+    transaction 1's abandoned ROLLBACK is still mid-op. Without
+    serialization the BEGIN hits ``cannot start a transaction within a
+    transaction``; with it, the BEGIN waits for the boundary and both
+    transactions behave (and a repeated cancel cannot strand anything)."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "boundary_probe")
+        rollback_started = threading.Event()
+        release = threading.Event()
+        rollback_done = threading.Event()
+        begin2_seen = threading.Event()
+        go2 = threading.Event()
+        original = store._call_threaded  # noqa: SLF001
+        begin_calls = itertools.count()
+
+        async def orchestrated(fn: object, *args: object) -> object:
+            from collections.abc import Callable
+            from typing import Any, cast
+
+            head = str(args[0]) if args else ""
+            if head.startswith("ROLLBACK"):
+
+                def blocked_rollback() -> object:
+                    rollback_started.set()
+                    assert release.wait(5.0)
+                    result = cast("Callable[..., Any]", fn)(*args)
+                    rollback_done.set()
+                    return result
+
+                return await original(blocked_rollback)
+            if head.startswith("BEGIN IMMEDIATE") and next(begin_calls) > 0:
+                # Issued while the abandoned rollback is still mid-op;
+                # the gate below lets the test pin that interleaving.
+                begin2_seen.set()
+                assert await asyncio.to_thread(go2.wait, 5.0)
+                return await original(cast("Callable[..., Any]", fn), *args)
+            return await original(cast("Callable[..., Any]", fn), *args)
+
+        store._call_threaded = orchestrated  # type: ignore[assignment,method-assign]
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+                raise RuntimeError("boom")
+
+        task = asyncio.create_task(txn_body())
+        assert await asyncio.to_thread(rollback_started.wait, 5.0)
+        task.cancel()  # cancel while ROLLBACK is mid-flight
+        task.cancel()  # ...and again: boundaries must complete anyway
+        with pytest.raises((RuntimeError, asyncio.CancelledError)):
+            await task
+
+        async def txn2_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+
+        task2 = asyncio.create_task(txn2_body())
+        assert await asyncio.to_thread(begin2_seen.wait, 5.0)
+        assert not rollback_done.is_set()  # BEGIN 2 raced the rollback
+        go2.set()
+        release.set()
+        assert await asyncio.to_thread(rollback_done.wait, 5.0)
+        await task2  # BEGIN 2 must succeed despite the race
+        assert (await store.get_instance(record.id)).status is TaskInstanceState.RUNNING
+    finally:
+        await store.close()
