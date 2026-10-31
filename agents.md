@@ -574,6 +574,7 @@ Final principle: Correctness, security, reproducibility, traceability, and owner
 
 17.1 Core principles
 
+- Define behavior before implementation. Every new runtime feature must define its FAILURE behavior, CANCELLATION behavior, PERSISTENCE behavior, and RECOVERY behavior before implementation begins — features that work in normal conditions but fail unpredictably during restarts or partial failures are defects by definition. Record the four behaviors in the feature's design note or PR description.
 - Classify before recovering. Every handled failure must have a defined category, an owning layer, and an explicit recovery policy. Do not treat every failure as transient or retryable.
 - Catch narrowly by default. Catch the most specific exception type that supports the intended recovery. Never use broad exception handling merely to suppress errors, keep execution moving, or avoid fixing an underlying defect.
 - Preserve failure context. Include the operation, account/task identifiers where applicable, relevant lifecycle state, and a traceback for unexpected exceptions. Never include Discord tokens, credentials, authorization headers, or sensitive message content in logs.
