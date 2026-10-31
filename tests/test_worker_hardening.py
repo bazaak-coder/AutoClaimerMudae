@@ -43,6 +43,7 @@ async def build_manager(
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 2},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
             "tasks": tasks if tasks is not None else {"job": {"parameters": {}}},
@@ -123,6 +124,7 @@ async def test_invalid_task_config_fails_terminally(tmp_path: Path) -> None:
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"shutdown_timeout_seconds": 2},
             "tasks": {"job": {"parameters": {"behavior": "noop"}}},
         }
@@ -281,6 +283,7 @@ async def test_recoverable_forever_eventually_fails_permanently(tmp_path: Path) 
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"shutdown_timeout_seconds": 2},
             "ratelimit": {
                 "backoff_base_seconds": 0.01,

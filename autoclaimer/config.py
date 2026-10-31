@@ -14,6 +14,7 @@ from .models import (
     AccountsConfig,
     AppConfig,
     AppSettings,
+    ChannelsConfig,
     ConfigValidationError,
     LoggingSettings,
     RateLimitPolicy,
@@ -114,8 +115,46 @@ def _contains_credential_key(value: Any, where: str) -> bool:
     return False
 
 
+def _parse_channels(raw: Any) -> ChannelsConfig:
+    """Global channel section: roll_claim required, mu/rt optional/null.
+
+    Fallback resolution (mu/rt -> roll_claim) lives in
+    ``ChannelsConfig.effective()`` — nowhere else.
+    """
+    obj = _object(raw, "config.channels")
+    _only_keys(obj, {"roll_claim", "mu", "rt"}, "config.channels")
+    if "roll_claim" not in obj:
+        raise ConfigValidationError(
+            "config.channels.roll_claim is required: set the channel used for "
+            "Mudae rolling and claim interactions. Optional dedicated channels: "
+            "config.channels.mu ($mu) and config.channels.rt ($rt/$rtu) — both "
+            "fall back to roll_claim when omitted or null."
+        )
+    mu: int | None = None
+    if "mu" in obj and obj["mu"] is not None:
+        mu = _snowflake(obj["mu"], "config.channels.mu")
+    rt: int | None = None
+    if "rt" in obj and obj["rt"] is not None:
+        rt = _snowflake(obj["rt"], "config.channels.rt")
+    return ChannelsConfig(
+        roll_claim=_snowflake(obj["roll_claim"], "config.channels.roll_claim"),
+        mu=mu,
+        rt=rt,
+    )
+
+
 def _parameters(value: Any, where: str) -> dict[str, Any]:
     obj = _object(value, where)
+    if "channel" in obj:
+        # Global-channel migration (breaking, explicit): the per-task
+        # channel parameter is gone — it silently defeated the
+        # every-account-same-channels guarantee. Never reinterpreted.
+        raise ConfigValidationError(
+            f"{where} may not set 'channel': channels are configured globally "
+            "in config.json (channels.roll_claim, optional channels.mu and "
+            "channels.rt). Remove the parameter; every account will use the "
+            "globally configured channels."
+        )
     for key in obj:
         lowered = key.lower()
         if any(hint in lowered for hint in _CREDENTIAL_KEY_HINTS):
@@ -267,7 +306,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     data = _object(dict(raw), "config")
     _only_keys(
         data,
-        {"version", "settings", "task_defaults", "tasks", "ratelimit", "logging"},
+        {"version", "settings", "task_defaults", "tasks", "channels", "ratelimit", "logging"},
         "config",
     )
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
@@ -275,6 +314,17 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         raise ConfigValidationError(
             f"Unsupported config.version {version}; supported version is 1."
         )
+
+    if "channels" not in data:
+        # Deliberate breaking migration (documented): no invented channel
+        # IDs, no arbitrary default — the user must name roll_claim.
+        raise ConfigValidationError(
+            "config.channels is required (global channel configuration shared "
+            "by every account). Add e.g. "
+            '{"channels": {"roll_claim": <channel-id>}} '
+            "— optional mu and rt channels default to roll_claim."
+        )
+    channels = _parse_channels(data["channels"])
 
     s = _object(data.get("settings", {}), "config.settings")
     _only_keys(
@@ -346,6 +396,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         settings=settings,
         task_defaults=defaults,
         tasks=tasks,
+        channels=channels,
         ratelimit=(
             _parse_ratelimit(data["ratelimit"], "config.ratelimit")
             if "ratelimit" in data

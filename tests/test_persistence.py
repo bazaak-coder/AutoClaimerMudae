@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 4  # v4: ROLLS kind split
+        assert version_row[0] == s.schema_version == 5  # v4: ROLLS kind split
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -118,7 +118,7 @@ async def test_v1_database_is_migrated_to_current(tmp_path: Path) -> None:
         assert len(rows) == 1
         version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == migrated.schema_version == 4  # v4: ROLLS kind split
+        assert version_row[0] == migrated.schema_version == 5  # v4: ROLLS kind split
     finally:
         await migrated.close()
 
@@ -684,7 +684,7 @@ async def test_v3_mudae_state_migrates_to_v4_keeping_rows(tmp_path: Path) -> Non
     store2 = TaskStateStore(db, clock=FakeClock())
     await store2.open()
     try:
-        assert store2.schema_version == 4
+        assert store2.schema_version == 5
         deadlines = await store2.mudae_deadlines(1)
         assert deadlines[MudaeStateKind.RT] == _future(3600)
         assert deadlines[MudaeStateKind.CLAIM] == _future(1800)

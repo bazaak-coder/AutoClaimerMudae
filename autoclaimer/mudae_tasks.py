@@ -981,10 +981,14 @@ def register_mudae_tasks(
     """
     from .registry import TaskType
 
-    for task_id, maker, description in (
-        ("roll", _make_roll_handler, "Send the roll command; claim claimable cards."),
-        ("rt", _make_rt_handler, "Use $rt and learn the reset window via $rtu."),
-        ("mu", _make_mu_handler, "Look up the claim cooldown ($mu)."),
+    # channel_role: the GLOBAL channel each task operates in — the worker
+    # injects the resolved ID (models.ChannelsConfig.effective().for_role).
+    # $rt and $rtu share the "rt" role inside one handler; rolling and
+    # claim interactions share "roll_claim".
+    for task_id, maker, description, role in (
+        ("roll", _make_roll_handler, "Send the roll command; claim claimable cards.", "roll_claim"),
+        ("rt", _make_rt_handler, "Use $rt and learn the reset window via $rtu.", "rt"),
+        ("mu", _make_mu_handler, "Look up the claim cooldown ($mu).", "mu"),
     ):
         validate, handler = maker(store, clock)
         registry.register(
@@ -993,6 +997,7 @@ def register_mudae_tasks(
                 description=description,
                 validate_config=validate,
                 handler=handler,
+                channel_role=role,
             )
         )
 

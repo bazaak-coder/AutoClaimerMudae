@@ -68,8 +68,9 @@ avoid speculative code.
 
 ## Configuration model
 
-Two files: `config.json` (global settings, task defaults, task definitions)
-and `accounts.json` (per-account assignments and overrides).
+Two files: `config.json` (global settings, global channels, task defaults,
+task definitions) and `accounts.json` (per-account assignments and
+overrides).
 
 - Account IDs are integers (Discord snowflakes).
 - Task IDs are short identifier strings.
@@ -83,6 +84,40 @@ global defaults (task_defaults)  <  task definition  <  account override
 - A setting omitted at an outer layer falls back to the layer above it.
 - Account overrides preserve explicit `false`; an omitted override key means
   "not overridden", not "false".
+
+### Global channels (every account, configured once)
+
+Channels are **global**: every account uses the same channel configuration.
+There are no per-account or per-task channel settings — a `channel` key in
+task `parameters` or account `overrides` is rejected with an actionable
+error (breaking change; previously `channel` was a per-task parameter).
+
+```json
+{
+  "version": 1,
+  "channels": {
+    "roll_claim": 123456789012345678,
+    "mu": null,
+    "rt": null
+  }
+}
+```
+
+| Setting | Purpose | Required | Falls back to |
+|---|---|---|---|
+| `roll_claim` | Mudae rolling AND claim interactions | yes | — |
+| `mu` | `$mu` commands | no | `roll_claim` |
+| `rt` | `$rt` and `$rtu` commands (same channel for both) | no | `roll_claim` |
+
+- `mu`/`rt` may be omitted or `null` (identical effect: use `roll_claim`).
+- An explicitly configured `mu` or `rt` is always respected.
+- Channel IDs must be positive integer snowflakes; strings, floats, and
+  booleans are rejected (`true` is not the snowflake `1`).
+- A config without a `channels` section is rejected with instructions —
+  channel IDs are never invented or defaulted silently.
+- Fallback resolution happens in exactly one place
+  (`ChannelsConfig.effective()`); task handlers receive the resolved
+  channel and never implement fallback logic themselves.
 
 ### Validation
 
@@ -99,9 +134,65 @@ global defaults (task_defaults)  <  task definition  <  account override
 Credentials must **never** be stored in plaintext JSON configuration. The
 parsers reject credential-like keys (`token`, `password`, `secret`, `cookie`,
 `authorization`, `api_key`, `credential`, ...) in any `parameters` block as a
-safety net. Account tokens are supplied at runtime by an implementation of
-the `CredentialProvider` protocol in `autoclaimer/credentials.py`; this
-project ships no secret-management implementation by design.
+safety net.
+
+### Encrypted account-token storage (Fernet + SQLite)
+
+`autoclaimer/credential_store.py` ships an encrypted token store backed by
+the same `state.db` as task state (schema v5 table `account_credentials`):
+
+- Tokens are encrypted with **Fernet** (authenticated encryption from the
+  `cryptography` package) **before** they touch SQLite. The database never
+  contains plaintext tokens, and the encryption key never lives in the
+  database, `config.json`, `accounts.json`, task state, or logs.
+- The key comes from the environment:
+  - `AUTOCLAIMER_FERNET_KEY` — the primary key (required). Missing or
+    invalid keys **fail closed**: credentials are simply unavailable;
+    there is no plaintext fallback and no automatic key generation.
+  - `AUTOCLAIMER_FERNET_RETIRED_KEYS` — optional comma-separated retired
+    keys, kept only so rotation can decrypt pre-rotation rows.
+- First-time setup: in the CLI run `credential generate-key`, store the
+    printed key outside the database (secret manager, restricted env file),
+    export it as `AUTOCLAIMER_FERNET_KEY`, and restart. Generating a key
+    never overwrites or invalidates an existing one — but losing the active
+    key makes existing credentials unrecoverable.
+- Managing tokens (interactive CLI, `state.db` next to `config.json`):
+
+  ```
+  credential set <account_id>        # prompts for the token (hidden input);
+                                      #  encrypts and upserts
+  credential has <account_id>
+  credential delete <account_id>
+  credential accounts
+  credential rotate
+  ```
+
+  Token entry uses a dedicated hidden-input reader (`getpass`): typed
+  characters are not echoed on a terminal. Without a controlling TTY,
+  getpass prints an explicit warning and reads echoed stdin — piped use
+  stays possible, visibly. The token is never accepted as a command
+  argument (keeping it out of shell history).
+
+- Adapters request tokens at login through the existing
+  `CredentialProvider` protocol — task handlers never see keys, ciphertext,
+  or credential rows. A missing/undecryptable credential is an
+  account-fatal error (the account stops; other accounts continue).
+- Removing an account from `accounts.json` does **not** delete its stored
+  token (a config typo must not destroy a secret) — deletion is the
+  explicit `credential delete` command.
+- **Key rotation** (implemented and tested, including interrupted-and-
+  resumed rotation): set the new key as `AUTOCLAIMER_FERNET_KEY`, move the
+  old key into `AUTOCLAIMER_FERNET_RETIRED_KEYS`, restart, run
+  `credential rotate`. Every row is decrypted with any loaded key,
+  re-encrypted under the primary, verified by decrypting the new ciphertext
+  back, and committed row-by-row (resumable; an interrupted pass leaves
+  remaining rows decryptable via the retired key). Rotation is complete
+  when it reports `0` re-encrypted; only then may the retired key be
+  discarded. Rotation fails loudly if a row cannot be decrypted (missing
+  retired key) — it never deletes or overwrites credentials it cannot read.
+- **Backups**: back up `state.db` AND the key material together; a database
+  without its key is unrecoverable ciphertext, and a key without the
+  database is useless. Store both with equivalent secrecy.
 
 ## Discord notifications
 

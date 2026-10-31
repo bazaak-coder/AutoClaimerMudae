@@ -1,5 +1,10 @@
 {
   "version": 1,
+  "channels": {
+    "roll_claim": 123456789012345678,
+    "mu": null,
+    "rt": null
+  },
   "settings": {
     "log_level": "INFO",
     "max_concurrent_accounts": 3,

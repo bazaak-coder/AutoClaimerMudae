@@ -407,3 +407,139 @@ async def test_close_waits_for_in_flight_operation(tmp_path: Path) -> None:
     # The abandoned op finished cleanly (no closed-underneath failure).
     assert await asyncio.to_thread(op_done.wait, 5.0)
     await store.close()  # idempotent
+
+
+# ChatGPT PR #6 review: cancellation during the BEGIN await itself must
+# not leak an open transaction (the abandoned BEGIN still executes).
+
+
+async def test_cancellation_during_begin_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """Cancel the task while its BEGIN IMMEDIATE is mid-op.
+
+    The abandoned BEGIN still executes in the worker thread. Without a
+    drain-and-rollback in the cancellation path, the connection is left
+    inside an open transaction and the NEXT transaction's BEGIN fails
+    with "cannot start a transaction within a transaction"."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "begin_probe")
+        began = threading.Event()
+        release = threading.Event()
+        begin_done = threading.Event()
+        original = store._call_threaded  # noqa: SLF001
+
+        async def orchestrated(fn: object, *args: object) -> object:
+            from collections.abc import Callable
+            from typing import Any, cast
+
+            if args and str(args[0]).startswith("BEGIN IMMEDIATE"):
+
+                def blocked_begin() -> object:
+                    began.set()
+                    assert release.wait(5.0)
+                    result = cast("Callable[..., Any]", fn)(*args)
+                    begin_done.set()  # the abandoned BEGIN HAS executed
+                    return result
+
+                return await original(blocked_begin)
+            return await original(cast("Callable[..., Any]", fn), *args)
+
+        store._call_threaded = orchestrated  # type: ignore[assignment,method-assign]
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+
+        task = asyncio.create_task(txn_body())
+        assert await asyncio.to_thread(began.wait, 5.0)
+        task.cancel()  # cancellation lands on the BEGIN await
+        release.set()  # the abandoned BEGIN now executes for real
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(begin_done.wait, 5.0)
+
+        # No leaked transaction: a FRESH transaction must BEGIN cleanly
+        # (and its write must actually commit — not join a zombie txn).
+        async with store.transaction():
+            await store.claim(record.id)
+        row = await store.get_instance(record.id)
+        assert row.status is TaskInstanceState.RUNNING
+        assert row.attempt_count == 1
+    finally:
+        await store.close()
+
+
+# ChatGPT PR #5 re-review VERIFY-001: the cleanup ROLLBACK can acquire the
+# connection guard BEFORE the abandoned BEGIN thread (threading.RLock
+# gives no FIFO guarantee) — the rollback then no-ops, the BEGIN lands
+# afterwards, and an open transaction leaks DESPITE the cleanup.
+
+
+class _ReorderableGuard:
+    """Drop-in RLock stand-in that parks the FIRST acquirer until allowed,
+    forcing the exact non-FIFO ordering VERIFY-001 describes."""
+
+    def __init__(self) -> None:
+        self._inner = threading.RLock()
+        self._mu = threading.Lock()
+        self.acquires = 0
+        self.first_parked = threading.Event()
+        self.allow_first = threading.Event()
+        self.second_done = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        with self._mu:
+            self.acquires += 1
+            n = self.acquires
+        if n == 1:
+            self.first_parked.set()
+            assert self.allow_first.wait(5.0)  # BEGIN thread parked pre-guard
+        return self._inner.acquire()
+
+    def release(self) -> None:
+        self._inner.release()
+        if self.acquires >= 2:
+            self.second_done.set()  # the LATE acquirer finished its section
+
+    def __enter__(self) -> "_ReorderableGuard":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
+async def test_guard_reorder_rollback_before_begin_still_cleans_up(tmp_path: Path) -> None:
+    """Deterministic VERIFY-001 interleaving: the cleanup ROLLBACK reaches
+    the connection BEFORE the abandoned BEGIN does. The store must still
+    end with no open transaction."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "reorder_probe")
+        guard = _ReorderableGuard()
+        store._conn_guard = guard  # type: ignore[assignment]
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+
+        task = asyncio.create_task(txn_body())
+        assert await asyncio.to_thread(guard.first_parked.wait, 5.0)
+        task.cancel()  # lands on the BEGIN await; BEGIN thread parked
+        # Buggy path: the cleanup ROLLBACK acquires the guard immediately
+        # (second acquirer) and finishes while the BEGIN is still parked.
+        # Fixed path: the cleanup drains the BEGIN first, so no second
+        # acquirer can complete before allow_first.
+        await asyncio.to_thread(guard.second_done.wait, 0.5)
+        guard.allow_first.set()  # the abandoned BEGIN executes NOW
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # No leaked transaction despite the adversarial guard order.
+        async with store.transaction():
+            await store.claim(record.id)
+        row = await store.get_instance(record.id)
+        assert row.status is TaskInstanceState.RUNNING
+        assert row.attempt_count == 1
+    finally:
+        await store.close()

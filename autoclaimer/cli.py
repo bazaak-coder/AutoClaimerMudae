@@ -25,13 +25,15 @@ Commands (REPL)::
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .adapters import AdapterError, PlatformAdapter
-from .credentials import CredentialProvider
+from .credential_store import SQLiteCredentialStore
+from .credentials import CredentialProvider, CredentialProviderError
 from .logging_setup import redact_text
 from .models import AccountsConfig, AppConfig
 from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
@@ -58,6 +60,7 @@ class AutoClaimerController:
         registry: TaskRegistry,
         adapter_factory: Callable[[int], PlatformAdapter],
         credentials: CredentialProvider | None = None,
+        credential_store: SQLiteCredentialStore | None = None,
         idle_interval_seconds: float = 30.0,
     ) -> None:
         self._app_config = app_config
@@ -65,6 +68,10 @@ class AutoClaimerController:
         self._store = store
         self._limiter = limiter
         self._credentials = credentials
+        # Encrypted credential administration (optional: absent when no
+        # valid Fernet key is configured — credential commands then
+        # explain instead of failing opaquely).
+        self._credential_store = credential_store
         self._manager = WorkerManager(
             registry=registry,
             store=store,
@@ -113,10 +120,58 @@ class AutoClaimerController:
                     self._credentials.close()
                 except Exception:
                     logger.exception("credential provider close failed")
+            if self._credential_store is not None:
+                # close() is idempotent — double close via the provider
+                # path (when the store IS the provider) is harmless.
+                try:
+                    self._credential_store.close()
+                except Exception:
+                    logger.exception("credential store close failed")
             try:
                 await self._store.close()  # always released (N7)
             except Exception:
                 logger.exception("store close failed during shutdown")
+
+    # ----- credential administration (encrypted store) -----
+
+    def credential_store_ready(self) -> bool:
+        return self._credential_store is not None
+
+    async def credential_set(self, account_id: int, token: str) -> str:
+        assert self._credential_store is not None
+        await self._credential_store.set_token(account_id, token)
+        return f"credential stored (encrypted) for account {account_id}"
+
+    async def credential_delete(self, account_id: int) -> str:
+        assert self._credential_store is not None
+        removed = await self._credential_store.delete_token(account_id)
+        return (
+            f"credential deleted for account {account_id}"
+            if removed
+            else f"no stored credential for account {account_id}"
+        )
+
+    async def credential_has(self, account_id: int) -> str:
+        assert self._credential_store is not None
+        present = await self._credential_store.has_token(account_id)
+        return (
+            f"account {account_id}: credential stored (encrypted)"
+            if present
+            else f"account {account_id}: no stored credential"
+        )
+
+    async def credential_accounts(self) -> list[str]:
+        assert self._credential_store is not None
+        ids = await self._credential_store.account_ids()
+        return [
+            f"{len(ids)} account(s) with stored (encrypted) credentials",
+            *(f"  {account_id}" for account_id in sorted(ids)),
+        ]
+
+    async def credential_rotate(self) -> str:
+        assert self._credential_store is not None
+        count = await self._credential_store.rotate()
+        return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
 
     # ----- account controls (valid before start) -----
 
@@ -234,9 +289,14 @@ class CliSession:
         *,
         read_line: LineReader,
         write: LineWriter,
+        read_secret: LineReader | None = None,
     ) -> None:
         self._controller = controller
         self._read_line = read_line
+        # Secret input has its OWN reader (BUG-008 fix): the plain line
+        # reader echoes on a TTY; the default secret reader disables echo
+        # via getpass. Injectable separately for deterministic tests.
+        self._read_secret = read_secret if read_secret is not None else stdin_secret_reader
         self._write = write
 
     def _emit(self, lines: list[str] | str) -> None:
@@ -290,9 +350,9 @@ class CliSession:
                 self._emit(result)
         except ValueError as exc:
             self._emit(f"error: {exc}")
-        except (PersistenceError, RateLimitError, AdapterError) as exc:
-            # Transient store/limiter/adapter problems must not kill the
-            # REPL or skip the graceful shutdown path.
+        except (PersistenceError, RateLimitError, AdapterError, CredentialProviderError) as exc:
+            # Transient store/limiter/adapter/credential problems must not
+            # kill the REPL or skip the graceful shutdown path.
             self._emit(f"error: {type(exc).__name__}: {exc}")
         return True
 
@@ -373,6 +433,82 @@ class CliSession:
             raise ValueError(f"unknown account {account_id}")
         return account_id
 
+    def _any_account_arg(self, raw: str) -> int:
+        """Snowflake validation WITHOUT requiring the account in config:
+        credentials may be registered before the account is added."""
+        try:
+            account_id = int(raw)
+        except ValueError:
+            raise ValueError(f"account id must be an integer, got {raw!r}") from None
+        if account_id <= 0:
+            raise ValueError("account id must be a positive integer")
+        return account_id
+
+    async def _cmd_credential(self, args: list[str]) -> str | list[str]:
+        """Encrypted credential administration (Fernet key required)."""
+        from .credential_store import CredentialKeyError, generate_fernet_key
+
+        if not args:
+            return "usage: credential set|has|delete|accounts|rotate|generate-key <account>"
+        action = args[0].lower()
+        if action == "generate-key":
+            self._exact_args(args, 1)
+            return (
+                "new Fernet key (store it OUTSIDE the database, e.g. a secret "
+                "manager; NEVER overwrite an in-use key — existing credentials "
+                "become unrecoverable):\n  "
+                + generate_fernet_key()
+                + ("\nset it as AUTOCLAIMER_FERNET_KEY and restart.")
+            )
+        if action == "set":
+            self._exact_args(args, 2)
+            account_id = self._any_account_arg(args[1])
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY "
+                    "(see 'credential generate-key') and restart"
+                )
+            token = await self._read_secret(f"token for account {account_id} (input hidden): ")
+            token = token.strip()
+            if not token:
+                raise ValueError("empty token — nothing stored")
+            return await self._controller.credential_set(account_id, token)
+        if action == "has":
+            self._exact_args(args, 2)
+            account_id = self._any_account_arg(args[1])
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY and restart"
+                )
+            return await self._controller.credential_has(account_id)
+        if action == "delete":
+            self._exact_args(args, 2)
+            account_id = self._any_account_arg(args[1])
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY and restart"
+                )
+            return await self._controller.credential_delete(account_id)
+        if action == "accounts":
+            self._exact_args(args, 1)
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY and restart"
+                )
+            return await self._controller.credential_accounts()
+        if action == "rotate":
+            self._exact_args(args, 1)
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    "credential rotation unavailable: set AUTOCLAIMER_FERNET_KEY "
+                    "(new primary) and AUTOCLAIMER_FERNET_RETIRED_KEYS (old keys)"
+                )
+            return await self._controller.credential_rotate()
+        raise ValueError(
+            f"unknown credential action {action!r}; "
+            "expected set, has, delete, accounts, rotate, or generate-key"
+        )
+
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
             return TaskInstanceState(raw)
@@ -393,6 +529,7 @@ class CliSession:
         "cooldowns": _cmd_cooldowns,
         "errors": _cmd_errors,
         "status": _cmd_status,
+        "credential": _cmd_credential,
     }
 
 
@@ -407,6 +544,12 @@ USAGE = """commands:
   cooldowns                       active cooldowns and permits
   errors                          recent failures and retry times
   status                          worker status snapshot
+  credential set <account>        store a token (Fernet-encrypted; prompts for the token)
+  credential has <account>        whether a credential is stored
+  credential delete <account>     delete the stored credential
+  credential accounts             accounts with stored credentials
+  credential rotate               re-encrypt all credentials under the primary key
+  credential generate-key         print a fresh Fernet key (first-time setup only)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 
@@ -414,3 +557,12 @@ USAGE = """commands:
 async def stdin_reader(prompt: str) -> str:
     """Default line reader: blocking ``input`` off the event loop."""
     return await asyncio.to_thread(input, prompt)
+
+
+async def stdin_secret_reader(prompt: str) -> str:
+    """Default SECRET reader (BUG-008 fix): ``getpass`` disables terminal
+    echo, so an entered token is not displayed or captured in terminal
+    recordings. Without a controlling TTY, getpass prints an explicit
+    warning and falls back to echoed stdin — piped/automated use stays
+    possible, visibly."""
+    return await asyncio.to_thread(getpass.getpass, prompt)

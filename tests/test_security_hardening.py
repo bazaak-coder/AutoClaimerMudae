@@ -13,7 +13,11 @@ ACCOUNT = 271485504361996288
 
 
 def base_app() -> dict[str, Any]:
-    return {"version": 1, "tasks": {"job": {"parameters": {}}}}
+    return {
+        "version": 1,
+        "channels": {"roll_claim": 111111111111111111},
+        "tasks": {"job": {"parameters": {}}},
+    }
 
 
 # D1: log_file traversal rejected
