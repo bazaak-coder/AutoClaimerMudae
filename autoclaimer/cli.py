@@ -173,6 +173,26 @@ class AutoClaimerController:
         count = await self._credential_store.rotate()
         return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
 
+    async def credential_export(self, path: str) -> str:
+        """Ciphertext-only export (roadmap item 4). Confirmation is
+        enforced by the CLI layer; this stays a single loud operation."""
+        assert self._credential_store is not None
+        count = await self._credential_store.export_ciphertext(path)
+        return (
+            f"exported {count} credential(s) as CIPHERTEXT to {path} — the file "
+            "contains no plaintext tokens; protect it exactly like the "
+            "database (it is only usable together with the key)"
+        )
+
+    async def credential_import(self, path: str) -> str:
+        assert self._credential_store is not None
+        imported, skipped = await self._credential_store.import_ciphertext(path)
+        return (
+            f"imported {imported} credential(s) from {path} "
+            f"({skipped} already current); every record was validated and "
+            "re-encrypted under the current primary key"
+        )
+
     async def integrity_report(self) -> list[str]:
         """Read-only database diagnostic (roadmap item 2)."""
         known = {account.id for account in self._accounts.accounts}
@@ -518,6 +538,21 @@ class CliSession:
                     "(new primary) and AUTOCLAIMER_FERNET_RETIRED_KEYS (old keys)"
                 )
             return await self._controller.credential_rotate()
+        if action in ("export", "import"):
+            # Destructive-adjacent operations: an explicit literal
+            # ``confirm`` is required so they can never run by accident.
+            if len(args) != 3 or args[2] != "confirm":
+                raise ValueError(
+                    f"credential {action} requires an explicit confirmation: "
+                    f"'credential {action} <path> confirm'"
+                )
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    f"credential {action} unavailable: set AUTOCLAIMER_FERNET_KEY and restart"
+                )
+            if action == "export":
+                return await self._controller.credential_export(args[1])
+            return await self._controller.credential_import(args[1])
         raise ValueError(
             f"unknown credential action {action!r}; "
             "expected set, has, delete, accounts, rotate, or generate-key"
@@ -569,6 +604,10 @@ USAGE = """commands:
   credential delete <account>     delete the stored credential
   credential accounts             accounts with stored credentials
   credential rotate               re-encrypt all credentials under the primary key
+  credential export <path> confirm
+                                  write all credentials as CIPHERTEXT (no plaintext)
+  credential import <path> confirm
+                                  restore credentials (validated, re-encrypted under primary)
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
   help                            this help

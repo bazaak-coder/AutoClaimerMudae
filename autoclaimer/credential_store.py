@@ -71,8 +71,10 @@ class CredentialDecryptError(CredentialProviderError):
     key, or corrupted ciphertext). Never carries token or key material."""
 
 
-def _validate_account_id(account_id: int) -> int:
-    # bool is a subclass of int — reject it explicitly.
+def _validate_account_id(account_id: object) -> int:
+    """Validate an account id from UNTRUSTED input (JSON bundles included):
+    true int in snowflake range — ``bool`` is a subclass of ``int`` and is
+    rejected explicitly."""
     if type(account_id) is not int or not 0 < account_id <= _MAX_SNOWFLAKE:
         raise ValueError(
             f"account id must be a positive Discord snowflake integer, got {account_id!r}"
@@ -464,6 +466,171 @@ class SQLiteCredentialStore:
             return await asyncio.to_thread(_ids)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
+
+    # ----- ciphertext backup / restore (roadmap item 4) -----------------
+
+    _EXPORT_FORMAT = 1
+
+    async def export_ciphertext(self, path: str | Path) -> int:
+        """Write every credential row to *path* as CIPHERTEXT-only JSON.
+
+        The plaintext tokens are never exported: the file carries the
+        stored ciphertext (base64), key versions, and timestamps. It is
+        only usable together with a key that can decrypt it — protect the
+        file like the database itself. Returns the exported row count.
+        """
+        import base64
+        import json as _json
+
+        def _dump() -> list[dict[str, object]]:
+            conn = self._connection()
+            with self._guard:
+                return [
+                    {
+                        "account_id": int(r[0]),
+                        "encrypted_token": base64.b64encode(bytes(r[1])).decode("ascii"),
+                        "key_version": int(r[2]),
+                        "created_at": str(r[3]),
+                        "updated_at": str(r[4]),
+                    }
+                    for r in conn.execute(
+                        "SELECT account_id, encrypted_token, key_version, "
+                        "created_at, updated_at FROM account_credentials "
+                        "ORDER BY account_id"
+                    )
+                ]
+
+        try:
+            records = await asyncio.to_thread(_dump)
+        except sqlite3.Error as exc:
+            raise _map_sqlite_error(exc) from exc
+        payload = {
+            "version": self._EXPORT_FORMAT,
+            "exported_at": self._clock().isoformat(),
+            "accounts": records,
+        }
+        Path(path).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info(
+            "credential ciphertext exported",
+            extra={"operation": "credential.export", "outcome": str(len(records))},
+        )
+        return len(records)
+
+    async def import_ciphertext(self, path: str | Path) -> tuple[int, int]:
+        """Restore credentials from an export bundle. Validate, then write.
+
+        Every record is validated by DECRYPTING it with the configured
+        keys before anything is written — a bundle that does not match
+        the configured keys, or contains malformed records, is rejected
+        whole (typed error, zero rows written, no partial import).
+        Accepted records are re-encrypted under the CURRENT primary key
+        (verified before commit), so the restored store is
+        self-consistent with the keys in the environment. Re-importing
+        is idempotent: already-current rows are skipped.
+
+        Returns ``(imported, skipped_current)``.
+        """
+        import base64
+        import json as _json
+
+        try:
+            payload = _json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("version") != self._EXPORT_FORMAT:
+            raise CredentialProviderError(
+                "credential bundle format not recognized (expected version "
+                f"{self._EXPORT_FORMAT}; produced by 'credential export')"
+            )
+        raw_accounts = payload.get("accounts")
+        if not isinstance(raw_accounts, list):
+            raise CredentialProviderError("credential bundle has no 'accounts' list")
+
+        # Phase 1: validate every record WITHOUT writing anything.
+        staged: list[tuple[int, bytes]] = []
+        for index, record in enumerate(raw_accounts):
+            if not isinstance(record, dict):
+                raise CredentialProviderError(f"bundle record {index} is not an object")
+            account_id = record.get("account_id")
+            blob_b64 = record.get("encrypted_token")
+            account_id = _validate_account_id(account_id)
+            if not isinstance(blob_b64, str):
+                raise CredentialProviderError(
+                    f"bundle record for account {account_id} has no ciphertext"
+                )
+            try:
+                blob = base64.b64decode(blob_b64, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise CredentialProviderError(
+                    f"bundle record for account {account_id} is malformed"
+                ) from exc
+            try:
+                self._keys.multi.decrypt(blob)  # decryptable with configured keys?
+            except InvalidToken as exc:
+                raise CredentialDecryptError(
+                    f"bundle record for account {account_id} cannot be decrypted "
+                    "with the configured keys — restore the matching "
+                    "AUTOCLAIMER_FERNET_KEY (or retired keys) and retry"
+                ) from exc
+            staged.append((account_id, blob))
+
+        # Phase 2: upsert accepted records, re-encrypted under the primary.
+        imported = 0
+        skipped = 0
+        for account_id, blob in staged:
+            if self._upsert_restored_row(account_id, blob):
+                imported += 1
+            else:
+                skipped += 1
+        logger.info(
+            "credential ciphertext imported",
+            extra={"operation": "credential.import", "outcome": f"{imported}+{skipped}"},
+        )
+        return (imported, skipped)
+
+    def _upsert_restored_row(self, account_id: int, blob: bytes) -> bool:
+        """Upsert one bundle record under the primary key. Skips when the
+        account already stores the SAME TOKEN (token equality — Fernet
+        ciphertexts never compare equal across encryptions). A stored row
+        that cannot be decrypted (corrupt) is replaced. Verify before
+        commit — the same discipline as rotation."""
+        conn = self._connection()
+        with self._guard:
+            row = conn.execute(
+                "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            bundle_token = self._keys.multi.decrypt(blob)  # validated in phase 1
+            if row is not None:
+                try:
+                    stored_token = self._keys.multi.decrypt(bytes(row[0]))
+                except InvalidToken:
+                    stored_token = None  # corrupt stored row: import replaces it
+                if stored_token is not None and stored_token == bundle_token:
+                    return False  # same token already stored
+            new_blob = self._keys.multi.encrypt(bundle_token)  # primary
+            if self._keys.primary.decrypt(new_blob) != bundle_token:  # pragma: no cover - AEAD
+                raise CredentialProviderError(
+                    f"restore verification failed for account {account_id}"
+                )
+            now = self._clock().isoformat()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO account_credentials "
+                    "(account_id, encrypted_token, key_version, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(account_id) DO UPDATE SET "
+                    "encrypted_token = excluded.encrypted_token, "
+                    "key_version = excluded.key_version, "
+                    "updated_at = excluded.updated_at",
+                    (account_id, new_blob, self._keys.version, now, now),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return True
 
 
 __all__ = [

@@ -39,6 +39,8 @@ Interactive CLI commands (the database lives next to `config.json`):
 | `credential delete <account_id>` | Explicitly deletes the stored token. |
 | `credential accounts` | Lists accounts with stored (encrypted) credentials. |
 | `credential rotate` | Re-encrypts all credentials under the primary key (below). |
+| `credential export <path> confirm` | Writes all credentials to a JSON **ciphertext bundle** — never plaintext; the explicit `confirm` argument prevents accidents. |
+| `credential import <path> confirm` | Restores from a bundle: every record is validated by decrypting it with the configured keys **before anything is written** (a non-matching bundle is rejected whole), then re-encrypted under the current primary key. Idempotent. |
 
 Without a controlling terminal, token entry falls back to echoed input **with
 an explicit warning** — piped/automated use stays possible, visibly.

@@ -74,18 +74,20 @@ Document what happens when the encryption key is lost, replaced, or becomes inac
 
 **Dependencies:** Credential store and configuration documentation.
 
-### [ ] 4. Credential Backup and Restore
+### [x] 4. Credential Backup and Restore
 
 Establish a safe procedure for backing up and restoring credential-related data.
 
 **Acceptance criteria:**
 
-- [ ] Define which credential files and database records require backup.
-- [ ] Never export plaintext credentials by default.
-- [ ] Require explicit confirmation for sensitive export operations.
-- [ ] Validate restored encrypted data before accepting it.
-- [ ] Test restoration using a separate temporary environment.
-- [ ] Document key and backup compatibility requirements.
+- [x] Define which credential files and database records require backup. — `docs/credentials.md` (the `state.db` `account_credentials` rows and/or the export bundle, always paired with the key)
+- [x] Never export plaintext credentials by default. — export is ciphertext-only by construction (byte-level test assertion); there is no plaintext export path at all
+- [x] Require explicit confirmation for sensitive export operations. — literal `confirm` argument enforced for both `credential export` and `credential import` (tested)
+- [x] Validate restored encrypted data before accepting it. — phase-1 decrypt validation of every record; a non-matching or malformed bundle is rejected whole with zero rows written (tested)
+- [x] Test restoration using a separate temporary environment. — round-trip test exports from one database and restores into a fresh store/database; plus a re-encryption-under-new-primary test proving the old key can be discarded afterwards
+- [x] Document key and backup compatibility requirements. — bundle usable only with the export-time primary or any still-configured retired key; restored rows re-encrypted under the current primary
+
+**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 6 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
 
 **Dependencies:** Credential recovery documentation.
 
