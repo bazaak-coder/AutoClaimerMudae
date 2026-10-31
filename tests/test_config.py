@@ -132,6 +132,7 @@ def test_ratelimit_invalid_values_are_rejected(bad: dict[str, Any]) -> None:
 def base_app() -> dict[str, Any]:
     return {
         "version": 1,
+        "channels": {"roll_claim": 111111111111111111},
         "settings": {"log_level": "INFO", "max_concurrent_accounts": 2},
         "task_defaults": {"enabled": True, "retry_limit": 4},
         "tasks": {

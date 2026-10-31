@@ -37,7 +37,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from .adapters import (
     AccountFatalError,
@@ -49,7 +49,13 @@ from .adapters import (
 )
 from .config import resolve_task_config
 from .credentials import CredentialProvider
-from .models import AccountProfile, AccountsConfig, AppConfig, ConfigValidationError
+from .models import (
+    AccountProfile,
+    AccountsConfig,
+    AppConfig,
+    ConfigValidationError,
+    ResolvedTaskConfig,
+)
 from .persistence import (
     DatabaseBusyError,
     PersistenceError,
@@ -309,7 +315,9 @@ class WorkerManager:
                     )
                     continue
                 try:
-                    self._registry.validate_config(task_id, resolved.parameters)
+                    self._registry.validate_config(
+                        task_id, self._execution_parameters(resolved, task_id)
+                    )
                 except Exception as exc:
                     logger.error(
                         "task parameters rejected at startup; instance will fail without executing",
@@ -449,6 +457,24 @@ class WorkerManager:
     def _profile(self, account_id: int) -> AccountProfile | None:
         return next((a for a in self._accounts.accounts if a.id == account_id), None)
 
+    def _execution_parameters(self, resolved: ResolvedTaskConfig, task_id: str) -> dict[str, Any]:
+        """The parameter mapping a task's validator and handler see.
+
+        Global-channel integration: a task declaring a ``channel_role``
+        receives its resolved channel ID injected as ``channel`` — the
+        ONE place effective channels reach task execution. Handlers read
+        ``config["channel"]`` and never resolve fallbacks themselves;
+        users cannot set ``channel`` anywhere (config parsing rejects
+        it), so per-task values cannot defeat the global configuration.
+        """
+        parameters = dict(resolved.parameters)
+        task_type = self._registry.get(task_id)  # membership pre-checked by callers
+        if task_type.channel_role is not None:
+            parameters["channel"] = self._app_config.channels.effective().for_role(
+                task_type.channel_role
+            )
+        return parameters
+
     # ----- worker loop -----
 
     async def _worker_loop(self, worker: _AccountWorker) -> None:
@@ -580,7 +606,7 @@ class WorkerManager:
             context = TaskContext(
                 account_id=account_id,
                 task_id=record.task_id,
-                config=resolved.parameters,
+                config=self._execution_parameters(resolved, record.task_id),
                 adapter=task_adapter,
                 credentials=self._credentials,
             )

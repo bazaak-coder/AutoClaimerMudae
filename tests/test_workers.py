@@ -52,6 +52,7 @@ async def build_harness(
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {
                 "max_concurrent_accounts": max_concurrent,
                 "shutdown_timeout_seconds": shutdown_timeout,
@@ -597,6 +598,7 @@ async def test_start_loads_persisted_server_cooldowns(tmp_path: Path) -> None:
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"job": {"parameters": {}}},
@@ -691,6 +693,7 @@ async def test_outcome_retry_at_schedules_from_learned_deadline(tmp_path: Path) 
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"roll": {"parameters": {}}},
@@ -754,6 +757,7 @@ async def test_naive_outcome_retry_at_fails_terminally_not_stuck(tmp_path: Path)
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"roll": {"parameters": {}}},
@@ -819,6 +823,7 @@ async def test_naive_retry_at_on_success_fails_terminally(tmp_path: Path) -> Non
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"job": {"parameters": {}}},
@@ -869,6 +874,7 @@ async def test_naive_retry_at_on_permanent_failure_keeps_terminal(tmp_path: Path
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"job": {"parameters": {}}},
@@ -929,6 +935,7 @@ async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) ->
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"roll": {"parameters": {}}},
@@ -987,6 +994,7 @@ async def test_disabled_task_never_materializes_or_executes(tmp_path: Path) -> N
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {
@@ -1040,6 +1048,7 @@ async def test_disabled_by_account_override_never_executes(tmp_path: Path) -> No
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"job": {"parameters": {}}},
@@ -1088,6 +1097,7 @@ async def test_unregistered_task_type_skips_without_poisoning(tmp_path: Path) ->
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"known": {"parameters": {}}, "ghost": {"parameters": {}}},
@@ -1138,6 +1148,7 @@ async def test_start_can_retry_after_recovery_failure(tmp_path: Path) -> None:
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"job": {"parameters": {}}},
@@ -1220,6 +1231,7 @@ async def _paced_harness(
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": tasks_raw,
@@ -1341,6 +1353,7 @@ async def test_global_policy_falls_through_when_no_overrides(tmp_path: Path) -> 
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {
                 "backoff_base_seconds": 0.01,

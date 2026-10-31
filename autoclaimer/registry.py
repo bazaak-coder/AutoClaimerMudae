@@ -79,6 +79,11 @@ class TaskContext:
     credentials: CredentialProvider | None = None
 
 
+#: Logical channel roles a task may declare (resolved from the GLOBAL
+#: channels configuration; see models.ChannelsConfig.effective()).
+CHANNEL_ROLES = ("roll_claim", "mu", "rt")
+
+
 @dataclass(frozen=True)
 class TaskType:
     """Definition of one task type: identity, schema, and async behaviour."""
@@ -87,6 +92,10 @@ class TaskType:
     description: str
     validate_config: ConfigValidator
     handler: TaskHandler
+    # Global channel role this task operates in (None: no channel). The
+    # worker injects the resolved channel ID into the execution config;
+    # handlers read it as config["channel"] and never resolve fallbacks.
+    channel_role: str | None = None
 
     def __post_init__(self) -> None:
         if not valid_task_id(self.id):
@@ -100,6 +109,11 @@ class TaskType:
             raise TaskRegistryError(f"Task type {self.id!r} validator must be callable.")
         if not callable(self.handler):
             raise TaskRegistryError(f"Task type {self.id!r} handler must be callable.")
+        if self.channel_role is not None and self.channel_role not in CHANNEL_ROLES:
+            raise TaskRegistryError(
+                f"Task type {self.id!r} channel_role must be one of "
+                f"{', '.join(CHANNEL_ROLES)} (got {self.channel_role!r})."
+            )
 
 
 class TaskRegistry:

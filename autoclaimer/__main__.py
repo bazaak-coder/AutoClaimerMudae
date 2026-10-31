@@ -40,12 +40,29 @@ def build_demo_registry() -> TaskRegistry:
 
 
 async def async_main(config_path: str, accounts_path: str) -> int:
+    from .credential_store import CredentialKeyError, SQLiteCredentialStore, load_fernet_keys
+
     app, accounts = load_config(config_path, accounts_path)
     logger = setup_logging(app.logging)
     # State DB lives next to the config (decoupled from log_file so a log
     # path can never relocate or name the database).
-    store = TaskStateStore(Path(config_path).resolve().parent / "state.db")
+    db_path = Path(config_path).resolve().parent / "state.db"
+    store = TaskStateStore(db_path)
     await store.open()
+    # Encrypted credential storage: attached only when a valid Fernet key
+    # is configured (fail closed — never a plaintext fallback). The demo
+    # adapter needs no tokens; the store is attached so `credential`
+    # CLI management works out of the box.
+    credential_store: SQLiteCredentialStore | None = None
+    try:
+        credential_store = SQLiteCredentialStore(db_path, load_fernet_keys())
+        await credential_store.open()
+    except CredentialKeyError:
+        logger.warning(
+            "encrypted credential storage disabled: no valid Fernet key "
+            "(set AUTOCLAIMER_FERNET_KEY; see README)",
+            extra={"operation": "cli.start", "outcome": "credential_key_missing"},
+        )
     limiter = RateLimiter(default_policy=resolve_policy(app.ratelimit), store=store)
     controller = AutoClaimerController(
         app_config=app,
@@ -54,6 +71,8 @@ async def async_main(config_path: str, accounts_path: str) -> int:
         limiter=limiter,
         registry=build_demo_registry(),
         adapter_factory=lambda account_id: MockAdapter(),
+        credentials=credential_store,
+        credential_store=credential_store,
         idle_interval_seconds=5.0,
     )
     logger.info("cli session starting", extra={"operation": "cli.start"})

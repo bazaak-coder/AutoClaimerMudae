@@ -51,6 +51,7 @@ async def test_worker_records_uncertain_outcome_as_permanent() -> None:
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"shutdown_timeout_seconds": 2},
             "ratelimit": {"retry_limit": 5},
             "tasks": {"press": {"parameters": {}}},

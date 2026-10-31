@@ -64,6 +64,7 @@ async def build_manager(
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
             "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
             "tasks": {"probe": {"parameters": {}}},

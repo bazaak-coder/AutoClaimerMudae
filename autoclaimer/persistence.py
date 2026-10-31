@@ -55,8 +55,22 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _BUSY_TIMEOUT_MS = 5000
+
+#: v5 — Fernet-encrypted account tokens. One row per account; the
+#: Fernet key NEVER lives in this database (external key management:
+#: see autoclaimer.credential_store). Owned by the shared migration
+#: chain so a single state.db carries task state AND credentials.
+_CREDENTIALS_DDL = """
+    CREATE TABLE IF NOT EXISTS account_credentials (
+        account_id INTEGER PRIMARY KEY,
+        encrypted_token BLOB NOT NULL,
+        key_version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -108,6 +122,7 @@ _MIGRATIONS: dict[int, str] = {
     DROP TABLE mudae_state;
     ALTER TABLE mudae_state_v4 RENAME TO mudae_state;
     """,
+    5: _CREDENTIALS_DDL,
 }
 
 
@@ -336,6 +351,13 @@ class TaskStateStore:
             },
             "scope_cooldowns": {"scope", "deadline", "server_directed"},
             "mudae_state": {"account_id", "kind", "deadline", "updated_at"},
+            "account_credentials": {
+                "account_id",
+                "encrypted_token",
+                "key_version",
+                "created_at",
+                "updated_at",
+            },
         }
         for table, columns in expected.items():
             found = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

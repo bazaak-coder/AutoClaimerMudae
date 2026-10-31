@@ -15,6 +15,46 @@ class ConfigValidationError(ValueError):
 
 
 @dataclass(frozen=True)
+class ChannelsConfig:
+    """Global Discord channel settings shared by EVERY account.
+
+    ``roll_claim`` (Mudae rolling + claim interactions) is mandatory.
+    ``mu`` and ``rt`` are optional dedicated channels; when omitted or
+    ``None`` they fall back to ``roll_claim``. Channel configuration is
+    global by design — per-account or per-task channel overrides do not
+    exist (config parsing rejects a ``channel`` task parameter).
+    """
+
+    roll_claim: int
+    mu: int | None = None
+    rt: int | None = None
+
+    def effective(self) -> ResolvedChannels:
+        """Resolve fallbacks ONCE, centrally (explicit None handling)."""
+        return ResolvedChannels(
+            roll_claim=self.roll_claim,
+            mu=self.mu if self.mu is not None else self.roll_claim,
+            rt=self.rt if self.rt is not None else self.roll_claim,
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedChannels:
+    """All three channel IDs resolved — the only form tasks consume."""
+
+    roll_claim: int
+    mu: int
+    rt: int
+
+    def for_role(self, role: str) -> int:
+        """The channel ID for a task's declared channel role."""
+        value = getattr(self, role, None)
+        if not isinstance(value, int):
+            raise ValueError(f"unknown channel role {role!r} (expected roll_claim, mu, or rt)")
+        return value
+
+
+@dataclass(frozen=True)
 class AppSettings:
     log_level: str = "INFO"
     max_concurrent_accounts: int = 3
@@ -92,6 +132,7 @@ class AppConfig:
     settings: AppSettings
     task_defaults: TaskDefaults
     tasks: dict[str, TaskDefinition]
+    channels: ChannelsConfig
     ratelimit: RateLimitPolicy = field(default_factory=RateLimitPolicy)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
 

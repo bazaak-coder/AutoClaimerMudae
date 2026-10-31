@@ -49,11 +49,12 @@ def write_configs(tmp_path: Path) -> tuple[Path, Path]:
         """
         {
           "version": 1,
+          "channels": {"roll_claim": 111111111111111111},
           "settings": {"log_level": "INFO", "max_concurrent_accounts": 2,
                        "shutdown_timeout_seconds": 2},
           "ratelimit": {"min_interval_seconds": 0.01, "retry_limit": 2},
           "tasks": {
-            "claim": {"priority": 5, "parameters": {"channel": 42},
+            "claim": {"priority": 5, "parameters": {},
                       "ratelimit": {"backoff_base_seconds": 0.02}}
           }
         }
@@ -135,6 +136,7 @@ async def test_full_lifecycle(tmp_path: Path, caplog: Any) -> None:
             description="lifecycle claim probe",
             validate_config=lambda config: None,
             handler=handler,
+            channel_role="roll_claim",
         )
     )
     adapters[ACCOUNT].script("add_reaction", CooldownError(0.05))

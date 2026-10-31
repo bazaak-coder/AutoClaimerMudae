@@ -1,6 +1,7 @@
 """Unit tests for the discord.py-self adapter (fake client; no credentials)."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +19,8 @@ from autoclaimer.adapters import (
     SentMessage,
     UncertainOutcomeError,
 )
-from autoclaimer.credentials import CredentialProviderError
+from autoclaimer.credential_store import SQLiteCredentialStore
+from autoclaimer.credentials import CredentialProvider, CredentialProviderError
 from autoclaimer.discord_adapter import DiscordAdapter
 
 ACCOUNT = 271485504361996288
@@ -169,7 +171,7 @@ class FakeClient:
 
 def make_adapter(
     client: FakeClient,
-    credentials: FakeCredentials | None = None,
+    credentials: CredentialProvider | None = None,
     *,
     events: list[str] | None = None,
 ) -> DiscordAdapter:
@@ -805,3 +807,86 @@ async def test_credential_provider_error_is_account_fatal() -> None:
         await adapter.start()
     assert adapter.is_healthy is False  # latched, account stops — no
     # per-instance permanent failures across the whole queue.
+
+
+# Encrypted-store integration: login through the provider boundary
+
+
+def _encrypted_store(tmp_path: Path, token_by_account: dict[int, str]) -> SQLiteCredentialStore:
+    """An encrypted store for *tmp_path* (tokens are seeded by the caller
+    through :func:`_open_store_with`, which also opens it)."""
+    from autoclaimer.credential_store import PRIMARY_KEY_ENV as _PK
+    from autoclaimer.credential_store import generate_fernet_key, load_fernet_keys
+
+    return SQLiteCredentialStore(
+        tmp_path / "creds.db", load_fernet_keys({_PK: generate_fernet_key()})
+    )
+
+
+async def _open_store_with(
+    store: SQLiteCredentialStore, token_by_account: dict[int, str]
+) -> SQLiteCredentialStore:
+    await store.open()
+    for account_id, token in token_by_account.items():
+        await store.set_token(account_id, token)
+    return store
+
+
+async def test_login_uses_the_encrypted_stores_token(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The adapter requests the account's credential through the
+    CredentialProvider boundary; the SQLite/Fernet store supplies it and
+    exactly that token reaches client.login. No plaintext in any log."""
+    import logging
+
+    store = await _open_store_with(_encrypted_store(tmp_path, {ACCOUNT: TOKEN}), {ACCOUNT: TOKEN})
+    try:
+        client = FakeClient()
+        adapter = make_adapter(client, store)
+        with caplog.at_level(logging.DEBUG, logger="autoclaimer"):
+            await adapter.start()
+        assert client.login_calls == [TOKEN]
+        for record in caplog.records:
+            assert TOKEN not in record.getMessage()
+        await adapter.close()
+    finally:
+        store.close()
+
+
+async def test_other_accounts_credential_never_serves_this_adapter(tmp_path: Path) -> None:
+    store = await _open_store_with(
+        _encrypted_store(tmp_path, {ACCOUNT: TOKEN, 999: "other-account-token"}),
+        {ACCOUNT: TOKEN, 999: "other-account-token"},
+    )
+    try:
+        client = FakeClient()
+        adapter = make_adapter(client, store)
+        await adapter.start()
+        assert client.login_calls == [TOKEN]  # ACCOUNT's own, not 999's
+        await adapter.close()
+    finally:
+        store.close()
+
+
+async def test_missing_encrypted_credential_is_account_fatal_and_safe(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No credential row for the account: typed, account-specific,
+    account-fatal — and the message carries no secrets."""
+    import logging
+
+    store = await _open_store_with(
+        _encrypted_store(tmp_path, {999: "unrelated-token"}), {999: "unrelated-token"}
+    )
+    try:
+        client = FakeClient()
+        adapter = make_adapter(client, store)
+        with caplog.at_level(logging.DEBUG, logger="autoclaimer"):
+            with pytest.raises(AccountFatalError, match=str(ACCOUNT)):
+                await adapter.start()
+        assert client.login_calls == []  # never reached login
+        for record in caplog.records:
+            assert "unrelated-token" not in record.getMessage()
+    finally:
+        store.close()

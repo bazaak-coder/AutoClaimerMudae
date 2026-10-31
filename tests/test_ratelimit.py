@@ -109,6 +109,7 @@ def test_policy_for_resolves_from_parsed_config() -> None:
     app = parse_app_config(
         {
             "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
             "ratelimit": {"max_concurrency": 4},
             "tasks": {"claim_test": {"ratelimit": {"min_interval_seconds": 3}}},
         }
