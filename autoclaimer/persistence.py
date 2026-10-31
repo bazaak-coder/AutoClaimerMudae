@@ -229,6 +229,18 @@ def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
     return PersistenceError(f"Unexpected database error: {exc}")
 
 
+#: Bounded wait for abandoned database calls to settle during a
+#: transaction-cancellation cleanup (VERIFY-001 fix).
+_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+def _silence_task_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve (and drop) an abandoned task's exception so Python does
+    not warn about it — the cancellation path intentionally moves on."""
+    if not task.cancelled():
+        task.exception()
+
+
 class TaskStateStore:
     """Async, transactional SQLite store for task-instance runtime state."""
 
@@ -252,6 +264,10 @@ class TaskStateStore:
         # abandoned (cancelled-await) threaded op can never interleave
         # with a later boundary or write. See ``_call_threaded``.
         self._conn_guard = threading.RLock()
+        # In-flight guarded calls (VERIFY-001 fix): cancellation abandons
+        # the await but the tracked task keeps running; the transaction
+        # cleanup drains these before rolling back.
+        self._in_flight: set[asyncio.Task[Any]] = set()
 
     # ----- lifecycle -----
 
@@ -393,10 +409,44 @@ class TaskStateStore:
             with self._conn_guard:
                 return fn(*args)
 
+        # VERIFY-001 fix: run as a tracked task behind a shield. A
+        # cancellation abandons the AWAIT, never the work — and the
+        # abandoned task stays registered in ``_in_flight`` so a
+        # transaction's cleanup can WAIT for it to settle before rolling
+        # back (no reliance on threading.RLock acquisition order).
+        task: asyncio.Task[_T] = asyncio.create_task(asyncio.to_thread(guarded))
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        task.add_done_callback(_silence_task_exception)
         try:
-            return await asyncio.to_thread(guarded)
+            return await asyncio.shield(task)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
+
+    async def _drain_and_rollback(self, where: str) -> None:
+        """Transaction-cancellation cleanup: settle, THEN roll back.
+
+        Waits (bounded) for every in-flight guarded call submitted before
+        this point — including the abandoned BEGIN or body write — before
+        the ROLLBACK reaches the connection. ``threading.RLock`` gives no
+        FIFO guarantee, so without this drain the rollback could acquire
+        the guard first, no-op, and let the abandoned BEGIN land after it
+        (deterministically reproduced by the guard-reorder regression
+        test). Shielded by callers so a second cancellation cannot skip
+        the rollback; a drain timeout proceeds best-effort (logged).
+        """
+        pending = [t for t in self._in_flight if not t.done()]
+        if pending:
+            _done, stuck = await asyncio.wait(pending, timeout=_DRAIN_TIMEOUT_SECONDS)
+            if stuck:
+                logger.warning(
+                    "cancelled database call(s) did not settle in time; rolling back anyway",
+                    extra={"operation": "store.drain", "outcome": "drain_timeout"},
+                )
+        try:
+            await self._call_threaded(self._connection().execute, "ROLLBACK")
+        except sqlite3.Error:
+            logger.exception(f"rollback after {where} also failed")
 
     async def _run(self, fn: Callable[..., _T], *args: Any) -> _T:
         """Run one database call; inside a transaction the caller's lock covers us."""
@@ -443,37 +493,25 @@ class TaskStateStore:
                 await self._call_threaded(self._connection().execute, "BEGIN IMMEDIATE")
             except BaseException:
                 self._txn_owner.reset(token)
-                # PR #6 review edge case: cancellation never stops the
+                # PR #6 review + VERIFY-001: cancellation never stops the
                 # abandoned ``to_thread`` call — the BEGIN may still
                 # EXECUTE after this coroutine unwinds, leaking an open
-                # transaction (the next BEGIN would fail; plain writes
-                # would silently join the zombie). The guarded ROLLBACK
-                # drains it in every ordering: queued behind the BEGIN
-                # on the connection guard if it has not run yet,
-                # rolling it back if it has, and harmlessly erroring
-                # only if no transaction is active.
-                try:
-                    await self._call_threaded(self._connection().execute, "ROLLBACK")
-                except sqlite3.Error:
-                    logger.exception("rollback after cancelled BEGIN also failed")
+                # transaction. The DRAIN-then-rollback settles the
+                # abandoned call FIRST (no RLock-FIFO assumption), then
+                # rolls back whatever it opened.
+                await asyncio.shield(self._drain_and_rollback("cancelled BEGIN"))
                 raise
             try:
                 yield
             except BaseException:
                 self._txn_owner.reset(token)
-                try:
-                    await self._call_threaded(self._connection().execute, "ROLLBACK")
-                except sqlite3.Error:
-                    logger.exception("rollback after transaction failure also failed")
+                await asyncio.shield(self._drain_and_rollback("transaction failure"))
                 raise
             self._txn_owner.reset(token)
             try:
                 await self._call_threaded(self._connection().execute, "COMMIT")
             except BaseException:
-                try:
-                    await self._call_threaded(self._connection().execute, "ROLLBACK")
-                except sqlite3.Error:
-                    logger.exception("rollback after failed commit also failed")
+                await asyncio.shield(self._drain_and_rollback("failed commit"))
                 raise
 
     # ----- queries -----
