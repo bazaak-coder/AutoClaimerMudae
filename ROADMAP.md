@@ -58,17 +58,19 @@ Add safeguards for detecting database corruption and inconsistent persisted stat
 
 **Dependencies:** SQLite persistence layer.
 
-### [ ] 3. Credential Recovery Documentation
+### [x] 3. Credential Recovery Documentation
 
 Document what happens when the encryption key is lost, replaced, or becomes inaccessible.
 
 **Acceptance criteria:**
 
-- [ ] Explain the consequences of losing the encryption key.
-- [ ] Document how to restore access to credentials.
-- [ ] Explain which data can and cannot be recovered.
-- [ ] Ensure recovery instructions never expose plaintext credentials.
-- [ ] Document secure key storage and backup recommendations.
+- [x] Explain the consequences of losing the encryption key. — `docs/credentials.md` → "Consequences of losing the key"
+- [x] Document how to restore access to credentials. — replace-key procedure AND backup-restore path, step by step
+- [x] Explain which data can and cannot be recovered. — key-dependency table (tokens vs tasks/cooldowns/state) + explicit never-recoverable case
+- [x] Ensure recovery instructions never expose plaintext credentials. — every artifact in the procedures is ciphertext, a key, or metadata
+- [x] Document secure key storage and backup recommendations. — storage rules, separation/equivalent-secrecy rule, two independent copies, tested restore
+
+**Completed:** 2026-10-31 (documentation; the procedures reference the item-4 export/import commands).
 
 **Dependencies:** Credential store and configuration documentation.
 
