@@ -9,7 +9,9 @@ persistence, and adapter integration through the provider boundary.
 import asyncio
 import logging
 import sqlite3
+import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
 from cryptography.fernet import Fernet, MultiFernet
@@ -449,5 +451,105 @@ async def test_persistence_error_mapping_preserved(tmp_path: Path) -> None:
             store.get_token(ACCOUNT)
         with pytest.raises((PersistenceError, CredentialProviderError)):
             await store.has_token(ACCOUNT)
+    finally:
+        store.close()
+
+
+# ChatGPT PR #5 review: rotation must not overwrite concurrent updates
+# (BUG-007) and malformed ciphertext rows must fail typed (BUG-009).
+
+
+class _BlockingMulti:
+    """MultiFernet proxy that blocks the FIRST decrypt call (the window
+    between rotation's row read and its write)."""
+
+    def __init__(
+        self, inner: MultiFernet, entered: threading.Event, release: threading.Event
+    ) -> None:
+        self.inner = inner
+        self.entered = entered
+        self.release = release
+
+    def decrypt(self, token: bytes) -> bytes:
+        if not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(5.0)
+        return self.inner.decrypt(token)
+
+    def encrypt(self, token: bytes) -> bytes:
+        return self.inner.encrypt(token)
+
+
+async def test_rotation_never_overwrites_a_concurrent_token_update(tmp_path: Path) -> None:
+    """A token updated while rotation is mid-row must never revert.
+
+    Store A (rotation) reads the old ciphertext and pauses; store B
+    (separate instance, same database — cross-process equivalent) writes
+    a NEW token; A resumes. The final stored token must be NEW."""
+    import threading
+
+    old_key = generate_fernet_key()
+    new_key = generate_fernet_key()
+
+    seeder = SQLiteCredentialStore(
+        tmp_path / "state.db", load_fernet_keys({PRIMARY_KEY_ENV: old_key})
+    )
+    await seeder.open()
+    old_token = "gho_OLDtokenThatWasRevoked_000111222333"
+    await seeder.set_token(ACCOUNT, old_token)
+    seeder.close()
+
+    entered = threading.Event()
+    release = threading.Event()
+    rotating = SQLiteCredentialStore(
+        tmp_path / "state.db",
+        load_fernet_keys({PRIMARY_KEY_ENV: new_key, RETIRED_KEYS_ENV: old_key}),
+    )
+    await rotating.open()
+    real_keys = rotating._keys  # noqa: SLF001
+    from autoclaimer.credential_store import FernetKeys as _FK
+
+    rotating._keys = _FK(  # noqa: SLF001
+        multi=cast(MultiFernet, _BlockingMulti(real_keys.multi, entered, release)),
+        primary=cast(MultiFernet, _BlockingMulti(real_keys.primary, entered, release)),
+        version=real_keys.version,
+    )
+
+    writer = SQLiteCredentialStore(
+        tmp_path / "state.db", load_fernet_keys({PRIMARY_KEY_ENV: new_key})
+    )
+    await writer.open()
+    new_token = "gho_NEWtokenThatMustSurvive_444555666777"
+    try:
+        rotate_task = asyncio.create_task(rotating.rotate())
+        assert await asyncio.to_thread(entered.wait, 5.0)  # A read the row, paused
+
+        write_task = asyncio.create_task(writer.set_token(ACCOUNT, new_token))
+        await asyncio.sleep(0.15)  # B commits (unserialized) or parks on the lock
+        release.set()  # A resumes and writes its re-encrypted OLD token
+        await write_task
+        await rotate_task
+
+        assert writer.get_token(ACCOUNT) == new_token, "rotation reverted the token"
+    finally:
+        rotating.close()
+        writer.close()
+
+
+async def test_rotation_handles_malformed_text_ciphertext_typed(tmp_path: Path) -> None:
+    key = generate_fernet_key()
+    store = SQLiteCredentialStore(tmp_path / "state.db", load_fernet_keys({PRIMARY_KEY_ENV: key}))
+    await store.open()
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        conn = sqlite3.connect(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE account_credentials SET encrypted_token = ? WHERE account_id = ?",
+                ("not-a-binary-ciphertext", ACCOUNT),
+            )
+        conn.close()
+        with pytest.raises(CredentialDecryptError, match="malformed"):
+            await store.rotate()
     finally:
         store.close()

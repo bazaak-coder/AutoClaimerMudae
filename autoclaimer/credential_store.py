@@ -351,41 +351,59 @@ class SQLiteCredentialStore:
         Per-row verify-then-commit makes an interrupted rotation
         resumable; un-migrated rows stay decryptable via retired keys.
 
+        The row READ and the UPDATE share ONE write transaction
+        (BUG-007 fix): a concurrent ``set_token`` — from another store
+        instance or process — either completes entirely before this read
+        or waits until after the commit, so rotation can never overwrite
+        a newer token with a stale re-encryption.
+
         Returns True if the row was re-encrypted, False if already current.
         """
         conn = self._connection()
         with self._guard:
-            row = conn.execute(
-                "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
-                (account_id,),
-            ).fetchone()
-            if row is None:
-                return False
-            blob = bytes(row[0])
-            try:
-                self._keys.primary.decrypt(blob)
-                return False  # already current under the primary key
-            except InvalidToken:
-                pass
-            token = self._keys.multi.decrypt(blob)  # any loaded (retired) key
-            new_blob = self._keys.multi.encrypt(token)  # primary
-            # Verify the re-encrypted row decrypts back BEFORE commit.
-            if self._keys.primary.decrypt(new_blob) != token:  # pragma: no cover - AEAD
-                raise CredentialProviderError(
-                    f"rotation verification failed for account {account_id}"
-                )
             conn.execute("BEGIN IMMEDIATE")
             try:
+                row = conn.execute(
+                    "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                # BUG-009 fix: SQLite's BLOB column still admits TEXT —
+                # same typed handling as get_token, never a raw TypeError.
+                value = row[0]
+                if not isinstance(value, (bytes, bytearray)):
+                    raise CredentialDecryptError(
+                        f"stored credential for account {account_id} is malformed"
+                    )
+                blob = bytes(value)
+                try:
+                    self._keys.primary.decrypt(blob)
+                    conn.execute("ROLLBACK")  # read-only outcome
+                    return False  # already current under the primary key
+                except InvalidToken:
+                    pass
+                token = self._keys.multi.decrypt(blob)  # any loaded (retired) key
+                new_blob = self._keys.multi.encrypt(token)  # primary
+                # Verify the re-encrypted row decrypts back BEFORE commit.
+                if self._keys.primary.decrypt(new_blob) != token:  # pragma: no cover - AEAD
+                    raise CredentialProviderError(
+                        f"rotation verification failed for account {account_id}"
+                    )
                 conn.execute(
                     "UPDATE account_credentials SET encrypted_token = ?, "
                     "key_version = ?, updated_at = ? WHERE account_id = ?",
                     (new_blob, self._keys.version, self._clock().isoformat(), account_id),
                 )
                 conn.execute("COMMIT")
+                return True
             except BaseException:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:  # pragma: no cover - already rolled back
+                    logger.exception("rollback during failed rotation row also failed")
                 raise
-            return True
 
     async def rotate(self) -> int:
         """Re-encrypt every pre-rotation row under the PRIMARY key.

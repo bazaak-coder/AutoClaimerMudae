@@ -159,12 +159,19 @@ the same `state.db` as task state (schema v5 table `account_credentials`):
 - Managing tokens (interactive CLI, `state.db` next to `config.json`):
 
   ```
-  credential set <account_id>        # prompts for the token; encrypts and upserts
+  credential set <account_id>        # prompts for the token (hidden input);
+                                      #  encrypts and upserts
   credential has <account_id>
   credential delete <account_id>
   credential accounts
   credential rotate
   ```
+
+  Token entry uses a dedicated hidden-input reader (`getpass`): typed
+  characters are not echoed on a terminal. Without a controlling TTY,
+  getpass prints an explicit warning and reads echoed stdin — piped use
+  stays possible, visibly. The token is never accepted as a command
+  argument (keeping it out of shell history).
 
 - Adapters request tokens at login through the existing
   `CredentialProvider` protocol — task handlers never see keys, ciphertext,

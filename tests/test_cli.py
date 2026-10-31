@@ -8,6 +8,7 @@ import pytest
 
 from autoclaimer.cli import AutoClaimerController, CliSession
 from autoclaimer.config import parse_accounts_config, parse_app_config
+from autoclaimer.credential_store import SQLiteCredentialStore
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.persistence import PersistenceError, TaskInstanceState, TaskStateStore
 from autoclaimer.ratelimit import RateLimiter
@@ -34,6 +35,7 @@ async def build_cli(
     tasks_raw: dict[str, Any] | None = None,
     accounts_raw: list[dict[str, Any]] | None = None,
     shutdown_timeout: int = 15,
+    credential_store: SQLiteCredentialStore | None = None,
 ) -> CliHarness:
     app = parse_app_config(
         {
@@ -79,6 +81,7 @@ async def build_cli(
         limiter=limiter,
         registry=registry,
         adapter_factory=lambda account_id: adapters[account_id],
+        credential_store=credential_store,
         idle_interval_seconds=0.02,
     )
     harness = CliHarness()
@@ -321,3 +324,64 @@ async def test_output_redacts_tokens(tmp_path: Path) -> None:
     text = "\n".join(h.output)
     assert leaked not in text
     assert "[REDACTED-TOKEN]" in text
+
+
+# ChatGPT PR #5 review (BUG-008): credential entry uses a dedicated
+# SECRET reader (getpass by default — terminal echo disabled), never the
+# echoing command line reader.
+
+
+async def test_credential_set_reads_via_secret_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The token must come from the SECRET reader and must never appear
+    in any emitted output."""
+    from autoclaimer.credential_store import PRIMARY_KEY_ENV as _PK
+    from autoclaimer.credential_store import (
+        SQLiteCredentialStore,
+        generate_fernet_key,
+        load_fernet_keys,
+    )
+
+    getpass_calls: list[str] = []
+
+    def fake_getpass(prompt: str = "") -> str:
+        getpass_calls.append(prompt)
+        return "gho_secretFromGetPass_998877665544"
+
+    import getpass as getpass_module
+
+    monkeypatch.setattr(getpass_module, "getpass", fake_getpass)
+
+    store = SQLiteCredentialStore(
+        tmp_path / "state.db", load_fernet_keys({_PK: generate_fernet_key()})
+    )
+    await store.open()
+    harness = await build_cli(tmp_path, credential_store=store)
+    try:
+        ok = await harness.session.run_once("credential set 271485504361996288")
+        assert ok is True
+        assert any("hidden" in p for p in getpass_calls)  # getpass prompt used
+        assert store.get_token(271485504361996288) == "gho_secretFromGetPass_998877665544"
+        joined = "\n".join(harness.output)
+        assert "gho_secretFromGetPass" not in joined  # never echoed back
+        assert "encrypted" in joined
+    finally:
+        store.close()
+
+
+async def test_stdin_secret_reader_uses_getpass(monkeypatch: pytest.MonkeyPatch) -> None:
+    import getpass as getpass_module
+
+    from autoclaimer.cli import stdin_secret_reader
+
+    seen: list[str] = []
+
+    def fake_getpass(prompt: str = "") -> str:
+        seen.append(prompt)
+        return "hidden-token"
+
+    monkeypatch.setattr(getpass_module, "getpass", fake_getpass)
+    value = await stdin_secret_reader("prompt: ")
+    assert value == "hidden-token"
+    assert seen == ["prompt: "]

@@ -25,6 +25,7 @@ Commands (REPL)::
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
 import shlex
 from collections.abc import Awaitable, Callable
@@ -288,9 +289,14 @@ class CliSession:
         *,
         read_line: LineReader,
         write: LineWriter,
+        read_secret: LineReader | None = None,
     ) -> None:
         self._controller = controller
         self._read_line = read_line
+        # Secret input has its OWN reader (BUG-008 fix): the plain line
+        # reader echoes on a TTY; the default secret reader disables echo
+        # via getpass. Injectable separately for deterministic tests.
+        self._read_secret = read_secret if read_secret is not None else stdin_secret_reader
         self._write = write
 
     def _emit(self, lines: list[str] | str) -> None:
@@ -462,10 +468,7 @@ class CliSession:
                     "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY "
                     "(see 'credential generate-key') and restart"
                 )
-            token = await self._read_line(
-                f"token for account {account_id} "
-                "(not echoed by AutoClaimer; use a private terminal): "
-            )
+            token = await self._read_secret(f"token for account {account_id} (input hidden): ")
             token = token.strip()
             if not token:
                 raise ValueError("empty token — nothing stored")
@@ -554,3 +557,12 @@ USAGE = """commands:
 async def stdin_reader(prompt: str) -> str:
     """Default line reader: blocking ``input`` off the event loop."""
     return await asyncio.to_thread(input, prompt)
+
+
+async def stdin_secret_reader(prompt: str) -> str:
+    """Default SECRET reader (BUG-008 fix): ``getpass`` disables terminal
+    echo, so an entered token is not displayed or captured in terminal
+    recordings. Without a controlling TTY, getpass prints an explicit
+    warning and falls back to echoed stdin — piped/automated use stays
+    possible, visibly."""
+    return await asyncio.to_thread(getpass.getpass, prompt)

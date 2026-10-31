@@ -576,6 +576,20 @@ class WorkerManager:
                 record, "task not assigned to this account in current config"
             )
             return
+        # ChatGPT PR #5 review (BUG-010): a persisted instance can
+        # OUTLIVE the registry entry that created it (the task is still
+        # defined and assigned in config, but the type is no longer
+        # registered — e.g. a removed plugin). Retire it terminally
+        # BEFORE claiming: parameter resolution below would otherwise
+        # raise outside the handler-error boundary and strand the
+        # claimed row in `running` until restart. Documented trade-off:
+        # stale instances become terminal instead of waiting for a
+        # future re-registration.
+        if record.task_id not in self._registry:
+            await self._terminal_without_claim(
+                record, "task type is no longer registered; instance retired"
+            )
+            return
         try:
             resolved = resolve_task_config(self._app_config, profile, record.task_id)
         except ConfigValidationError as exc:
