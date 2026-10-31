@@ -347,7 +347,7 @@ minimal local provider reads them from the environment:
 
 ```python
 import os
-from autoclaimer.credentials import CredentialProvider
+from autoclaimer.credentials import CredentialProvider, CredentialProviderError
 
 
 class EnvironmentCredentials:
@@ -356,7 +356,9 @@ class EnvironmentCredentials:
     def get_token(self, account_id: int) -> str:
         token = os.environ.get(f"AUTOCLAIMER_TOKEN_{account_id}")
         if not token:
-            raise RuntimeError(f"missing env var AUTOCLAIMER_TOKEN_{account_id}")
+            # The protocol's typed error: the adapter maps it to an
+            # account-fatal stop (never a generic permanent failure).
+            raise CredentialProviderError(f"missing env var AUTOCLAIMER_TOKEN_{account_id}")
         return token
 
     def close(self) -> None:

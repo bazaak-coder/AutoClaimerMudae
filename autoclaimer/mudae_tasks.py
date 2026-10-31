@@ -837,11 +837,19 @@ def _make_roll_handler(
                     channel_id=cfg.channel,
                     author_id=cfg.author_id,
                     exclude_message_ids={reply.message.id},
+                    # BUG-005 (external audit batch 4): dispatch-gate the
+                    # confirmation exactly like command replies — a delayed
+                    # duplicate pair arriving during the reaction's pacing
+                    # wait can never satisfy THIS round's confirmation.
+                    dispatch_gated=True,
                 )
                 confirmation.begin()
                 try:
                     await context.adapter.add_reaction(
-                        cfg.channel, reply.message.id, cfg.claim_emoji
+                        cfg.channel,
+                        reply.message.id,
+                        cfg.claim_emoji,
+                        on_dispatch=confirmation.mark_dispatched,
                     )
                     # Owner semantics (2026-10-29): a claim confirmation is
                     # a username/character pair — the CHARACTER must match

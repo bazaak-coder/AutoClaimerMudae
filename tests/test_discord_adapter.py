@@ -787,3 +787,21 @@ async def test_subscribe_forwards_on_events_lost_to_the_dispatcher() -> None:
     client.connect_stopped.set()
     await adapter.close()  # in-flight delivery interrupted -> reported lost
     assert lost == [1]
+
+
+# Repo-sweep: credential-provider contract is account-fatal
+
+
+async def test_credential_provider_error_is_account_fatal() -> None:
+    from autoclaimer.credentials import CredentialProviderError
+
+    class BrokenCredentials(FakeCredentials):
+        def get_token(self, account_id: int) -> str:
+            raise CredentialProviderError("missing env var AUTOCLAIMER_TOKEN_1")
+
+    client = FakeClient()
+    adapter = make_adapter(client, BrokenCredentials())
+    with pytest.raises(AccountFatalError, match="credential provider"):
+        await adapter.start()
+    assert adapter.is_healthy is False  # latched, account stops — no
+    # per-instance permanent failures across the whole queue.

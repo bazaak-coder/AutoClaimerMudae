@@ -3,6 +3,8 @@
 import logging
 from pathlib import Path
 
+import pytest
+
 from autoclaimer.logging_setup import (
     LOGGER_NAME,
     StructuredRedactingFormatter,
@@ -125,3 +127,83 @@ def test_rotating_file_respects_size_and_retention(tmp_path: Path) -> None:
     setup_logging(LoggingSettings(log_file=str(tmp_path / "cleanup.log")), also_stderr=False)
     del logger
     logging.getLogger(LOGGER_NAME).handlers.clear()
+
+
+# Repo-sweep audit: redaction split-value leak + handler failure path
+
+
+def test_redaction_covers_bearer_and_multiword_values() -> None:
+    from autoclaimer.logging_setup import redact_text
+
+    cases = [
+        "Authorization: Bearer gho_16C7eDfAaBb1234567890abcd",
+        "authorization=Bearer MTIzNDU2Nzg5MTIzNDU2Nzg",
+        "password: correct horse gho_staple_battery",
+        "{'Authorization': 'Bearer gho_leakme123'}",
+    ]
+    for text in cases:
+        out = redact_text(text)
+        assert "gho_" not in out, text
+        assert "leakme" not in out, text
+        assert "staple_battery" not in out, text
+
+
+def test_redaction_extended_key_alternation() -> None:
+    from autoclaimer.logging_setup import redact_text
+
+    for key in (
+        "access_token",
+        "refresh_token",
+        "bot_token",
+        "discord_token",
+        "api-key",
+        "x-api-key",
+        "private_key",
+        "auth",
+    ):
+        out = redact_text(f"{key}: super-secret-value-1234567890")
+        assert "super-secret" not in out, key
+
+
+def test_redaction_wider_token_shape_windows() -> None:
+    from autoclaimer.logging_setup import redact_text
+
+    # Middle segment > 10 chars, short first segment, 19-char tail: all
+    # previously escaped the length-windowed shape matcher.
+    for token in (
+        "aaaaaaaaaa.bbbbbbbbbbbbbb.cccccccccccccccccccc",
+        "abcdef.ghijklmn.opqrstuvwxyzabcdefghi",
+        "aaaaaaaaaaaa.bbbbbb.ccccccccccccccccccc",
+    ):
+        assert token not in redact_text(f"token is {token}")
+
+
+def test_rotation_failure_path_never_dumps_raw_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging as _logging
+
+    from autoclaimer.logging_setup import setup_logging
+    from autoclaimer.models import LoggingSettings as _LS
+
+    def _make_settings(path: Path) -> _LS:
+        return _LS(log_file=str(path), max_bytes=10, backup_count=1)
+
+    log = tmp_path / "full.log"
+    log.write_text("x" * 10)  # non-empty: rollover attempted
+    logger = setup_logging(_make_settings(log), also_stderr=False)
+    from autoclaimer.logging_setup import _RedactingRotatingFileHandler as _RH
+
+    handler = logger.handlers[0]
+    assert isinstance(handler, _RH)
+
+    def failing_rollover() -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(handler, "doRollover", failing_rollover)
+    secret = "gho_16C7eDfAaBb1234567890abcdEFGH"
+    logger.error("Authorization: Bearer %s", secret)
+    _logging.shutdown()
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert secret not in combined

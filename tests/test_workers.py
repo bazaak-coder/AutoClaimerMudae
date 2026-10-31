@@ -972,3 +972,435 @@ async def test_succeeded_with_retry_at_reschedules_next_round(tmp_path: Path) ->
     assert record.last_outcome is not None
     assert record.last_outcome.status is TaskStatus.SUCCEEDED
     await store.close()
+
+
+# Repo-sweep: enabled=false is consumed; unregistered types never poison state
+
+
+async def test_disabled_task_never_materializes_or_executes(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {
+                "on_task": {"parameters": {}},
+                "off_task": {"enabled": False, "parameters": {}},
+            },
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["on_task", "off_task"]}]}, app
+    )
+    registry = TaskRegistry()
+    for tid in ("on_task", "off_task"):
+        registry.register(
+            TaskType(
+                id=tid,
+                description=f"Probe {tid}.",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "on_task", TaskInstanceState.SUCCEEDED)
+    await asyncio.sleep(0.05)
+    from autoclaimer.persistence import UnknownInstanceError
+
+    with pytest.raises(UnknownInstanceError):
+        await store.get_instance_by_ids(ACCOUNT, "off_task")  # no row
+    assert calls == [1]  # only on_task executed
+    await store.close()
+
+
+async def test_disabled_by_account_override_never_executes(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        calls.append(1)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {
+            "version": 1,
+            "accounts": [
+                {"id": ACCOUNT, "tasks": ["job"], "overrides": {"job": {"enabled": False}}}
+            ],
+        },
+        app,
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await asyncio.sleep(0.2)
+    assert calls == []  # override honored
+    assert await store.due_instances(ACCOUNT) == ()  # nothing materialized
+    await store.close()
+
+
+async def test_unregistered_task_type_skips_without_poisoning(tmp_path: Path) -> None:
+    """Startup with a config referencing an unregistered task type: the
+    instance is NOT created-and-failed (terminal rows never re-create —
+    the demo config previously bricked state.db on first run)."""
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"known": {"parameters": {}}, "ghost": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["known", "ghost"]}]}, app
+    )
+    registry = TaskRegistry()
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry.register(
+        TaskType(
+            id="known",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "known", TaskInstanceState.SUCCEEDED)
+    from autoclaimer.persistence import UnknownInstanceError
+
+    with pytest.raises(UnknownInstanceError):
+        await store.get_instance_by_ids(ACCOUNT, "ghost")  # never created
+    await store.close()
+
+
+# External audit BUG-001: failed startup is retryable
+
+
+async def test_start_can_retry_after_recovery_failure(tmp_path: Path) -> None:
+    from autoclaimer.persistence import DatabaseBusyError
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry.register(
+        TaskType(
+            id="job",
+            description="Probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    original = store.recover_interrupted
+    calls = [0]
+
+    async def flaky_recovery() -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise DatabaseBusyError("simulated lock")
+        return await original()
+
+    store.recover_interrupted = flaky_recovery  # type: ignore[method-assign]
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    with pytest.raises(DatabaseBusyError):
+        await manager.start()
+    # Retry after the transient failure: startup completes, work runs.
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+    assert calls[0] == 2
+    await store.close()
+
+
+# External audit BUG-004: per-account/per-task ratelimit policies are applied
+
+
+class RecordingSleep:
+    """Instant ``sleep`` stand-in recording requested durations."""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+    def max_gap(self) -> float:
+        return max(self.calls, default=0.0)
+
+
+async def _paced_harness(
+    tmp_path: Path,
+    *,
+    tasks_raw: dict[str, Any],
+    accounts_raw: list[dict[str, Any]],
+    task_ids: tuple[str, ...],
+) -> tuple[WorkerManager, TaskStateStore, RecordingSleep, list[tuple[str, float]]]:
+    """Manager whose limiter sleeps INSTANTLY while recording reservations.
+
+    A 30 s ``min_interval_seconds`` then shows up as a recorded ~30 s
+    reservation instead of a real 30 s pause: fully deterministic.
+    """
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": tasks_raw,
+        }
+    )
+    accounts = parse_accounts_config({"version": 1, "accounts": accounts_raw}, app)
+    gaps: list[tuple[str, float]] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        await context.adapter.send_message(1, "first")
+        await context.adapter.send_message(1, "second")
+        gaps.append((context.task_id, 0.0))  # marker: executed to completion
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry = TaskRegistry()
+    for task_id in task_ids:
+        registry.register(
+            TaskType(
+                id=task_id,
+                description=f"Pacing probe {task_id}.",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    sleep = RecordingSleep()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store, sleep=sleep),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    return manager, store, sleep, gaps
+
+
+async def test_task_ratelimit_policy_paces_operations(tmp_path: Path) -> None:
+    """A task-level ``ratelimit`` block must reach the adapter's second
+    operation as a pacing reservation (previously parsed, never applied)."""
+    manager, store, sleep, gaps = await _paced_harness(
+        tmp_path,
+        tasks_raw={
+            "paced": {"parameters": {}, "ratelimit": {"min_interval_seconds": 30.0}},
+            "free": {"parameters": {}},
+        },
+        accounts_raw=[
+            {"id": ACCOUNT, "tasks": ["paced", "free"]},
+        ],
+        task_ids=("paced", "free"),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "paced", TaskInstanceState.SUCCEEDED)
+        await wait_for_status(store, ACCOUNT, "free", TaskInstanceState.SUCCEEDED)
+    # "paced" reserved a ~30 s gap between its two sends; "free" (no
+    # override, global default 0) reserved nothing.
+    assert sleep.max_gap() > 25.0
+    await store.close()
+
+
+async def test_account_policy_overrides_task_policy(tmp_path: Path) -> None:
+    manager, store, sleep, _gaps = await _paced_harness(
+        tmp_path,
+        tasks_raw={
+            "job": {"parameters": {}, "ratelimit": {"min_interval_seconds": 30.0}},
+        },
+        accounts_raw=[
+            {
+                "id": ACCOUNT,
+                "tasks": ["job"],
+                "ratelimit": {"min_interval_seconds": 7.0},
+            },
+        ],
+        task_ids=("job",),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+    # Account layer (7 s) wins over the task layer (30 s): the reservation
+    # is ~7 s, nowhere near 30 s.
+    assert 4.0 <= sleep.max_gap() < 12.0, sleep.calls
+    await store.close()
+
+
+async def test_two_tasks_one_account_distinct_policies(tmp_path: Path) -> None:
+    """Two tasks on one account are bound DIFFERENT policies per execution.
+
+    Pacing slots are shared per account, so the order-independent
+    observable is the COUNT of ~30 s reservations: the 30 s task paces
+    its own second send (exactly one such reservation), while the
+    zero-interval task's sends reserve nothing. A cross-contaminating
+    binding (one policy for the whole account) yields zero (fast policy
+    everywhere) or several (slow policy everywhere)."""
+    manager, store, sleep, _gaps = await _paced_harness(
+        tmp_path,
+        tasks_raw={
+            "slow_task": {
+                "parameters": {},
+                "ratelimit": {"min_interval_seconds": 30.0},
+            },
+            "fast_task": {
+                "parameters": {},
+                "ratelimit": {"min_interval_seconds": 0.0},
+            },
+        },
+        accounts_raw=[{"id": ACCOUNT, "tasks": ["slow_task", "fast_task"]}],
+        task_ids=("slow_task", "fast_task"),
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "slow_task", TaskInstanceState.SUCCEEDED)
+        await wait_for_status(store, ACCOUNT, "fast_task", TaskInstanceState.SUCCEEDED)
+    big = [c for c in sleep.calls if c >= 25.0]
+    assert len(big) == 1, sleep.calls
+    await store.close()
+
+
+async def test_global_policy_falls_through_when_no_overrides(tmp_path: Path) -> None:
+    app = parse_app_config(
+        {
+            "version": 1,
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {
+                "backoff_base_seconds": 0.01,
+                "backoff_cap_seconds": 0.01,
+                "min_interval_seconds": 11.0,
+            },
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        await context.adapter.send_message(1, "first")
+        await context.adapter.send_message(1, "second")
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="Global pacing probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    sleep = RecordingSleep()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store, sleep=sleep),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    async with manager:
+        await wait_for_status(store, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+    assert 9.0 <= sleep.max_gap() < 13.0, sleep.calls
+    await store.close()
+
+
+async def test_with_policy_shares_client_binds_policy() -> None:
+    """Unit: ``with_policy`` views share the inner client/limiter and bind
+    only their policy (the base adapter stays policy-less)."""
+    sleep = RecordingSleep()
+    limiter = RateLimiter(sleep=sleep)
+    inner = MockAdapter()
+    adapter = RateLimitedAdapter(inner, limiter, ACCOUNT)
+    view = adapter.with_policy(EffectivePolicy(min_interval_seconds=5.0))
+
+    await view.send_message(1, "a")
+    await view.send_message(1, "b")  # ~5 s reservation recorded
+    assert 3.0 <= sleep.max_gap() < 6.0, sleep.calls
+
+    sleep.calls.clear()
+    await adapter.send_message(1, "c")
+    await adapter.send_message(1, "d")  # base view: no policy, no pacing
+    assert sleep.calls == []
+    assert len(inner.sent_messages) == 4  # same inner client throughout

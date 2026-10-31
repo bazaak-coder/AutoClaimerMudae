@@ -364,3 +364,32 @@ def test_non_object_json_root_is_rejected(tmp_path: Path) -> None:
     accounts_path.write_text(json.dumps(base_accounts()), encoding="utf-8")
     with pytest.raises(ConfigValidationError, match="must be a JSON object"):
         load_config(config_path, accounts_path)
+
+
+# External audit BUG-002: nested credential keys are rejected recursively
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"options": {"bot_token": "sensitive"}},
+        {"auth": {"token": "secret"}},
+        {"settings": [{"api_key": "secret"}]},
+        {"nested": {"credentials": {"password": "secret"}}},
+    ],
+)
+def test_nested_credentials_are_rejected(parameters: dict[str, Any]) -> None:
+    raw = base_app()
+    raw["tasks"]["claim_test"]["parameters"] = parameters
+    with pytest.raises(ConfigValidationError):
+        parse_app_config(raw)
+
+
+def test_legitimate_nested_parameters_still_parse() -> None:
+    raw = base_app()
+    raw["tasks"]["claim_test"]["parameters"] = {
+        "behavior": "safe",
+        "limits": {"max": 10, "labels": ["a", "b"]},
+    }
+    parsed = parse_app_config(raw)
+    assert parsed.tasks["claim_test"].parameters["limits"]["max"] == 10

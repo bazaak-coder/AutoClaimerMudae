@@ -529,3 +529,33 @@ async def test_status_snapshot_reflects_state_and_is_a_copy() -> None:
         pass
     assert status.next_pacing == {}
     assert limiter.status().next_pacing != {}
+
+
+# Repo-sweep: hostile Retry-After, store-failure containment, pace bypass
+
+
+async def test_hostile_retry_after_values_are_clamped() -> None:
+    limiter = RateLimiter()
+    for bad in (float("inf"), float("nan"), 1e309, -5.0):
+        deadline = await limiter.record_cooldown(
+            "account:1", retry_after_seconds=bad, server_directed=True
+        )  # never raises; finite, sane deadline
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        assert 0 <= remaining <= 86400
+
+
+async def test_store_failure_during_cooldown_record_is_contained() -> None:
+    """A transient DB error while persisting a cooldown must not escape
+    record_cooldown (previously it discarded the caller's CooldownError
+    handling and terminally killed the task)."""
+    from autoclaimer.persistence import DatabaseBusyError
+
+    class BusyStore:
+        async def set_scope_cooldown(self, *a: object, **k: object) -> None:
+            raise DatabaseBusyError("locked")
+
+    limiter = RateLimiter(store=BusyStore())  # type: ignore[arg-type]
+    deadline = await limiter.record_cooldown(
+        "account:1", retry_after_seconds=30.0, server_directed=True
+    )
+    assert deadline > datetime.now(UTC)  # in-memory record stands

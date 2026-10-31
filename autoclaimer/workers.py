@@ -129,10 +129,19 @@ class RateLimitedAdapter:
             lambda: self._inner.send_message(channel_id, content, on_dispatch=on_dispatch),
         )
 
-    async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
+    async def add_reaction(
+        self,
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         await self._run(
             "add_reaction",
-            lambda: self._inner.add_reaction(channel_id, message_id, emoji),
+            lambda: self._inner.add_reaction(
+                channel_id, message_id, emoji, on_dispatch=on_dispatch
+            ),
         )
 
     async def press_component(
@@ -166,6 +175,19 @@ class RateLimitedAdapter:
     async def validate_channel(self, channel_id: int) -> bool:
         """Cache-only visibility check: not a platform operation, never limited."""
         return await self._inner.validate_channel(channel_id)
+
+    def with_policy(self, policy: EffectivePolicy) -> RateLimitedAdapter:
+        """A per-execution view of this adapter bound to *policy*.
+
+        External-audit BUG-004 fix: the account-shared adapter carries no
+        policy, so account/task ratelimit overrides were parsed but never
+        applied to platform operations (the limiter default — global-only
+        — was used). The worker resolves the effective policy per
+        (account, task) — where the task id is known — and hands the
+        handler this view. Shares the inner client, limiter, and account
+        id; only the policy differs.
+        """
+        return RateLimitedAdapter(self._inner, self._limiter, self._account_id, policy=policy)
 
 
 class _AccountWorker:
@@ -219,10 +241,25 @@ class WorkerManager:
     # ----- lifecycle -----
 
     async def start(self) -> None:
-        """Recover interrupted work, materialize instances, start workers."""
+        """Recover interrupted work, materialize instances, start workers.
+
+        External audit BUG-001 fix: startup state is transactional —
+        ``_started`` flips True only after the whole initialization
+        sequence succeeds; a failure (e.g. transient ``DatabaseBusyError``
+        in ``recover_interrupted``) leaves the manager startable again
+        instead of silently no-op-ing every retry.
+        """
         if self._started:
             return
+        try:
+            await self._start_sequence()
+        except BaseException:
+            # Re-raise after cleanup: callers see the failure and may
+            # retry (the manager is NOT marked started).
+            raise
         self._started = True
+
+    async def _start_sequence(self) -> None:
         await self._store.recover_interrupted()
         # Audit fix (agents.md section 17.2.1): validate resolved task
         # parameters against the registry BEFORE spawning workers — a
@@ -240,6 +277,37 @@ class WorkerManager:
                     resolved = resolve_task_config(self._app_config, profile, task_id)
                 except ConfigValidationError:
                     continue  # handled at execution via _terminal_without_claim
+                # Repo-sweep fix: `enabled: false` (task definition or
+                # account override) is now CONSUMED — disabled assignments
+                # materialize nothing and never execute (previously the
+                # flag was parsed and silently ignored).
+                if not resolved.enabled:
+                    logger.info(
+                        "task disabled by configuration; skipping",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": task_id,
+                            "operation": "startup.validate",
+                            "outcome": "disabled",
+                        },
+                    )
+                    continue
+                # Repo-sweep fix: an UNREGISTERED task type is a wiring
+                # gap, not a parameter defect — do NOT create-and-fail
+                # the instance (terminal rows are never re-created, so
+                # the previous behavior permanently poisoned state.db for
+                # the repo's own demo config).
+                if task_id not in self._registry:
+                    logger.error(
+                        "task type not registered; skipping materialization",
+                        extra={
+                            "account_id": account_id,
+                            "task_id": task_id,
+                            "operation": "startup.validate",
+                            "outcome": "unregistered_task_type",
+                        },
+                    )
+                    continue
                 try:
                     self._registry.validate_config(task_id, resolved.parameters)
                 except Exception as exc:
@@ -362,6 +430,20 @@ class WorkerManager:
         if profile is None:
             return
         for task_id in profile.tasks:
+            try:
+                resolved = resolve_task_config(self._app_config, profile, task_id)
+            except ConfigValidationError:
+                # Startup validation already failed the instance; nothing
+                # to materialize here.
+                continue
+            # Repo-sweep fix: `enabled: false` (task or override) is
+            # consumed at materialization — disabled assignments never
+            # get an instance row, on start() or on runtime enable.
+            if not resolved.enabled:
+                continue
+            # Unregistered task types are a wiring gap, never a row.
+            if task_id not in self._registry:
+                continue
             await self._store.create_instance(account_id, task_id)
 
     def _profile(self, account_id: int) -> AccountProfile | None:
@@ -474,6 +556,13 @@ class WorkerManager:
             await self._terminal_without_claim(record, f"invalid task config: {exc}")
             return
         adapter = await self._adapter_for(account_id)
+        # External-audit BUG-004 fix: bind the RESOLVED policy (global →
+        # task → account) to the adapter used for THIS execution — the
+        # account-shared adapter is policy-less, and handlers driving it
+        # previously operated under the limiter default (global-only),
+        # silently ignoring every per-task/per-account ratelimit block.
+        policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
+        task_adapter = adapter.with_policy(policy)
         # Wait out account cooldowns BEFORE taking a global execution slot
         # so parked accounts cannot starve others (audit B6).
         await self._limiter.wait_scopes(account_id)
@@ -492,7 +581,7 @@ class WorkerManager:
                 account_id=account_id,
                 task_id=record.task_id,
                 config=resolved.parameters,
-                adapter=adapter,
+                adapter=task_adapter,
                 credentials=self._credentials,
             )
             try:
@@ -635,15 +724,20 @@ class WorkerManager:
                 return
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
-            # Worker-level retries are bounded by the resolved policy's
-            # retry_limit; beyond it the instance fails permanently (audit B8).
-            policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
-            if claimed.attempt_count >= policy.retry_limit + 1:
+            # Worker-level retries are bounded by the RESOLVED TASK
+            # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
+            # task → override chain was computed, test-asserted, and
+            # then ignored — the ratelimit-layer policy bound was used
+            # instead); beyond it the instance fails permanently (audit B8).
+            resolved_limit = resolve_task_config(
+                self._app_config, profile, record.task_id
+            ).retry_limit
+            if claimed.attempt_count >= resolved_limit + 1:
                 await self._record(
                     record.id,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"worker retry limit ({policy.retry_limit}) exhausted",
+                        message=f"worker retry limit ({resolved_limit}) exhausted",
                     ),
                     retry_at=None,
                 )

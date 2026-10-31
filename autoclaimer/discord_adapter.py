@@ -109,7 +109,7 @@ from .adapters import (
     SentMessage,
     UncertainOutcomeError,
 )
-from .credentials import CredentialProvider
+from .credentials import CredentialProvider, CredentialProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,16 @@ class DiscordAdapter:
                 # (transient close codes, network loss) reach this rebuild.
                 self._reset_for_restart()
             self._register_bridges()
-            token = self._credentials.get_token(self._account_id)
+            # Repo-sweep fix: a contract-following provider raises
+            # CredentialProviderError — missing/dead credentials are
+            # ACCOUNT-FATAL (the documented policy), not a generic
+            # per-instance permanent failure.
+            try:
+                token = self._credentials.get_token(self._account_id)
+            except CredentialProviderError as exc:
+                fatal = AccountFatalError(f"credential provider: {exc}")
+                self._latch_fatal(fatal)  # is_healthy flips; account stops
+                raise fatal from exc
             try:
                 await self._client.login(token)
             except discord.DiscordException as exc:
@@ -529,10 +538,22 @@ class DiscordAdapter:
         )
         return SentMessage(channel_id=channel_id, message_id=message.id, content=content)
 
-    async def add_reaction(self, channel_id: int, message_id: int, emoji: str) -> None:
+    async def add_reaction(
+        self,
+        channel_id: int,
+        message_id: int,
+        emoji: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         await self._ensure_ready()
         await self._pace()
         self._channel(channel_id)  # cache check only: no fetch_channel call
+        if on_dispatch is not None:
+            # BUG-005 fix: the reaction's wire boundary — after pacing,
+            # immediately before the HTTP request. Traffic from here on
+            # can genuinely answer THIS reaction.
+            on_dispatch()
         try:
             await self._client.http.add_reaction(channel_id, message_id, emoji)
         except discord.DiscordException as exc:

@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -231,6 +232,11 @@ class TaskStateStore:
         self._txn_owner: ContextVar[object | None] = ContextVar(
             "autoclaimer_txn_owner", default=None
         )
+        # Thread-level connection guard (repo-sweep cancellation fix):
+        # serializes every connection call across worker threads so an
+        # abandoned (cancelled-await) threaded op can never interleave
+        # with a later boundary or write. See ``_call_threaded``.
+        self._conn_guard = threading.RLock()
 
     # ----- lifecycle -----
 
@@ -251,9 +257,20 @@ class TaskStateStore:
             try:
                 self._conn = await asyncio.to_thread(_connect)
                 await asyncio.to_thread(self._migrate_sync, self._conn)
+                # Repo-sweep fix: CREATE TABLE IF NOT EXISTS no-ops on a
+                # tampered/foreign schema and user_version still claims
+                # current — verify the actual column shapes post-migrate
+                # so a mismatched database fails FAST with a typed,
+                # named error instead of forever-recoverable write errors.
+                await asyncio.to_thread(self._verify_shape_sync, self._conn)
             except (sqlite3.Error, PersistenceError) as exc:
                 if self._conn is not None:
-                    await asyncio.to_thread(self._conn.close)
+                    # Guarded close (repo-sweep): waits for any in-flight
+                    # call to drain instead of closing underneath it.
+                    try:
+                        await self._call_threaded(self._conn.close)
+                    except PersistenceError:
+                        logger.exception("connection close after failed open also failed")
                     self._conn = None
                 if isinstance(exc, sqlite3.Error):
                     raise _map_sqlite_error(exc) from exc
@@ -263,7 +280,9 @@ class TaskStateStore:
         """Close the connection; safe to call more than once."""
         async with self._lock:
             if self._conn is not None:
-                await asyncio.to_thread(self._conn.close)
+                # Guarded (repo-sweep): an abandoned in-flight call must
+                # finish before the connection closes underneath it.
+                await self._call_threaded(self._conn.close)
                 self._conn = None
 
     @property
@@ -299,11 +318,61 @@ class TaskStateStore:
                 raise
             version = target
 
+    def _verify_shape_sync(self, conn: sqlite3.Connection) -> None:
+        """Post-migration schema-shape verification (repo-sweep fix)."""
+        expected = {
+            "task_instances": {
+                "id",
+                "account_id",
+                "task_id",
+                "status",
+                "attempt_count",
+                "created_at",
+                "updated_at",
+                "last_outcome",
+                "next_attempt_at",
+                "cooldown_until",
+                "cooldown_scope",
+            },
+            "scope_cooldowns": {"scope", "deadline", "server_directed"},
+            "mudae_state": {"account_id", "kind", "deadline", "updated_at"},
+        }
+        for table, columns in expected.items():
+            found = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            missing = columns - found
+            if missing:
+                raise PersistenceError(
+                    f"Database schema shape mismatch for table '{table}': "
+                    f"missing column(s) {sorted(missing)}; the database "
+                    "appears tampered or foreign. Restore from a backup or "
+                    "delete the file to reinitialize."
+                )
+
     # ----- execution helpers -----
 
     async def _call_threaded(self, fn: Callable[..., _T], *args: Any) -> _T:
+        """Run *fn* on a worker thread, serialized by a CONNECTION GUARD.
+
+        Repo-sweep fix (ChatGPT unranked risk, promoted by deterministic
+        repro): cancelling the awaiting coroutine does NOT stop the
+        underlying ``to_thread`` operation — the asyncio lock releases
+        (or a transaction's ROLLBACK runs) while the abandoned call is
+        still in flight. That let a cancelled transaction's write land
+        afterwards in AUTOCOMMIT mode (orphaned write) and let the next
+        BEGIN race an abandoned ROLLBACK ("cannot start a transaction
+        within a transaction"). Acquiring a thread-level guard around
+        EVERY connection call establishes happens-before ordering:
+        boundaries never start until prior calls finish, and later
+        callers wait for abandoned calls to drain — cancellation can
+        abandon an await, never the connection's serialization.
+        """
+
+        def guarded() -> _T:
+            with self._conn_guard:
+                return fn(*args)
+
         try:
-            return await asyncio.to_thread(fn, *args)
+            return await asyncio.to_thread(guarded)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
 
@@ -586,7 +655,12 @@ class TaskStateStore:
             scope = row["scope"]
             try:
                 deadline = _parse_ts(row["deadline"])
-                server_directed = int(row["server_directed"])
+                raw_flag = row["server_directed"]
+                # Repo-sweep fix: float values (0.9, 1.7) previously
+                # truncated silently — require an exact 0/1 integer.
+                if not isinstance(raw_flag, int) or raw_flag not in (0, 1):
+                    raise ValueError(f"server_directed flag is {raw_flag!r}")
+                server_directed = raw_flag
                 if server_directed not in (0, 1):
                     raise ValueError(f"server_directed flag is {row['server_directed']!r}")
             except (ValueError, TypeError) as exc:
@@ -773,9 +847,11 @@ def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]
 def _row_to_record(row: sqlite3.Row) -> TaskInstanceRecord:
     try:
         return _decode_row(row)
-    except (ValueError, KeyError, TypeError) as exc:
-        # Corrupt row (bad JSON / timestamp / enum): a typed error carrying
-        # the row id so callers can quarantine instead of crashing raw.
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        # Corrupt row (bad JSON / timestamp / enum / MISSING COLUMN —
+        # repo-sweep: IndexError from a hand-made schema previously
+        # skipped containment entirely): a typed error carrying the row
+        # id so callers can quarantine instead of crashing raw.
         raise PersistenceError(
             f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: {exc}"
         ) from exc

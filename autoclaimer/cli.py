@@ -25,6 +25,7 @@ Commands (REPL)::
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -37,6 +38,8 @@ from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
 from .ratelimit import RateLimiter, RateLimitError
 from .registry import TaskRegistry
 from .workers import WorkerManager
+
+logger = logging.getLogger(__name__)
 
 LineReader = Callable[[str], Awaitable[str]]
 LineWriter = Callable[[str], None]
@@ -61,6 +64,7 @@ class AutoClaimerController:
         self._accounts = accounts
         self._store = store
         self._limiter = limiter
+        self._credentials = credentials
         self._manager = WorkerManager(
             registry=registry,
             store=store,
@@ -92,14 +96,27 @@ class AutoClaimerController:
         return "framework stopped (graceful)"
 
     async def shutdown(self) -> None:
-        """Stop workers and close the store; idempotent."""
+        """Stop workers and close the store; idempotent.
+
+        Repo-sweep fixes: the credential provider's ``close()`` hook is
+        finally honored (providers holding keyring/session handles leak
+        otherwise), and a persistence failure during store close is
+        logged instead of escaping the REPL's finally block."""
         if self._closed:
             return
         self._closed = True
         try:
             await self._manager.stop()
         finally:
-            await self._store.close()  # always released (N7)
+            if self._credentials is not None:
+                try:
+                    self._credentials.close()
+                except Exception:
+                    logger.exception("credential provider close failed")
+            try:
+                await self._store.close()  # always released (N7)
+            except Exception:
+                logger.exception("store close failed during shutdown")
 
     # ----- account controls (valid before start) -----
 
@@ -292,11 +309,13 @@ class CliSession:
     async def _cmd_pause(self, args: list[str]) -> str:
         if not args:
             return self._controller.pause_all()
+        self._exact_args(args, 1)  # audit BUG-003: no silently ignored ids
         return self._controller.pause_account(self._account_arg(args[0]))
 
     async def _cmd_resume(self, args: list[str]) -> str:
         if not args:
             return self._controller.resume_all()
+        self._exact_args(args, 1)
         return self._controller.resume_account(self._account_arg(args[0]))
 
     async def _cmd_enable(self, args: list[str]) -> str:

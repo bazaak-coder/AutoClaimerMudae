@@ -88,6 +88,32 @@ def _snowflake(value: Any, where: str) -> int:
     return value
 
 
+def _contains_credential_key(value: Any, where: str) -> bool:
+    """External-audit BUG-002 fix: RECURSIVE credential-key detection.
+
+    The previous check examined only the top-level keys —
+    ``{"options": {"bot_token": "…"}}`` passed validation. Nested
+    dicts and lists are now walked to the leaves.
+    """
+    if isinstance(value, dict):
+        for key, child in value.items():
+            lowered = key.lower()
+            if any(hint in lowered for hint in _CREDENTIAL_KEY_HINTS):
+                raise ConfigValidationError(
+                    f"{where} contains credential-like key '{key}'. Credentials "
+                    "must be supplied by a secure credential provider and never "
+                    "stored in plaintext JSON configuration."
+                )
+            if _contains_credential_key(child, f"{where}.{key}"):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _contains_credential_key(child, f"{where}[{i}]") for i, child in enumerate(value)
+        )
+    return False
+
+
 def _parameters(value: Any, where: str) -> dict[str, Any]:
     obj = _object(value, where)
     for key in obj:
@@ -98,6 +124,7 @@ def _parameters(value: Any, where: str) -> dict[str, Any]:
                 "must be supplied by a secure credential provider and never "
                 "stored in plaintext JSON configuration."
             )
+    _contains_credential_key(obj, where)  # nested keys too (audit fix)
     # Ensure values can be represented as JSON, don't contain NaN/Infinity,
     # and stay bounded (64 KiB) so configs cannot balloon memory.
     try:
