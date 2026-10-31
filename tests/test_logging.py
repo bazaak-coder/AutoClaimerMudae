@@ -197,8 +197,6 @@ def test_rotation_failure_path_never_dumps_raw_record(
     handler = logger.handlers[0]
     assert isinstance(handler, _RH)
 
-    real_rollover = handler.doRollover
-
     def failing_rollover() -> None:
         raise OSError(28, "No space left on device")
 

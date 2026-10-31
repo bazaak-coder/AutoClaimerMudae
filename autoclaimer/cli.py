@@ -33,13 +33,13 @@ from typing import Any
 from .adapters import AdapterError, PlatformAdapter
 from .credentials import CredentialProvider
 from .logging_setup import redact_text
-
-logger = logging.getLogger(__name__)
 from .models import AccountsConfig, AppConfig
 from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
 from .ratelimit import RateLimiter, RateLimitError
 from .registry import TaskRegistry
 from .workers import WorkerManager
+
+logger = logging.getLogger(__name__)
 
 LineReader = Callable[[str], Awaitable[str]]
 LineWriter = Callable[[str], None]

@@ -167,6 +167,19 @@ class RateLimitedAdapter:
         """Cache-only visibility check: not a platform operation, never limited."""
         return await self._inner.validate_channel(channel_id)
 
+    def with_policy(self, policy: EffectivePolicy) -> RateLimitedAdapter:
+        """A per-execution view of this adapter bound to *policy*.
+
+        External-audit BUG-004 fix: the account-shared adapter carries no
+        policy, so account/task ratelimit overrides were parsed but never
+        applied to platform operations (the limiter default — global-only
+        — was used). The worker resolves the effective policy per
+        (account, task) — where the task id is known — and hands the
+        handler this view. Shares the inner client, limiter, and account
+        id; only the policy differs.
+        """
+        return RateLimitedAdapter(self._inner, self._limiter, self._account_id, policy=policy)
+
 
 class _AccountWorker:
     """One account's scheduling loop."""
@@ -534,6 +547,13 @@ class WorkerManager:
             await self._terminal_without_claim(record, f"invalid task config: {exc}")
             return
         adapter = await self._adapter_for(account_id)
+        # External-audit BUG-004 fix: bind the RESOLVED policy (global →
+        # task → account) to the adapter used for THIS execution — the
+        # account-shared adapter is policy-less, and handlers driving it
+        # previously operated under the limiter default (global-only),
+        # silently ignoring every per-task/per-account ratelimit block.
+        policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
+        task_adapter = adapter.with_policy(policy)
         # Wait out account cooldowns BEFORE taking a global execution slot
         # so parked accounts cannot starve others (audit B6).
         await self._limiter.wait_scopes(account_id)
@@ -552,7 +572,7 @@ class WorkerManager:
                 account_id=account_id,
                 task_id=record.task_id,
                 config=resolved.parameters,
-                adapter=adapter,
+                adapter=task_adapter,
                 credentials=self._credentials,
             )
             try:
