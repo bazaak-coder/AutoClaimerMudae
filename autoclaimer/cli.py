@@ -362,9 +362,7 @@ class AutoClaimerController:
         if self._credential_store is not None:
             try:
                 ids = await self._credential_store.account_ids()
-                lines.append(
-                    f"  [OK] credentials — encrypted store ready, {len(ids)} token(s)"
-                )
+                lines.append(f"  [OK] credentials — encrypted store ready, {len(ids)} token(s)")
             except Exception as exc:
                 lines.append(f"  [FAIL] credentials — {type(exc).__name__}: {exc}")
         else:
@@ -392,11 +390,7 @@ class AutoClaimerController:
             status = await self._manager.status()
             by_account = {info.account_id: info for info in status.workers}
             for profile in accounts_cfg.accounts:
-                state = (
-                    health[profile.id].state.value
-                    if profile.id in health
-                    else "unknown"
-                )
+                state = health[profile.id].state.value if profile.id in health else "unknown"
                 worker = by_account.get(profile.id)
                 queued = worker.queued if worker is not None else 0
                 marker = "OK" if state in ("healthy", "connecting", "unknown") else "WARN"
