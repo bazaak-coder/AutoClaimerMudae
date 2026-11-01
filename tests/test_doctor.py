@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 import autoclaimer.config as config_module
 from autoclaimer.cli import AutoClaimerController, CliSession
 from autoclaimer.config import parse_accounts_config, parse_app_config
@@ -69,9 +68,7 @@ def _controller(
     return controller, store
 
 
-async def _run_doctor(
-    controller: AutoClaimerController, tmp_path: Path
-) -> str:
+async def _run_doctor(controller: AutoClaimerController, tmp_path: Path) -> str:
     output: list[str] = []
     session = CliSession(controller, read_line=None, write=output.append)  # type: ignore[arg-type]
     cfg = str(tmp_path / "config.json")
@@ -164,6 +161,7 @@ async def test_doctor_neever_migrates_an_outdated_config(tmp_path: Path) -> None
     controller, store = _controller(tmp_path)
     await store.open()
     try:
+
         def _sample(doc: Any) -> dict[str, Any]:
             return {**doc, "channels": {**doc.get("channels", {}), "mu": None}}
 
