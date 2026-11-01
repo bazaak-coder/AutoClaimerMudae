@@ -108,6 +108,26 @@ config); extra/unknown arguments are errors, never silently ignored; store,
 limiter, adapter, and credential failures are reported without killing the
 session.
 
+### Database maintenance
+
+AutoClaimer runs SQLite's **rollback journal** (not WAL — the shared-memory
+mapping is unreliable in the target environment), so there are no WAL
+checkpoints to manage: the journal is removed automatically after every
+commit.
+
+- **Growth monitoring:** `dbstats` reports file size, page/free-page
+  counts, the live journal mode, and per-table row counts. Growth is
+  structurally bounded: audit events (latest 1000) and per-task history
+  (latest 50 attempts) are pruned on write.
+- **Backup:** `backup <path>` writes a consistent, compacted snapshot
+  (`VACUUM INTO`) through the store's serialized connection — safe while
+  idle, and safe to run live (it waits for concurrent writes; it never
+  produces a torn copy). Existing targets are never overwritten.
+- **Restoration:** stop the application, replace `state.db` with the
+  backup file, restart. Credentials in the backup decrypt only with the
+  key that encrypted them — keep key and backup pairing in mind when
+  restoring across environments.
+
 ## Logging
 
 - Rotating file log (see `logging` in [configuration.md](configuration.md))
