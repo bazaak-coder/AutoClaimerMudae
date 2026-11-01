@@ -97,20 +97,22 @@ Establish a safe procedure for backing up and restoring credential-related data.
 
 **Priority: P1**
 
-### [ ] 5. Fault-Injection Testing
+### [x] 5. Fault-Injection Testing
 
 Introduce systematic failure testing across workers, adapters, persistence, and rate limiting.
 
 **Acceptance criteria:**
 
-- [ ] Simulate adapter disconnections.
-- [ ] Simulate database read and write failures.
-- [ ] Simulate delayed responses and timeouts.
-- [ ] Simulate task cancellation at critical execution points.
-- [ ] Simulate rate-limit exceptions and repeated cooldowns.
-- [ ] Verify worker recovery and shutdown behavior.
-- [ ] Verify no leaked asynchronous tasks.
-- [ ] Verify failures are observable through structured logs.
+- [x] Simulate adapter disconnections. — disconnect storm (heals inside the transport layer within one worker attempt) and never-healing disconnects (transport bound exhausts → terminal with the exhaustion reason persisted)
+- [x] Simulate database read and write failures. — `DatabaseBusyError` injected on the scheduling read (worker backs off, survives, completes) and on outcome recording (row stays honestly `running`; restart recovers and re-executes)
+- [x] Simulate delayed responses and timeouts. — a bounded handler against a stalled adapter: recoverable classification, bounded retries, terminal with exhaustion reason — never a hang
+- [x] Simulate task cancellation at critical execution points. — graceful stop while a handler is mid-execution: no leaked asyncio tasks, row recoverable, restart completes it
+- [x] Simulate rate-limit exceptions and repeated cooldowns. — repeated server-directed `CooldownError`s waited out via the limiter (fake-clock verified: two ≥30 s deferrals, exactly one real send, no burst)
+- [x] Verify worker recovery and shutdown behavior. — every scenario asserts subsequent work still completes and `stop()` drains within budget
+- [x] Verify no leaked asynchronous tasks. — `asyncio.all_tasks()` baseline comparison after every scenario (drain-tolerant)
+- [x] Verify failures are observable through structured logs. — classified "task handler crashed" record with `exc_info` carrying the injected reason + structured operation/outcome extras
+
+**Completed:** 2026-11-01 (`tests/test_fault_injection.py` — 9 scenarios). Note: `RecordingSleep` doubles as a fake clock (sleep advances wall/mono) — cooldown waits loop until the wall deadline, so an instant sleep alone would busy-spin in real time.
 
 **Dependencies:** Existing integration test infrastructure.
 
