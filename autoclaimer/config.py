@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -322,9 +323,10 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         "config",
     )
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
-    if version != 1:
+    if version != CURRENT_CONFIG_VERSION:
         raise ConfigValidationError(
-            f"Unsupported config.version {version}; supported version is 1."
+            f"Unsupported config.version {version}; supported version is "
+            f"{CURRENT_CONFIG_VERSION}."
         )
 
     if "channels" not in data:
@@ -502,11 +504,107 @@ def parse_accounts_config(raw: Mapping[str, Any], app_config: AppConfig) -> Acco
     return AccountsConfig(version=version, accounts=tuple(profiles))
 
 
+#: The configuration schema version this build reads and writes. Bump
+#: when a config.json format change ships, register a migrator for the
+#: previous version in ``_CONFIG_MIGRATIONS``, and document the change.
+CURRENT_CONFIG_VERSION = 1
+
+#: Sequential config migrations: ``from_version -> callable`` producing
+#: the NEXT version's document (without the version key — the framework
+#: bumps it). Empty until a v2 schema exists; tests exercise the
+#: machinery through :func:`register_config_migration`.
+ConfigMigrator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+_CONFIG_MIGRATIONS: dict[int, ConfigMigrator] = {}
+
+
+def register_config_migration(from_version: int, migrator: ConfigMigrator) -> None:
+    """Register the migration FROM *from_version* (to from_version+1).
+
+    The framework's contract with each migrator: receive the previous
+    document, return the next one WITHOUT the ``version`` key (the
+    framework sets it), and preserve unrelated user settings.
+    """
+    if from_version < 1 or from_version >= CURRENT_CONFIG_VERSION + 10:
+        raise ConfigValidationError(
+            f"cannot register a config migration from version {from_version}."
+        )
+    _CONFIG_MIGRATIONS[from_version] = migrator
+
+
+def migrate_config_document(
+    raw: Mapping[str, Any], *, target: int | None = None
+) -> tuple[dict[str, Any], list[int]]:
+    """Pure, sequential migration of *raw* toward *target* (no I/O).
+
+    Returns ``(document, applied_from_versions)``. Raises
+    ConfigValidationError when a step is missing from the chain (no
+    migration path) — before any file is touched.
+    """
+    if target is None:
+        target = CURRENT_CONFIG_VERSION
+    document = dict(raw)
+    applied: list[int] = []
+    version = document.get("version")
+    if not isinstance(version, int):
+        raise ConfigValidationError("config.version must be an integer.")
+    while version < target:
+        step = _CONFIG_MIGRATIONS.get(version)
+        if step is None:
+            raise ConfigValidationError(
+                f"no registered migration from config version {version} to "
+                f"{version + 1}; upgrade AutoClaimer (or migrate manually) "
+                "and retry."
+            )
+        document = dict(step(document))
+        version += 1
+        document["version"] = version
+        applied.append(version - 1)
+    return document, applied
+
+
+def _migrate_config_file(path: Path, raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the config file ON DISK (roadmap item 12).
+
+    Order of operations (fail-safe by construction):
+    1. migrate PURELY (a raising migrator changes nothing on disk);
+    2. VALIDATE the migrated document through the full parser (an
+       invalid result changes nothing on disk);
+    3. write a BACKUP of the original beside it (``<name>.vN.bak``) —
+       never overwriting an existing backup;
+    4. ATOMIC write (temp file + rename) — a crash cannot leave a
+       half-written config, and no ``.tmp`` litter survives.
+    """
+    migrated, applied = migrate_config_document(raw)
+    parse_app_config(migrated)  # fail-safe validation before any write
+    backup = path.with_name(f"{path.name}.v{raw.get('version')}.bak")
+    if not backup.exists():
+        backup.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "config migrated",
+        extra={"operation": "config.migrate", "outcome": ",".join(map(str, applied))},
+    )
+    return migrated
+
+
 def load_config(
     config_path: str | Path, accounts_path: str | Path
 ) -> tuple[AppConfig, AccountsConfig]:
-    """Load and validate both files, including cross-file task references."""
-    app = parse_app_config(_load_json(config_path))
+    """Load and validate both files, including cross-file task references.
+
+    Roadmap item 12: an outdated ``config.json`` version is migrated
+    (backup + atomic rewrite) before parsing. ``accounts.json`` follows
+    the application schema version and has no independent migrations.
+    """
+    path = Path(config_path)
+    raw = _load_json(path)
+    version = raw.get("version")
+    if isinstance(version, int) and version < CURRENT_CONFIG_VERSION:
+        raw = _migrate_config_file(path, raw)
+    app = parse_app_config(raw)
     accounts = parse_accounts_config(_load_json(accounts_path), app)
     return app, accounts
 
