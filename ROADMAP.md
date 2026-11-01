@@ -301,20 +301,22 @@ Introduce database maintenance procedures for long-running installations.
 
 **Dependencies:** SQLite persistence.
 
-### [ ] 15. CLI Diagnostics
+### [x] 15. CLI Diagnostics
 
 Provide a diagnostic command for troubleshooting installations (`autoclaimer doctor`).
 
 **Acceptance criteria:**
 
-- [ ] Check configuration validity.
-- [ ] Check database accessibility and integrity.
-- [ ] Check credential-store availability without displaying secrets.
-- [ ] Check registered task definitions.
-- [ ] Report account connection status.
-- [ ] Report worker and scheduler status.
-- [ ] Provide actionable failure explanations.
-- [ ] Avoid modifying application state during ordinary diagnostics.
+- [x] Check configuration validity. — full parse of both files, FAIL-first with the actionable validation error
+- [x] Check database accessibility and integrity. — reuses the read-only integrity diagnostics (item 2); typed failure line with a hint on store errors
+- [x] Check credential-store availability without displaying secrets. — readiness + token COUNT only; WARN (never FAIL) when no Fernet key, with the setup hint
+- [x] Check registered task definitions. — registry types vs configured tasks: WARN on unregistered wiring gaps with the "retired, not executed" hint
+- [x] Report account connection status. — per-account health state (item 6) in the report
+- [x] Report worker and scheduler status. — worker state + queue depth per account, scheduler summary
+- [x] Provide actionable failure explanations. — every WARN/FAIL line carries a `→` hint; invalid config short-circuits with the fix instruction
+- [x] Avoid modifying application state during ordinary diagnostics. — strictly read-only: configuration is parsed WITHOUT migrating (verified — outdated config + registered migrator leaves the file byte-identical, no backup), database checks are the read-only diagnostics
+
+**Completed:** 2026-11-01 (CLI `doctor [config accounts]`; `tests/test_doctor.py` — 6 scenarios).
 
 **Dependencies:** Existing CLI, persistence, and runtime components.
 

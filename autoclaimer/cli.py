@@ -311,6 +311,101 @@ class AutoClaimerController:
             f"  rows: {rows}",
         ]
 
+    async def doctor_report(self, config_path: str, accounts_path: str) -> list[str]:
+        """Operational diagnostics (roadmap item 15) — strictly READ-ONLY.
+
+        Checks configuration (parsed WITHOUT migrating — doctor never
+        rewrites files), database integrity, credential availability
+        (count only, never secrets), task registration wiring, account
+        health, and worker/scheduler status. Every WARN/FAIL carries an
+        actionable hint.
+        """
+        from .config import _load_json, parse_accounts_config, parse_app_config
+        from .models import ConfigValidationError
+
+        lines: list[str] = ["doctor:"]
+
+        # 1. Configuration validity (read-only parse — no migration).
+        try:
+            app = parse_app_config(_load_json(config_path))
+            accounts_cfg = parse_accounts_config(_load_json(accounts_path), app)
+            lines.append(
+                f"  [OK] configuration — {len(app.tasks)} task(s), "
+                f"{len(accounts_cfg.accounts)} account(s), channels resolved"
+            )
+        except (ConfigValidationError, OSError) as exc:
+            lines.append(f"  [FAIL] configuration — {exc}")
+            lines.append("      → fix the reported field and re-run doctor")
+            return lines  # nothing else can be checked meaningfully
+
+        # 2. Database accessibility + integrity (read-only diagnostics).
+        try:
+            known = {account.id for account in accounts_cfg.accounts}
+            findings = await self._store.integrity_report(known_account_ids=known)
+            if findings:
+                for finding in findings:
+                    lines.append(
+                        f"  [{'WARN' if finding.severity == 'warning' else 'FAIL'}] "
+                        f"database — {finding.table} {finding.key}: {finding.problem}"
+                    )
+                    lines.append(f"      → {finding.hint}")
+            else:
+                lines.append("  [OK] database — accessible, integrity clean")
+        except Exception as exc:  # typed store failures
+            lines.append(f"  [FAIL] database — {type(exc).__name__}: {exc}")
+            lines.append("      → check the file permissions/path of state.db")
+
+        # 3. Credential store availability (no secrets displayed).
+        if self._credential_store is not None:
+            try:
+                ids = await self._credential_store.account_ids()
+                lines.append(
+                    f"  [OK] credentials — encrypted store ready, {len(ids)} token(s)"
+                )
+            except Exception as exc:
+                lines.append(f"  [FAIL] credentials — {type(exc).__name__}: {exc}")
+        else:
+            lines.append(
+                "  [WARN] credentials — no valid FERNET key configured "
+                "(credential commands disabled)"
+            )
+            lines.append("      → set AUTOCLAIMER_FERNET_KEY (see 'credential generate-key')")
+
+        # 4. Registered task definitions vs configuration wiring.
+        registered = set(self._manager._registry.type_ids)  # noqa: SLF001
+        configured = set(app.tasks)
+        unregistered = sorted(configured - registered)
+        if unregistered:
+            lines.append(
+                f"  [WARN] tasks — configured but not registered: {', '.join(unregistered)}"
+            )
+            lines.append("      → instances for these tasks are retired, not executed")
+        else:
+            lines.append(f"  [OK] tasks — {len(registered)} registered type(s)")
+
+        # 5. Account health + 6. worker/scheduler status.
+        try:
+            health = self._manager.health()
+            status = await self._manager.status()
+            by_account = {info.account_id: info for info in status.workers}
+            for profile in accounts_cfg.accounts:
+                state = (
+                    health[profile.id].state.value
+                    if profile.id in health
+                    else "unknown"
+                )
+                worker = by_account.get(profile.id)
+                queued = worker.queued if worker is not None else 0
+                marker = "OK" if state in ("healthy", "connecting", "unknown") else "WARN"
+                lines.append(
+                    f"  [{marker}] account {profile.id} — health={state}, "
+                    f"worker={worker.state.value if worker else 'not spawned'}, queued={queued}"
+                )
+            lines.append(f"  [OK] scheduler — {len(status.workers)} worker(s) tracked")
+        except Exception as exc:  # pragma: no cover - defensive
+            lines.append(f"  [WARN] runtime — status unavailable: {type(exc).__name__}: {exc}")
+        return lines
+
     async def audit_report(self, limit: int) -> list[str]:
         """Recent audit events, newest first (roadmap item 11)."""
         events = await self._store.audit_events(limit=limit)
@@ -712,6 +807,15 @@ class CliSession:
         account_id = self._account_arg(args[0])
         return await self._controller.retry_task(account_id, args[1])
 
+    async def _cmd_doctor(self, args: list[str]) -> list[str]:
+        """Operational diagnostics: config, database, credentials, tasks,
+        workers — read-only, with actionable hints."""
+        if len(args) not in (0, 2):
+            raise ValueError("usage: doctor [config.json accounts.json]")
+        config_path = args[0] if args else "config.json"
+        accounts_path = args[1] if args else "accounts.json"
+        return await self._controller.doctor_report(config_path, accounts_path)
+
     async def _cmd_backup(self, args: list[str]) -> str:
         """Consistent database backup (VACUUM INTO; refuses to overwrite)."""
         self._exact_args(args, 1)
@@ -780,6 +884,7 @@ class CliSession:
         "reload": _cmd_reload,
         "backup": _cmd_backup,
         "dbstats": _cmd_dbstats,
+        "doctor": _cmd_doctor,
     }
 
 
@@ -812,6 +917,7 @@ USAGE = """commands:
   reload [config accounts]       validate + atomically apply new configuration at runtime
   backup <path>                  consistent database backup (VACUUM INTO; refuses to overwrite)
   dbstats                        database growth snapshot (size, pages, rows)
+  doctor [config accounts]       read-only diagnostics: config, DB, credentials, tasks, workers
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 
