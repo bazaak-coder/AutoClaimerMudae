@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 import autoclaimer.config as config_module
 from autoclaimer.cli import AutoClaimerController, CliSession
@@ -165,7 +164,10 @@ async def test_doctor_neever_migrates_an_outdated_config(tmp_path: Path) -> None
     controller, store = _controller(tmp_path)
     await store.open()
     try:
-        config_module._CONFIG_MIGRATIONS[1] = lambda doc: {**doc, "channels": {**doc.get("channels", {}), "mu": None}}
+        def _sample(doc: Any) -> dict[str, Any]:
+            return {**doc, "channels": {**doc.get("channels", {}), "mu": None}}
+
+        config_module._CONFIG_MIGRATIONS[1] = _sample
         config_module.CURRENT_CONFIG_VERSION = 2
         cfg_path = tmp_path / "config.json"
         before = cfg_path.read_bytes()
