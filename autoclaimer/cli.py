@@ -207,6 +207,27 @@ class AutoClaimerController:
             )
         return lines
 
+    def health_report(self) -> list[str]:
+        """Per-account health (roadmap item 6): state, last success,
+        consecutive failures, and the last (redacted) error."""
+        health = self._manager.health()
+        if not health:
+            return ["health: no accounts observed yet"]
+        lines = ["health:"]
+        for account in sorted(health):
+            snapshot = health[account]
+            lines.append(
+                f"  account {account}: {snapshot.state.value}"
+                f" | successes {snapshot.total_successes}"
+                f" | failures {snapshot.total_failures}"
+                f" (streak {snapshot.consecutive_failures})"
+                f" | last success "
+                f"{snapshot.last_success_at.isoformat() if snapshot.last_success_at else '—'}"
+            )
+            if snapshot.last_error:
+                lines.append(f"    last error: {snapshot.last_error}")
+        return lines
+
     # ----- account controls (valid before start) -----
 
     def known_account(self, account_id: int) -> bool:
@@ -563,6 +584,11 @@ class CliSession:
         self._exact_args(args, 0)
         return await self._controller.integrity_report()
 
+    async def _cmd_health(self, args: list[str]) -> list[str]:
+        """Per-account health: state, streaks, last success, last error."""
+        self._exact_args(args, 0)
+        return self._controller.health_report()
+
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
             return TaskInstanceState(raw)
@@ -585,6 +611,7 @@ class CliSession:
         "status": _cmd_status,
         "credential": _cmd_credential,
         "integrity": _cmd_integrity,
+        "health": _cmd_health,
     }
 
 
@@ -610,6 +637,7 @@ USAGE = """commands:
                                   restore credentials (validated, re-encrypted under primary)
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
+  health                          account health: state, streaks, last success/error
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 

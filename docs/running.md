@@ -93,6 +93,7 @@ The interactive REPL (`help` inside the session shows the same):
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
 | `status` | Worker status snapshot |
+| `health` | Per-account health: state (`healthy`/`connecting`/`disconnected`/`degraded`/`auth_failed`/`rate_limited`/`disabled`), success/failure totals, current streak, last success, last (redacted) error |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
 | `help` | Command help |
 | `quit` / `exit` / `shutdown` | Graceful shutdown and exit |
