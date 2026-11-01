@@ -284,18 +284,20 @@ Surface: CLI `reload [config accounts]` (defaults config.json/accounts.json) —
 
 **Dependencies:** Configuration migration framework and runtime controls.
 
-### [ ] 14. SQLite Maintenance
+### [x] 14. SQLite Maintenance
 
 Introduce database maintenance procedures for long-running installations.
 
 **Acceptance criteria:**
 
-- [ ] Document WAL checkpoint behavior.
-- [ ] Monitor database file growth.
-- [ ] Provide safe backup procedures.
-- [ ] Avoid maintenance during conflicting active transactions.
-- [ ] Test maintenance while the runtime is idle.
-- [ ] Document restoration procedures.
+- [x] Document WAL checkpoint behavior. — the deployment deliberately runs the ROLLBACK journal, not WAL (shared-memory mapping unreliable in the target environment — `persistence._connect`); there are no WAL checkpoints, the journal is auto-removed after each commit, and `dbstats` surfaces the live journal mode so a silent switch cannot go unnoticed
+- [x] Monitor database file growth. — `dbstats` CLI + `database_stats()`: file size, page/free-page counts, per-table row counts; growth is structurally bounded by audit/history retention (verified end to end)
+- [x] Provide safe backup procedures. — `backup <path>` CLI + `backup_to()`: consistent snapshot via `VACUUM INTO` on the guarded connection (compacted, self-contained); refuses to overwrite existing targets
+- [x] Avoid maintenance during conflicting active transactions. — the backup serializes through the connection guard: a concurrent write completes first or waits within the busy timeout — never a torn copy (tested against an open write transaction on a second connection)
+- [x] Test maintenance while the runtime is idle. — idle backup + restoration verified on a seeded store
+- [x] Document restoration procedures. — `docs/running.md` "Database maintenance": stop (or back up live), replace `state.db` with the backup, remember key↔backup pairing for credentials
+
+**Completed:** 2026-11-01 (`tests/test_db_maintenance.py` — 5 scenarios).
 
 **Dependencies:** SQLite persistence.
 

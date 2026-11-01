@@ -294,6 +294,23 @@ class AutoClaimerController:
             )
         return lines
 
+    async def backup_database(self, path: str) -> str:
+        """Consistent backup via VACUUM INTO (roadmap item 14)."""
+        size = await self._store.backup_to(path)
+        return f"backup written: {path} ({size} bytes, consistent snapshot)"
+
+    async def database_stats_report(self) -> list[str]:
+        """Growth-monitoring snapshot (roadmap item 14)."""
+        stats = await self._store.database_stats()
+        rows = ", ".join(f"{table}={count}" for table, count in stats["rows"].items())
+        return [
+            f"database: {stats['path']}",
+            f"  size {stats['size_bytes']} bytes | pages {stats['page_count']} "
+            f"({stats['page_size']} B each, {stats['freelist_pages']} free)",
+            f"  journal {stats['journal_mode']} (rollback journal; no WAL checkpoints)",
+            f"  rows: {rows}",
+        ]
+
     async def audit_report(self, limit: int) -> list[str]:
         """Recent audit events, newest first (roadmap item 11)."""
         events = await self._store.audit_events(limit=limit)
@@ -695,6 +712,16 @@ class CliSession:
         account_id = self._account_arg(args[0])
         return await self._controller.retry_task(account_id, args[1])
 
+    async def _cmd_backup(self, args: list[str]) -> str:
+        """Consistent database backup (VACUUM INTO; refuses to overwrite)."""
+        self._exact_args(args, 1)
+        return await self._controller.backup_database(args[0])
+
+    async def _cmd_dbstats(self, args: list[str]) -> list[str]:
+        """Database growth snapshot (sizes, pages, row counts)."""
+        self._exact_args(args, 0)
+        return await self._controller.database_stats_report()
+
     async def _cmd_reload(self, args: list[str]) -> list[str]:
         """Runtime configuration reload (validated, atomic, audited)."""
         if len(args) not in (0, 2):
@@ -751,6 +778,8 @@ class CliSession:
         "history": _cmd_history,
         "audit": _cmd_audit,
         "reload": _cmd_reload,
+        "backup": _cmd_backup,
+        "dbstats": _cmd_dbstats,
     }
 
 
@@ -781,6 +810,8 @@ USAGE = """commands:
   history <account> <task>        execution history (attempts, outcomes, timestamps)
   audit [limit]                  recent audit events (lifecycle, controls, credentials)
   reload [config accounts]       validate + atomically apply new configuration at runtime
+  backup <path>                  consistent database backup (VACUUM INTO; refuses to overwrite)
+  dbstats                        database growth snapshot (size, pages, rows)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 

@@ -820,6 +820,66 @@ class TaskStateStore:
                 extra={"operation": "audit.append", "outcome": "audit_failed"},
             )
 
+    async def backup_to(self, path: str | Path) -> int:
+        """Consistent database backup via ``VACUUM INTO`` (roadmap 14).
+
+        Runs on the guarded connection, so it serializes with active
+        store operations (a conflicting write either completes first or
+        waits within the busy timeout — never a torn backup). The result
+        is a compacted, self-contained copy. Returns the backup size in
+        bytes. Preferred while idle; safe to run live.
+        """
+        target = Path(path)
+        if target.exists():
+            raise PersistenceError(
+                f"backup target {target} already exists; refusing to overwrite"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        def _vacuum_into() -> None:
+            conn = self._connection()
+            with self._conn_guard:
+                conn.execute("VACUUM INTO ?", (str(target),))
+
+        try:
+            await asyncio.to_thread(_vacuum_into)
+        except sqlite3.Error as exc:
+            raise _map_sqlite_error(exc) from exc
+        return target.stat().st_size
+
+    async def database_stats(self) -> dict[str, Any]:
+        """Growth-monitoring snapshot (roadmap item 14): file size, page
+        counts, and per-table row counts. Read-only."""
+        def _stats() -> dict[str, Any]:
+            conn = self._connection()
+            with self._conn_guard:
+                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+                freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                rows = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "task_instances",
+                        "scope_cooldowns",
+                        "mudae_state",
+                        "account_credentials",
+                        "task_history",
+                        "audit_events",
+                    )
+                }
+            return {
+                "path": str(self._path),
+                "size_bytes": self._path.stat().st_size if self._path.exists() else 0,
+                "page_count": int(page_count),
+                "freelist_pages": int(freelist),
+                "page_size": int(page_size),
+                "journal_mode": str(journal),
+                "rows": rows,
+            }
+
+        return await asyncio.to_thread(_stats)
+
     async def audit_events(self, *, limit: int = 50) -> tuple[tuple[Any, ...], ...]:
         """Recent audit events, newest first:
         (timestamp, category, action, account_id, task_id, detail)."""
