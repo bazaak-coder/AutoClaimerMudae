@@ -325,8 +325,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
     if version != CURRENT_CONFIG_VERSION:
         raise ConfigValidationError(
-            f"Unsupported config.version {version}; supported version is "
-            f"{CURRENT_CONFIG_VERSION}."
+            f"Unsupported config.version {version}; supported version is {CURRENT_CONFIG_VERSION}."
         )
 
     if "channels" not in data:

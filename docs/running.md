@@ -93,6 +93,7 @@ The interactive REPL (`help` inside the session shows the same):
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
 | `audit [limit]` | Structured audit trail: task lifecycle, account/runtime controls, credential operations — persisted (survives restart), secret-free, newest first |
+| `reload [config accounts]` | Runtime configuration reload: full validation first, atomic apply of the reloadable surface, restart-required settings reported (not applied), `configuration.changed` audited. In-flight executions keep the snapshot they were claimed with. |
 | `retry <account> <task>` | Dead-letter manual retry: failed → pending with a fresh attempt budget (worker woken immediately) |
 | `history <account> <task>` | Bounded execution history: attempt, outcome, message, timestamp per row (newest first) |
 | `status` | Worker status snapshot |
