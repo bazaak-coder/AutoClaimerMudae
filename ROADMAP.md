@@ -177,21 +177,25 @@ Auxiliary contract (tested): a history-write failure is logged and swallowed —
 
 **Dependencies:** Retry scheduler and persistent task state.
 
-### [ ] 9. Rate-Limit Stress Testing
+### [x] 9. Rate-Limit Stress Testing
 
 Validate rate-limiter behavior under concurrent account and task workloads.
 
 **Acceptance criteria:**
 
-- [ ] Test concurrent requests across multiple accounts.
-- [ ] Test sequential tasks within an account.
-- [ ] Verify account-specific policies.
-- [ ] Verify task-specific policies.
-- [ ] Verify global limits.
-- [ ] Verify cooldown handling.
-- [ ] Test repeated rate-limit responses.
-- [ ] Verify cancellation does not bypass limiter cleanup.
-- [ ] Confirm that retry scheduling does not create request bursts.
+- [x] Test concurrent requests across multiple accounts. — 6 accounts × 2 tasks × 3 sends under one global min-interval
+- [x] Test sequential tasks within an account. — per-account overlap violations asserted zero under concurrent load
+- [x] Verify account-specific policies. — strict account paced at its interval while the other stayed fast (measured real gaps)
+- [x] Verify task-specific policies. — task-level interval reached operations end to end through the worker's policy binding
+- [x] Verify global limits. — `max_concurrent_accounts` peak never exceeded 3 slots under 12 concurrent task executions
+- [x] Verify cooldown handling. — repeated server-directed 429s waited out via the limiter (fake-clock verified)
+- [x] Test repeated rate-limit responses. — two consecutive cooldown scripts then success: exactly one real send
+- [x] Verify cancellation does not bypass limiter cleanup. — mid-flight cancellations left every permit at `in_use == 0` and a probe operation completed immediately
+- [x] Confirm that retry scheduling does not create request bursts. — cooldown waits ≥ the recorded window; no sub-interval send pairs on any account
+
+Measurement discipline: pacing tests use the REAL clock with generous floors (no exact-equality timing); cooldown storms use the fake clock (instant, clock-advancing) — mixing them silently destroys pacing measurement (found while building the suite).
+
+**Completed:** 2026-11-01 (`tests/test_rate_limit_stress.py` — 5 scenarios).
 
 **Dependencies:** Existing rate limiter and worker system.
 
