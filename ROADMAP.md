@@ -157,19 +157,23 @@ Also fixed en passant: the retry-exhaustion terminal message now includes the la
 
 **Dependencies:** Worker lifecycle and task persistence.
 
-### [ ] 8. Dead-Letter Handling
+### [x] 8. Dead-Letter Handling
 
 Introduce a controlled mechanism for tasks that repeatedly fail.
 
 **Acceptance criteria:**
 
-- [ ] Define configurable maximum retry attempts.
-- [ ] Persist the final failure reason.
-- [ ] Keep exhausted tasks inspectable.
-- [ ] Prevent automatic infinite retry loops.
-- [ ] Support explicit manual retry.
-- [ ] Preserve task execution history.
-- [ ] Ensure dead-letter transitions survive restart.
+- [x] Define configurable maximum retry attempts. — existing `task_defaults` → task → override chain (pinned again here: retry_limit 1 → exactly 2 attempts)
+- [x] Persist the final failure reason. — terminal rows carry `…; last failure: <reason>` (item-7 fix, asserted)
+- [x] Keep exhausted tasks inspectable. — `tasks failed` listing + new `history <account> <task>` command (attempt, status, message, timestamp per row)
+- [x] Prevent automatic infinite retry loops. — worker retry bound (asserted: attempt_count never exceeds limit+1); restart does NOT resurrect dead-lettered rows
+- [x] Support explicit manual retry. — `retry <account> <task>` CLI → `requeue_instance`: failed → pending with a fresh attempt budget, wake the worker, requeue event in history; non-failed rows are rejected with a typed error
+- [x] Preserve task execution history. — schema v6 `task_history`: one bounded row per recorded outcome (success/waiting/failed/requeued), retention 50 per instance, newest-first query
+- [x] Ensure dead-letter transitions survive restart. — tested across two restarts (dead-letter persists; requeue persists; row pending and due)
+
+Auxiliary contract (tested): a history-write failure is logged and swallowed — the `task_instances` outcome write is the source of truth and never breaks.
+
+**Completed:** 2026-11-01 (schema v6 migration + shape verification; `tests/test_dead_letter.py` — 7 scenarios).
 
 **Dependencies:** Retry scheduler and persistent task state.
 

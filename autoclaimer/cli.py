@@ -210,6 +210,25 @@ class AutoClaimerController:
             )
         return lines
 
+    async def retry_task(self, account_id: int, task_id: str) -> str:
+        """Dead-letter manual retry (roadmap item 8)."""
+        record = await self._store.get_instance_by_ids(account_id, task_id)
+        requeued = await self._store.requeue_instance(record.id)
+        self._manager.wake(account_id)  # pick the requeued row up promptly
+        return f"requeued {account_id}/{task_id} (attempt budget reset)"
+
+    async def history_report(self, account_id: int, task_id: str) -> list[str]:
+        """Execution history for one task instance (newest first)."""
+        record = await self._store.get_instance_by_ids(account_id, task_id)
+        rows = await self._store.task_history(record.id)
+        lines = [f"history for {account_id}/{task_id}:"]
+        if not rows:
+            lines.append("  (no recorded attempts)")
+        for attempt, status, message, recorded_at in rows:
+            suffix = f" — {message}" if message else ""
+            lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
+        return lines
+
     def health_report(self) -> list[str]:
         """Per-account health (roadmap item 6): state, last success,
         consecutive failures, and the last (redacted) error."""
@@ -602,6 +621,18 @@ class CliSession:
         self._exact_args(args, 0)
         return self._controller.health_report()
 
+    async def _cmd_retry(self, args: list[str]) -> str:
+        """Dead-letter manual retry: failed -> pending, fresh attempts."""
+        self._exact_args(args, 2)
+        account_id = self._account_arg(args[0])
+        return await self._controller.retry_task(account_id, args[1])
+
+    async def _cmd_history(self, args: list[str]) -> list[str]:
+        """Execution history for one task (newest first)."""
+        self._exact_args(args, 2)
+        account_id = self._account_arg(args[0])
+        return await self._controller.history_report(account_id, args[1])
+
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
             return TaskInstanceState(raw)
@@ -625,6 +656,8 @@ class CliSession:
         "credential": _cmd_credential,
         "integrity": _cmd_integrity,
         "health": _cmd_health,
+        "retry": _cmd_retry,
+        "history": _cmd_history,
     }
 
 
@@ -651,6 +684,8 @@ USAGE = """commands:
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
   health                          account health: state, streaks, last success/error
+  retry <account> <task>          requeue a dead-lettered (failed) task with fresh attempts
+  history <account> <task>        execution history (attempts, outcomes, timestamps)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 

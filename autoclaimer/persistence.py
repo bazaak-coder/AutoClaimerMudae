@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _BUSY_TIMEOUT_MS = 5000
 
 #: v5 — Fernet-encrypted account tokens. One row per account; the
@@ -123,6 +123,23 @@ _MIGRATIONS: dict[int, str] = {
     ALTER TABLE mudae_state_v4 RENAME TO mudae_state;
     """,
     5: _CREDENTIALS_DDL,
+    6: """
+    -- Roadmap item 8: bounded per-attempt execution history. Auxiliary to
+    -- task_instances (the source of truth): a history-write failure must
+    -- never break outcome recording. Pruned per instance (latest N).
+    CREATE TABLE IF NOT EXISTS task_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL,
+        task_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS task_history_instance
+        ON task_history (instance_id, id);
+    """,
 }
 
 
@@ -271,6 +288,10 @@ def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
 #: Bounded wait for abandoned database calls to settle during a
 #: transaction-cancellation cleanup (VERIFY-001 fix).
 _DRAIN_TIMEOUT_SECONDS = 5.0
+
+#: Per-instance execution-history retention (roadmap item 8): bounded so
+#: history can never grow the database unboundedly.
+_HISTORY_KEEP_PER_INSTANCE = 50
 
 
 def _silence_task_exception(task: asyncio.Task[Any]) -> None:
@@ -425,6 +446,16 @@ class TaskStateStore:
                 "key_version",
                 "created_at",
                 "updated_at",
+            },
+            "task_history": {
+                "id",
+                "instance_id",
+                "account_id",
+                "task_id",
+                "attempt",
+                "status",
+                "message",
+                "recorded_at",
             },
         }
         for table, columns in expected.items():
@@ -686,18 +717,115 @@ class TaskStateStore:
 
     async def record_success(self, instance_id: int, outcome: TaskOutcome) -> TaskInstanceRecord:
         """running -> succeeded; idempotent when already succeeded identically."""
-        return await self._record_terminal(
+        record = await self._record_terminal(
             instance_id, "succeeded", outcome, from_states=("running",)
         )
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            "succeeded",
+            outcome.message,
+        )
+        return record
 
     async def record_failure(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
     ) -> TaskInstanceRecord:
         """running -> waiting (with retry time) or failed (when retry_at is None)."""
         target = "waiting" if retry_at is not None else "failed"
-        return await self._record_terminal(
+        record = await self._record_terminal(
             instance_id, target, outcome, from_states=("running",), retry_at=retry_at
         )
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            target,
+            outcome.message,
+        )
+        return record
+
+    async def _append_history(
+        self,
+        instance_id: int,
+        account_id: int,
+        task_id: str,
+        attempt: int,
+        status: str,
+        message: str,
+    ) -> None:
+        """Append one bounded history row (roadmap item 8).
+
+        AUXILIARY by contract: any failure here is logged and swallowed —
+        the task_instances outcome write is the source of truth and must
+        never break because history could not be recorded.
+        """
+        now = _format_ts(self._clock())
+        try:
+            await self._run(
+                self._update_sync,
+                "INSERT INTO task_history "
+                "(instance_id, account_id, task_id, attempt, status, message, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (instance_id, account_id, task_id, attempt, status, message[:500], now),
+            )
+            await self._run(
+                self._update_sync,
+                "DELETE FROM task_history WHERE instance_id = ? AND id NOT IN ("
+                " SELECT id FROM task_history WHERE instance_id = ? "
+                f" ORDER BY id DESC LIMIT {_HISTORY_KEEP_PER_INSTANCE})",
+                (instance_id, instance_id),
+            )
+        except PersistenceError:
+            logger.exception(
+                "execution history append failed (outcome unaffected)",
+                extra={"operation": "history.append", "outcome": "history_failed"},
+            )
+
+    async def task_history(
+        self, instance_id: int, *, limit: int = _HISTORY_KEEP_PER_INSTANCE
+    ) -> tuple[tuple[int, str, str, str], ...]:
+        """(attempt, status, message, recorded_at) rows, newest first."""
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT attempt, status, message, recorded_at FROM task_history "
+            "WHERE instance_id = ? ORDER BY id DESC LIMIT ?",
+            (instance_id, limit),
+        )
+        return tuple((int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
+
+    async def requeue_instance(self, instance_id: int) -> TaskInstanceRecord:
+        """Dead-letter manual retry (roadmap item 8): ``failed -> pending``
+        with a FRESH attempt budget; the requeue event is recorded in the
+        execution history. Only terminal-failed rows are requeueable —
+        live/healthy rows are a configuration error, not a retry."""
+        now = _format_ts(self._clock())
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'pending', attempt_count = 0, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'failed'",
+            (now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            raise StateTransitionError(
+                "only dead-lettered (failed) tasks can be requeued — "
+                f"instance {instance_id} is '{current.status.value}'"
+            )
+        record = await self.get_instance(instance_id)
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            0,
+            "requeued",
+            "manual requeue from dead-letter",
+        )
+        return record
 
     async def recover_interrupted(self) -> int:
         """Startup recovery: running -> pending for rows orphaned by a shutdown."""
