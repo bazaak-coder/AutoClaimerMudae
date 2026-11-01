@@ -326,36 +326,40 @@ Provide a diagnostic command for troubleshooting installations (`autoclaimer doc
 
 **Priority: P1/P2**
 
-### [ ] 16. Dependency Security Scanning
+### [x] 16. Dependency Security Scanning
 
 Add dependency vulnerability checks to CI.
 
 **Acceptance criteria:**
 
-- [ ] Scan production dependencies.
-- [ ] Scan development dependencies.
-- [ ] Report vulnerable dependency versions.
-- [ ] Define a policy for critical and high-severity findings.
-- [ ] Keep dependency lockfiles synchronized.
-- [ ] Avoid silently accepting known vulnerabilities.
+- [x] Scan production dependencies. — `uv export --locked --all-extras --no-emit-project` → pip-audit (resolved, hashed requirements)
+- [x] Scan development dependencies. — same export includes dev/test extras (ruff, mypy, pytest, hypothesis, xdist…)
+- [x] Report vulnerable dependency versions. — pip-audit output names package, version, and advisory IDs; job fails on ANY finding
+- [x] Define a policy for critical and high-severity findings. — policy: ANY known vulnerability fails the job; exceptions are EXPLICIT `--ignore-vuln` entries that must carry a reason + link in the PR that adds them (documented in the workflow)
+- [x] Keep dependency lockfiles synchronized. — `uv export --locked` itself fails when uv.lock drifts from pyproject.toml; the existing `verify-actions-lockfile` job pins action versions
+- [x] Avoid silently accepting known vulnerabilities. — weekly `schedule` re-scan: advisories published against versions we already ship retrigger the workflow even with no code change
+
+**Completed:** 2026-11-01 (CI `dependency-audit` job + weekly schedule; verified locally: current tree audits clean — "No known vulnerabilities found").
 
 **Dependencies:** GitHub Actions workflow.
 
-### [ ] 17. Static Analysis Enforcement
+### [x] 17. Static Analysis Enforcement
 
 Enforce consistent code-quality checks in CI.
 
 **Acceptance criteria:**
 
-- [ ] Run Ruff.
-- [ ] Run mypy.
-- [ ] Fail CI when enforced checks fail.
-- [ ] Keep configuration centralized.
-- [ ] Document intentional exceptions.
+- [x] Run Ruff. — lint + format-check as separate CI steps (`bash -e`, exit-code-strict)
+- [x] Run mypy. — strict mode, separate CI step
+- [x] Fail CI when enforced checks fail. — each check is its own step; a failure fails the job (verified the hard way: CI's newer ruff caught findings piped local runs had masked)
+- [x] Keep configuration centralized. — ruff + mypy + pytest config all in pyproject.toml; CI adds no flags
+- [x] Document intentional exceptions. — vendored `mudae_parser` + its three test files: excluded from ruff/mypy strict (byte-identical upstream, proven by its own 80-test suite — see autoclaimer/mudae_parser/VENDORED.md); no per-module mypy downgrades exist. ALSO: `scripts/gates.sh` runs the exact CI gates locally with `set -euo pipefail` and no output pipes — exit codes can no longer be masked
+
+**Completed:** 2026-11-01 (`scripts/gates.sh`; verification of the existing CI steps).
 
 **Dependencies:** Existing project configuration.
 
-### [ ] 18. Critical-Path Coverage
+### [x] 18. Critical-Path Coverage
 
 Improve test coverage around sensitive runtime components.
 
@@ -363,14 +367,16 @@ Improve test coverage around sensitive runtime components.
 
 **Acceptance criteria:**
 
-- [ ] Define meaningful coverage targets for critical modules.
-- [ ] Enforce targets in CI.
-- [ ] Prefer behavior and failure-path coverage over arbitrary line coverage.
-- [ ] Ensure important regressions have dedicated tests.
+- [x] Define meaningful coverage targets for critical modules. — `scripts/coverage-gates.py`: per-module floors on all 12 critical modules (credential_store 85%, persistence 92%, workers 89%, ratelimit 94%, config 92%, discord_adapter 79%, health 95%, audit 95%, cli 77%, mudae_tasks 88%, adapters 95%, logging_setup 90%) — each floor is the measured coverage minus a small buffer: regression fences, not vanity numbers (measured values recorded in the table's comments)
+- [x] Enforce targets in CI. — dedicated `coverage` job: pytest --cov → json → gates script; below-floor modules fail the job by name
+- [x] Prefer behavior and failure-path coverage over arbitrary line coverage. — no global `fail_under`; the suite is fail-first regression-driven (crash recovery, fault injection, cancellation matrices, adversarial redaction); floors only fence the critical paths
+- [x] Ensure important regressions have dedicated tests. — every confirmed bug since PR #2 landed with a fail-first regression test (established practice; coverage table records the result)
+
+**Completed:** 2026-11-01 (pytest-cov + floors script + CI job; measured baseline: TOTAL 89%).
 
 **Dependencies:** Existing test suite.
 
-### [ ] 19. Property-Based Testing
+### [x] 19. Property-Based Testing
 
 Use generated inputs to test invariants that are difficult to cover with example-based tests.
 
@@ -378,25 +384,31 @@ Use generated inputs to test invariants that are difficult to cover with example
 
 **Acceptance criteria:**
 
-- [ ] Define invariants before generating test cases.
-- [ ] Include malformed and boundary inputs.
-- [ ] Ensure failures are reproducible through saved examples or seeds.
-- [ ] Keep test execution practical for CI.
+- [x] Define invariants before generating test cases. — every property's docstring states its invariant BEFORE the generation (7 properties)
+- [x] Include malformed and boundary inputs. — invalid channel values (zero/negative/bool/float/text) always raise the TYPED error; boundary attempt counts (up to 10 000) and full-range timestamps
+- [x] Ensure failures are reproducible through saved examples or seeds. — hypothesis `derandomize=True`: re-runs reproduce the exact failing example (and the first run DID find a real bug — see below)
+- [x] Keep test execution practical for CI. — 75 examples/property, no deadlines; the whole property suite runs in ~3 s
+
+**Found a REAL bug on first run:** `_backoff_delay` computed `2 ** (attempt-1)` raw — OverflowError at attempt ≥ 1024 (a huge configured retry_limit would crash the limiter instead of capping). Fixed with a clamped exponent; the property now proves monotonicity + the cap for the full range.
+
+**Completed:** 2026-11-01 (`tests/test_property_based.py` — 7 properties; hypothesis added to test extras).
 
 **Dependencies:** Test infrastructure.
 
-### [ ] 20. Test Isolation
+### [x] 20. Test Isolation
 
 Ensure tests do not depend on execution order or shared external state.
 
 **Acceptance criteria:**
 
-- [ ] Isolate SQLite databases per test.
-- [ ] Isolate temporary configuration and credential files.
-- [ ] Avoid real Discord connections in ordinary CI.
-- [ ] Ensure asynchronous tasks are cleaned up.
-- [ ] Ensure tests can run independently.
-- [ ] Verify parallel test execution where supported.
+- [x] Isolate SQLite databases per test. — tmp_path file DBs per test or per-test `:memory:` databases (35 sites); zero shared database handles
+- [x] Isolate temporary configuration and credential files. — all config/credential fixtures generated under tmp_path per test
+- [x] Avoid real Discord connections in ordinary CI. — live-Discord tests skip by default (env-gated `pytestmark`, 3 tests; 1 dataset test); everything else runs on the deterministic mock
+- [x] Ensure asynchronous tasks are cleaned up. — leaked-task baseline assertions in the fault-injection, signal, and timeout suites; graceful-stop paths verified
+- [x] Ensure tests can run independently. — no order dependence: any single test runs green alone (no module-scoped mutable state)
+- [x] Verify parallel test execution where supported. — pytest-xdist added; the FULL suite runs green under `-n 4` (verified across repeated runs and wired into the CI coverage job — the strongest order/shared-state proof). Wall-clock pacing measurements self-skip under workers (recorded timestamps bunch under CPU contention even though the limiter ledger is honored — documented in the module) and run in the serial job
+
+**Completed:** 2026-11-01 (pytest-xdist in test extras; CI coverage job runs `-n 4`; timing-sensitive marker).
 
 **Dependencies:** Existing test infrastructure.
 

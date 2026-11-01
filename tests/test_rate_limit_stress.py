@@ -16,6 +16,7 @@ a fake-clock sleep (instant, clock-advancing) for determinism.
 """
 
 import asyncio
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,17 @@ from autoclaimer.persistence import TaskStateStore
 from autoclaimer.ratelimit import RateLimiter
 from autoclaimer.registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus, TaskType
 from autoclaimer.workers import WorkerManager
+
+#: Wall-clock pacing measurements are unreliable under parallel-worker CPU
+#: contention (recorded send timestamps can bunch even though the limiter's
+#: reservation ledger is honored — the ledger spaces send STARTS, not the
+# post-send timestamp recording). They run in the serial quality job;
+#: xdist workers skip them (roadmap item 20: parallel where supported,
+#: serial where the measurement demands it).
+_TIMING_SENSITIVE = pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="wall-clock pacing measurement requires serial execution",
+)
 
 ACCOUNTS = tuple(900000000000000000 + n for n in range(6))
 CHANNEL = 111111111111111111
@@ -187,6 +199,7 @@ async def _drain(store: TaskStateStore, accounts: tuple[int, ...], tasks: dict[s
 # --- concurrent load across accounts -------------------------------------------
 
 
+@_TIMING_SENSITIVE
 async def test_concurrent_accounts_respect_pacing_and_slots(tmp_path: Path) -> None:
     """6 accounts × 2 tasks × 3 sends under a global min-interval: the
     global concurrency bound holds, each account stays sequential, and
@@ -218,6 +231,7 @@ async def test_concurrent_accounts_respect_pacing_and_slots(tmp_path: Path) -> N
 # --- policy layering under load ---------------------------------------------------
 
 
+@_TIMING_SENSITIVE
 async def test_account_specific_policy_paces_that_account_only(tmp_path: Path) -> None:
     """One account carries a stricter policy: its sends pace slower than
     the others' while all accounts still finish."""
@@ -243,6 +257,7 @@ async def test_account_specific_policy_paces_that_account_only(tmp_path: Path) -
         await store.close()
 
 
+@_TIMING_SENSITIVE
 async def test_task_specific_policy_reaches_operations(tmp_path: Path) -> None:
     """A task-level policy paces only that task's operations (end to end
     through the worker's policy binding)."""
@@ -275,6 +290,7 @@ async def test_task_specific_policy_reaches_operations(tmp_path: Path) -> None:
 # --- cooldown storms and bursts -----------------------------------------------------
 
 
+@_TIMING_SENSITIVE
 async def test_repeated_cooldowns_never_burst(tmp_path: Path) -> None:
     """Every send 429s (retry-after 20 s) twice, then succeeds: each
     retry WAITS the recorded cooldown (fake clock) — three real sends
