@@ -135,9 +135,16 @@ async def test_manual_requeue_gives_fresh_budget_and_executes_again(
             revived = await _wait_status(store, "job", TaskInstanceState.SUCCEEDED)
             assert revived.attempt_count == 1
 
-            history = await store.task_history(dead.id)
-            statuses = [row[1] for row in history]
-            assert statuses[0] == "succeeded"
+            # The status flip and the history append are two writes; poll
+            # briefly until the history reflects the success (CI-timing).
+            statuses: list[str] = []
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < deadline:
+                statuses = [row[1] for row in await store.task_history(dead.id)]
+                if statuses and statuses[0] == "succeeded":
+                    break
+                await asyncio.sleep(0.02)
+            assert statuses and statuses[0] == "succeeded"
             assert "requeued" in statuses
     finally:
         await store.close()
