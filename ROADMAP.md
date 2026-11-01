@@ -244,20 +244,24 @@ Events wired: task started/completed/failed/retried/requeued, account paused/res
 
 **Dependencies:** Logging and persistence architecture.
 
-### [ ] 12. Configuration Migration Framework
+### [x] 12. Configuration Migration Framework
 
 Prepare for future configuration schema changes without breaking existing installations.
 
 **Acceptance criteria:**
 
-- [ ] Introduce an explicit configuration schema version.
-- [ ] Detect outdated configuration versions.
-- [ ] Provide sequential migrations.
-- [ ] Validate migrated configuration.
-- [ ] Preserve existing user settings.
-- [ ] Back up configuration before migration.
-- [ ] Test migration from supported previous versions.
-- [ ] Fail safely when a migration cannot complete.
+- [x] Introduce an explicit configuration schema version. — `CURRENT_CONFIG_VERSION` in config.py; the parser names it in errors; `accounts.json` follows the application version (no independent migrations — documented)
+- [x] Detect outdated configuration versions. — `load_config` checks before parsing
+- [x] Provide sequential migrations. — `register_config_migration(from_version, migrator)` + pure `migrate_config_document` chain (version bumped by the framework, not migrators)
+- [x] Validate migrated configuration. — the migrated document goes through the FULL parser before anything is written
+- [x] Preserve existing user settings. — asserted (migrators copy and extend, never drop)
+- [x] Back up configuration before migration. — `<name>.vN.bak` beside the original; existing backups are never overwritten (tested)
+- [x] Test migration from supported previous versions. — the production chain is empty until v2 exists; the machinery is fully exercised through the PUBLIC registration API with a schema-compatible sample migration (the documented pattern for the first real schema change), incl. a two-step chain
+- [x] Fail safely when a migration cannot complete. — raising migrator OR invalid migrated document leaves the original file byte-identical (no backup, no .tmp); missing-chain and future-version errors are actionable
+
+Order of operations is fail-safe by construction: migrate purely → validate → backup → atomic tmp+rename.
+
+**Completed:** 2026-11-01 (`tests/test_config_migration.py` — 10 scenarios).
 
 **Dependencies:** Configuration models and validation.
 

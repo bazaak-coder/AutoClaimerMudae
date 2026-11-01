@@ -27,7 +27,18 @@ Minimal complete `config.json`:
 
 ### `version` *(required)*
 
-Must be `1`.
+Must be `1` (the current schema version; the parser's error names the
+supported version on mismatch).
+
+**Migrations:** when a future schema version ships, `load_config`
+migrates an outdated `config.json` automatically — the migrated document
+is validated through the full parser BEFORE anything is written, the
+original is backed up beside it (`config.json.vN.bak`, never
+overwritten), and the rewrite is atomic (temp file + rename; no
+half-written config, no `.tmp` litter). A migration that cannot complete
+leaves the original file byte-identical with an actionable error.
+`accounts.json` follows the application schema version and has no
+independent migrations.
 
 ### `channels` *(required)*
 
