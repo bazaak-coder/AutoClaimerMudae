@@ -116,22 +116,24 @@ Introduce systematic failure testing across workers, adapters, persistence, and 
 
 **Dependencies:** Existing integration test infrastructure.
 
-### [ ] 6. Account Health Monitoring
+### [x] 6. Account Health Monitoring
 
 Introduce an account health model that distinguishes connection state from account usability.
 
-**Suggested states:** `HEALTHY`, `CONNECTING`, `DISCONNECTED`, `DEGRADED`, `AUTH_FAILED`, `RATE_LIMITED`, `DISABLED`.
+**Suggested states:** `HEALTHY`, `CONNECTING`, `DISCONNECTED`, `DEGRADED`, `AUTH_FAILED`, `RATE_LIMITED`, `DISABLED` (+ `UNKNOWN` for a fresh session).
 
 **Acceptance criteria:**
 
-- [ ] Track account connection state independently.
-- [ ] Record the last successful interaction.
-- [ ] Track consecutive failures.
-- [ ] Detect authentication failures.
-- [ ] Distinguish temporary disconnections from permanent failures.
-- [ ] Expose account health through CLI status commands.
-- [ ] Avoid logging tokens or other credentials.
-- [ ] Define how health changes affect task scheduling.
+- [x] Track account connection state independently. — per-account in-memory monitor (`autoclaimer/health.py`), one snapshot view per account
+- [x] Record the last successful interaction. — `last_success_at` (+ totals) per account
+- [x] Track consecutive failures. — streak counter with `DEGRADED` at the threshold (3); reset on success
+- [x] Detect authentication failures. — account-fatal events latch `AUTH_FAILED` (only the explicit revive path clears it)
+- [x] Distinguish temporary disconnections from permanent failures. — `DISCONNECTED` (transient) vs `AUTH_FAILED` (latched) vs `DEGRADED` (streak)
+- [x] Expose account health through CLI status commands. — new `health` command: state, totals, streak, last success, last error
+- [x] Avoid logging tokens or other credentials. — error text passes the redaction filter and is length-bounded (tested)
+- [x] Define how health changes affect task scheduling. — documented + asserted: `AUTH_FAILED`/`DISABLED` never schedule (existing fatal-stop/enabled enforcement); `RATE_LIMITED`/`DEGRADED`/`DISCONNECTED` are informational — deferral stays with the limiter and retry policy. Observation layer, not an enforcement layer.
+
+**Completed:** 2026-11-01 (`autoclaimer/health.py`, worker/adapter wiring, CLI `health`; `tests/test_account_health.py` — 11 scenarios incl. worker-level end-to-end and CLI exposure).
 
 **Dependencies:** Discord adapter and account runtime.
 

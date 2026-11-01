@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -49,6 +49,7 @@ from .adapters import (
 )
 from .config import resolve_task_config
 from .credentials import CredentialProvider
+from .health import AccountHealthMonitor, AccountHealthSnapshot
 from .models import (
     AccountProfile,
     AccountsConfig,
@@ -106,11 +107,13 @@ class RateLimitedAdapter:
         limiter: RateLimiter,
         account_id: int,
         policy: EffectivePolicy | None = None,
+        on_rate_limited: Callable[[], None] | None = None,
     ) -> None:
         self._inner = inner
         self._limiter = limiter
         self._account_id = account_id
         self._policy = policy
+        self._on_rate_limited = on_rate_limited
 
     async def _run(self, op_name: str, fn: Callable[[], Awaitable[_T]]) -> _T:
         logger.debug(
@@ -120,12 +123,20 @@ class RateLimitedAdapter:
                 "operation": op_name,
             },
         )
-        return await self._limiter.run(
-            fn,
-            account_id=self._account_id,
-            route=op_name,
-            policy=self._policy,
-        )
+        try:
+            return await self._limiter.run(
+                fn,
+                account_id=self._account_id,
+                route=op_name,
+                policy=self._policy,
+            )
+        except RetryLimitExceededError:
+            # Transport retries exhausted — most often a cooldown storm:
+            # surface the account as rate-limited (observation only; the
+            # limiter keeps owning deferral).
+            if self._on_rate_limited is not None:
+                self._on_rate_limited()
+            raise
 
     async def send_message(
         self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
@@ -223,6 +234,7 @@ class WorkerManager:
         credentials: CredentialProvider | None = None,
         idle_interval_seconds: float = 30.0,
         wall: Callable[[], datetime] = utc_now,
+        health: AccountHealthMonitor | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -230,6 +242,9 @@ class WorkerManager:
         self._app_config = app_config
         self._accounts = accounts
         self._adapter_factory = adapter_factory
+        # Account health observation (roadmap item 6): visibility only —
+        # enforcement stays with the fatal-stop / enabled / limiter paths.
+        self._health = health if health is not None else AccountHealthMonitor()
         self._credentials = credentials
         self._idle_interval = idle_interval_seconds
         self._wall = wall
@@ -411,6 +426,7 @@ class WorkerManager:
         await self.stop()
 
     def _spawn_worker(self, account_id: int) -> None:
+        self._health.worker_started(account_id)
         worker = self._workers.get(account_id)
         if worker is not None and worker.task is not None and not worker.task.done():
             return
@@ -627,6 +643,7 @@ class WorkerManager:
             try:
                 outcome = await self._registry.execute(context)
             except AccountFatalError as exc:
+                self._health.record_failure(account_id, exc, fatal=True)
                 # Credentials dead / gateway session invalidated / CAPTCHA:
                 # fail this instance, then stop the whole account (owner
                 # policy 2026-10-28) — never retry, never continue with
@@ -693,6 +710,7 @@ class WorkerManager:
                 )
                 return
             except Exception as exc:
+                self._health.record_failure(account_id, exc)
                 logger.exception(
                     "task handler crashed",
                     extra={
@@ -747,6 +765,7 @@ class WorkerManager:
             )
             return
         if outcome.status is TaskStatus.SUCCEEDED:
+            self._health.record_success(account_id)
             if outcome.retry_at is not None:
                 # Milestone 7 (recurring tasks): a successful ROUND with
                 # a learned deadline stays alive — rescheduled with a
@@ -764,6 +783,7 @@ class WorkerManager:
                 return
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
+            self._health.record_failure(account_id, outcome.message)
             # Worker-level retries are bounded by the RESOLVED TASK
             # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
             # task → override chain was computed, test-asserted, and
@@ -794,6 +814,8 @@ class WorkerManager:
                 retry_at = self._wall() + timedelta(seconds=delay)
             await self._record(record.id, outcome, retry_at=retry_at)
         else:
+            # Terminal failure returned by the handler (PERMANENT).
+            self._health.record_failure(account_id, outcome.message)
             await self._record(record.id, outcome, retry_at=None)
 
     async def _record(
@@ -924,9 +946,14 @@ class WorkerManager:
                 self._adapter_factory(account_id),
                 self._limiter,
                 account_id,
+                on_rate_limited=lambda: self._health.record_rate_limited(account_id),
             )
             self._adapters[account_id] = adapter
         return adapter
+
+    def health(self) -> Mapping[int, AccountHealthSnapshot]:
+        """Per-account health views for this session (roadmap item 6)."""
+        return self._health.snapshot()
 
     # ----- account controls -----
 
@@ -949,6 +976,9 @@ class WorkerManager:
             # Explicit revive path after an account-fatal stop: the owner
             # re-enables the account once the credential problem is fixed.
             self._fatal_accounts.discard(account_id)
+            self._health.record_revived(account_id)
+        else:
+            self._health.record_disabled(account_id)
         self._enabled[account_id] = enabled
         if enabled and self._started and not self._stopped:
             worker = self._workers.get(account_id)
