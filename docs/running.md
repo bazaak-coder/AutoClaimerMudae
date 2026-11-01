@@ -92,6 +92,7 @@ The interactive REPL (`help` inside the session shows the same):
 | `queue [account]` | Scheduling order with priorities |
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
+| `audit [limit]` | Structured audit trail: task lifecycle, account/runtime controls, credential operations — persisted (survives restart), secret-free, newest first |
 | `retry <account> <task>` | Dead-letter manual retry: failed → pending with a fresh attempt budget (worker woken immediately) |
 | `history <account> <task>` | Bounded execution history: attempt, outcome, message, timestamp per row (newest first) |
 | `status` | Worker status snapshot |

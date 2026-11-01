@@ -34,6 +34,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .adapters import AdapterError, PlatformAdapter
+from .audit import AuditLog
 from .credential_store import SQLiteCredentialStore
 from .credentials import CredentialProvider, CredentialProviderError
 from .logging_setup import redact_text
@@ -74,6 +75,7 @@ class AutoClaimerController:
         # valid Fernet key is configured — credential commands then
         # explain instead of failing opaquely).
         self._credential_store = credential_store
+        self._audit = AuditLog(store)
         self._manager = WorkerManager(
             registry=registry,
             store=store,
@@ -142,11 +144,18 @@ class AutoClaimerController:
     async def credential_set(self, account_id: int, token: str) -> str:
         assert self._credential_store is not None
         await self._credential_store.set_token(account_id, token)
+        await self._audit.emit(
+            category="credential", action="set", account_id=account_id
+        )
         return f"credential stored (encrypted) for account {account_id}"
 
     async def credential_delete(self, account_id: int) -> str:
         assert self._credential_store is not None
         removed = await self._credential_store.delete_token(account_id)
+        if removed:
+            await self._audit.emit(
+                category="credential", action="deleted", account_id=account_id
+            )
         return (
             f"credential deleted for account {account_id}"
             if removed
@@ -173,6 +182,9 @@ class AutoClaimerController:
     async def credential_rotate(self) -> str:
         assert self._credential_store is not None
         count = await self._credential_store.rotate()
+        await self._audit.emit(
+            category="credential", action="rotated", detail=f"{count} re-encrypted"
+        )
         return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
 
     async def credential_export(self, path: str) -> str:
@@ -180,6 +192,9 @@ class AutoClaimerController:
         enforced by the CLI layer; this stays a single loud operation."""
         assert self._credential_store is not None
         count = await self._credential_store.export_ciphertext(path)
+        await self._audit.emit(
+            category="credential", action="exported", detail=f"{count} records (ciphertext)"
+        )
         return (
             f"exported {count} credential(s) as CIPHERTEXT to {path} — the file "
             "contains no plaintext tokens; protect it exactly like the "
@@ -189,6 +204,11 @@ class AutoClaimerController:
     async def credential_import(self, path: str) -> str:
         assert self._credential_store is not None
         imported, skipped = await self._credential_store.import_ciphertext(path)
+        await self._audit.emit(
+            category="credential",
+            action="imported",
+            detail=f"{imported} imported, {skipped} current",
+        )
         return (
             f"imported {imported} credential(s) from {path} "
             f"({skipped} already current); every record was validated and "
@@ -213,6 +233,9 @@ class AutoClaimerController:
         """Dead-letter manual retry (roadmap item 8)."""
         record = await self._store.get_instance_by_ids(account_id, task_id)
         await self._store.requeue_instance(record.id)
+        await self._audit.emit(
+            category="task", action="requeued", account_id=account_id, task_id=task_id
+        )
         self._manager.wake(account_id)  # pick the requeued row up promptly
         return f"requeued {account_id}/{task_id} (attempt budget reset)"
 
@@ -226,6 +249,19 @@ class AutoClaimerController:
         for attempt, status, message, recorded_at in rows:
             suffix = f" — {message}" if message else ""
             lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
+        return lines
+
+    async def audit_report(self, limit: int) -> list[str]:
+        """Recent audit events, newest first (roadmap item 11)."""
+        events = await self._store.audit_events(limit=limit)
+        if not events:
+            return ["audit: no events recorded yet"]
+        lines = [f"audit: {len(events)} most recent event(s)"]
+        for timestamp, category, action, account_id, task_id, detail in events:
+            who = f" account={account_id}" if account_id is not None else ""
+            what = f" task={task_id}" if task_id else ""
+            suffix = f" — {detail}" if detail else ""
+            lines.append(f"  {timestamp} {category}.{action}{who}{what}{suffix}")
         return lines
 
     def health_report(self) -> list[str]:
@@ -616,6 +652,21 @@ class CliSession:
         account_id = self._account_arg(args[0])
         return await self._controller.retry_task(account_id, args[1])
 
+    async def _cmd_audit(self, args: list[str]) -> list[str]:
+        """Recent audit events (newest first)."""
+        limit = 20
+        if args:
+            self._exact_args(args, 1)
+            try:
+                limit = int(args[0])
+            except ValueError:
+                raise ValueError(f"limit must be an integer, got {args[0]!r}") from None
+            if not 0 < limit <= 1000:
+                raise ValueError("limit must be in (0, 1000]")
+        else:
+            self._exact_args(args, 0)
+        return await self._controller.audit_report(limit)
+
     async def _cmd_history(self, args: list[str]) -> list[str]:
         """Execution history for one task (newest first)."""
         self._exact_args(args, 2)
@@ -647,6 +698,7 @@ class CliSession:
         "health": _cmd_health,
         "retry": _cmd_retry,
         "history": _cmd_history,
+        "audit": _cmd_audit,
     }
 
 
@@ -675,6 +727,7 @@ USAGE = """commands:
   health                          account health: state, streaks, last success/error
   retry <account> <task>          requeue a dead-lettered (failed) task with fresh attempts
   history <account> <task>        execution history (attempts, outcomes, timestamps)
+  audit [limit]                  recent audit events (lifecycle, controls, credentials)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 
