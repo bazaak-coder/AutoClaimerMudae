@@ -442,7 +442,11 @@ class RateLimiter:
         )
 
     def _backoff_delay(self, attempt: int, policy: EffectivePolicy) -> float:
-        base = policy.backoff_base_seconds * (2 ** (attempt - 1))
+        # Property-test fix: the raw exponent overflows float for huge
+        # attempt counts (2**1023+) — clamp it; anything past ~64 doublings
+        # is at the cap anyway.
+        exponent = min(max(attempt - 1, 0), 64)
+        base = policy.backoff_base_seconds * (2**exponent)
         return float(min(base, policy.backoff_cap_seconds))
 
     # ----- status -----
