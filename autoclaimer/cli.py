@@ -213,7 +213,7 @@ class AutoClaimerController:
     async def retry_task(self, account_id: int, task_id: str) -> str:
         """Dead-letter manual retry (roadmap item 8)."""
         record = await self._store.get_instance_by_ids(account_id, task_id)
-        requeued = await self._store.requeue_instance(record.id)
+        await self._store.requeue_instance(record.id)
         self._manager.wake(account_id)  # pick the requeued row up promptly
         return f"requeued {account_id}/{task_id} (attempt budget reset)"
 

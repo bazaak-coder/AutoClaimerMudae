@@ -209,9 +209,8 @@ async def test_concurrent_accounts_respect_pacing_and_slots(tmp_path: Path) -> N
         for account in accounts:
             stamps = times[account]
             assert len(stamps) == 6  # 2 tasks × 3 sends each
-            assert _gap_floor(stamps, floor=0.015) == 0, (
-                f"pacing violated on {account}: {[round(b - a, 4) for a, b in zip(stamps, stamps[1:])]}"
-            )
+            observed = [round(b - a, 4) for a, b in zip(stamps, stamps[1:], strict=False)]
+            assert _gap_floor(stamps, floor=0.015) == 0, f"pacing violated on {account}: {observed}"
     finally:
         await store.close()
 
@@ -236,8 +235,8 @@ async def test_account_specific_policy_paces_that_account_only(tmp_path: Path) -
     try:
         async with manager:
             await _drain(store, (slow, fast), tasks)
-        slow_gaps = [b - a for a, b in zip(times[slow], times[slow][1:])]
-        fast_gaps = [b - a for a, b in zip(times[fast], times[fast][1:])]
+        slow_gaps = [b - a for a, b in zip(times[slow], times[slow][1:], strict=False)]
+        fast_gaps = [b - a for a, b in zip(times[fast], times[fast][1:], strict=False)]
         assert all(gap >= 0.06 for gap in slow_gaps), slow_gaps
         assert all(gap < 0.06 for gap in fast_gaps), fast_gaps
     finally:
@@ -282,7 +281,6 @@ async def test_repeated_cooldowns_never_burst(tmp_path: Path) -> None:
     total, zero bursts."""
     account = ACCOUNTS[0]
     tasks: dict[str, dict[str, Any]] = {"alpha": {}}
-    sends: list[float] = []
 
     async def behavior(context: TaskContext) -> TaskOutcome | None:
         return None  # default sends; cooldowns scripted below
