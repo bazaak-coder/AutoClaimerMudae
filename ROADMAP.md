@@ -224,7 +224,7 @@ Standardize shutdown and recovery behavior across different termination scenario
 
 **Dependencies:** Runtime lifecycle and persistence.
 
-### [ ] 11. Structured Audit Events
+### [x] 11. Structured Audit Events
 
 Introduce a consistent event trail for important runtime operations.
 
@@ -232,11 +232,15 @@ Introduce a consistent event trail for important runtime operations.
 
 **Acceptance criteria:**
 
-- [ ] Use structured event fields.
-- [ ] Include timestamps and relevant account/task identifiers.
-- [ ] Never include credentials or authentication tokens.
-- [ ] Separate audit events from debug logging.
-- [ ] Ensure important events remain useful after restart.
+- [x] Use structured event fields. — schema v7 `audit_events`: timestamp, category, action, account_id, task_id, detail (typed columns, not prose)
+- [x] Include timestamps and relevant account/task identifiers. — asserted per event
+- [x] Never include credentials or authentication tokens. — detail redacted at the emit boundary (tested with a token-shaped adversarial detail); credential events carry ids/actions only
+- [x] Separate audit events from debug logging. — dedicated `autoclaimer.audit` logger + persisted table, queryable via `audit [limit]` CLI — not buried in debug output
+- [x] Ensure important events remain useful after restart. — events persist across restarts (tested); bounded retention (latest 1000)
+
+Events wired: task started/completed/failed/retried/requeued, account paused/resumed/enabled/disabled, runtime paused/resumed, credential set/deleted/imported/exported/rotated. `configuration.changed` is reserved for the runtime-reload feature (item 13) — nothing changes configuration at runtime today. Emission is auxiliary (tested): an audit failure never breaks the audited operation.
+
+**Completed:** 2026-11-01 (`autoclaimer/audit.py`, schema v7, worker/controller emit sites, CLI `audit`; `tests/test_audit_events.py` — 8 scenarios).
 
 **Dependencies:** Logging and persistence architecture.
 

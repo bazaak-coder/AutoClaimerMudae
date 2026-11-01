@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _BUSY_TIMEOUT_MS = 5000
 
 #: v5 — Fernet-encrypted account tokens. One row per account; the
@@ -139,6 +139,20 @@ _MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX IF NOT EXISTS task_history_instance
         ON task_history (instance_id, id);
+    """,
+    7: """
+    -- Roadmap item 11: structured audit events. Separate from debug
+    -- logging: queryable, restart-durable, bounded retention, and the
+    -- detail column is ALWAYS secret-free (redacted at the emit site).
+    CREATE TABLE IF NOT EXISTS audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        category TEXT NOT NULL,
+        action TEXT NOT NULL,
+        account_id INTEGER,
+        task_id TEXT,
+        detail TEXT NOT NULL DEFAULT ''
+    );
     """,
 }
 
@@ -292,6 +306,9 @@ _DRAIN_TIMEOUT_SECONDS = 5.0
 #: Per-instance execution-history retention (roadmap item 8): bounded so
 #: history can never grow the database unboundedly.
 _HISTORY_KEEP_PER_INSTANCE = 50
+
+#: Audit-event retention (roadmap item 11): bounded, newest kept.
+_AUDIT_KEEP = 1000
 
 
 def _silence_task_exception(task: asyncio.Task[Any]) -> None:
@@ -456,6 +473,15 @@ class TaskStateStore:
                 "status",
                 "message",
                 "recorded_at",
+            },
+            "audit_events": {
+                "id",
+                "timestamp",
+                "category",
+                "action",
+                "account_id",
+                "task_id",
+                "detail",
             },
         }
         for table, columns in expected.items():
@@ -796,6 +822,60 @@ class TaskStateStore:
             (instance_id, limit),
         )
         return tuple((int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
+
+    async def record_audit_event(
+        self,
+        *,
+        category: str,
+        action: str,
+        account_id: int | None = None,
+        task_id: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """Persist one structured audit event (roadmap item 11).
+
+        AUXILIARY by contract (like task history): an audit failure is
+        logged and swallowed — the audited operation must never break.
+        *detail* must already be secret-free (redacted at the emit site).
+        Retention is bounded (latest ``_AUDIT_KEEP``).
+        """
+        try:
+            await self._run(
+                self._update_sync,
+                "INSERT INTO audit_events "
+                "(timestamp, category, action, account_id, task_id, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _format_ts(self._clock()),
+                    category,
+                    action,
+                    account_id,
+                    task_id,
+                    detail[:500],
+                ),
+            )
+            await self._run(
+                self._update_sync,
+                f"DELETE FROM audit_events WHERE id NOT IN ("
+                f" SELECT id FROM audit_events ORDER BY id DESC LIMIT {_AUDIT_KEEP})",
+                (),
+            )
+        except PersistenceError:
+            logger.exception(
+                "audit event could not be recorded (operation unaffected)",
+                extra={"operation": "audit.append", "outcome": "audit_failed"},
+            )
+
+    async def audit_events(self, *, limit: int = 50) -> tuple[tuple[Any, ...], ...]:
+        """Recent audit events, newest first:
+        (timestamp, category, action, account_id, task_id, detail)."""
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT timestamp, category, action, account_id, task_id, detail "
+            "FROM audit_events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return tuple(tuple(row) for row in rows)
 
     async def requeue_instance(self, instance_id: int) -> TaskInstanceRecord:
         """Dead-letter manual retry (roadmap item 8): ``failed -> pending``

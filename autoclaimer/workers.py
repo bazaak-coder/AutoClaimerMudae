@@ -48,6 +48,7 @@ from .adapters import (
     PlatformAdapter,
     SentMessage,
 )
+from .audit import AuditLog
 from .config import resolve_task_config
 from .credentials import CredentialProvider
 from .health import AccountHealthMonitor, AccountHealthSnapshot
@@ -246,6 +247,9 @@ class WorkerManager:
         # Account health observation (roadmap item 6): visibility only —
         # enforcement stays with the fatal-stop / enabled / limiter paths.
         self._health = health if health is not None else AccountHealthMonitor()
+        # Structured audit events (roadmap item 11): auxiliary — emit
+        # failures never break the audited operation.
+        self._audit = AuditLog(store)
         self._credentials = credentials
         self._idle_interval = idle_interval_seconds
         self._wall = wall
@@ -628,6 +632,13 @@ class WorkerManager:
                 return  # not claimed yet: instance stays pending
             try:
                 claimed = await self._store.claim(record.id)
+                await self._audit.emit(
+                    category="task",
+                    action="started",
+                    account_id=account_id,
+                    task_id=record.task_id,
+                    detail=f"attempt {claimed.attempt_count}",
+                )
             except StateTransitionError:
                 return  # already claimed or terminal: never execute twice
             except PersistenceError:
@@ -767,6 +778,13 @@ class WorkerManager:
             return
         if outcome.status is TaskStatus.SUCCEEDED:
             self._health.record_success(account_id)
+            await self._audit.emit(
+                category="task",
+                action="completed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=outcome.message,
+            )
             if outcome.retry_at is not None:
                 # Milestone 7 (recurring tasks): a successful ROUND with
                 # a learned deadline stays alive — rescheduled with a
@@ -785,6 +803,13 @@ class WorkerManager:
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
             self._health.record_failure(account_id, outcome.message)
+            await self._audit.emit(
+                category="task",
+                action="retried",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=outcome.message,
+            )
             # Worker-level retries are bounded by the RESOLVED TASK
             # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
             # task → override chain was computed, test-asserted, and
@@ -824,6 +849,13 @@ class WorkerManager:
         else:
             # Terminal failure returned by the handler (PERMANENT).
             self._health.record_failure(account_id, outcome.message)
+            await self._audit.emit(
+                category="task",
+                action="failed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=outcome.message,
+            )
             await self._record(record.id, outcome, retry_at=None)
 
     async def _run_handler(self, context: TaskContext, resolved: ResolvedTaskConfig) -> TaskOutcome:
@@ -1034,6 +1066,11 @@ class WorkerManager:
         else:
             self._health.record_disabled(account_id)
         self._enabled[account_id] = enabled
+        self._audit_emit(
+            category="account",
+            action="enabled" if enabled else "disabled",
+            account_id=account_id,
+        )
         if enabled and self._started and not self._stopped:
             worker = self._workers.get(account_id)
             dead = worker is None or worker.task is None or worker.task.done()
@@ -1070,20 +1107,33 @@ class WorkerManager:
 
     def pause_account(self, account_id: int) -> None:
         self._paused.add(account_id)
+        self._audit_emit(category="account", action="paused", account_id=account_id)
 
     def resume_account(self, account_id: int) -> None:
         self._paused.discard(account_id)
         worker = self._workers.get(account_id)
         if worker is not None:
             worker.nudge()
+        self._audit_emit(category="account", action="resumed", account_id=account_id)
 
     def pause_all(self) -> None:
         self._globally_paused = True
+        self._audit_emit(category="runtime", action="paused")
 
     def resume_all(self) -> None:
         self._globally_paused = False
         for worker in self._workers.values():
             worker.nudge()
+        self._audit_emit(category="runtime", action="resumed")
+
+    def _audit_emit(self, **event: Any) -> None:
+        """Fire-and-forget audit emission from sync control-plane methods
+        (roadmap item 11): best-effort, never raises, no-op without a
+        running loop (sync unit-test callers)."""
+        try:
+            asyncio.ensure_future(self._audit.emit(**event))
+        except RuntimeError:
+            pass  # no running loop: skip (the operation itself succeeded)
 
     def wake(self, account_id: int) -> None:
         worker = self._workers.get(account_id)
