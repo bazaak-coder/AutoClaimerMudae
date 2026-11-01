@@ -59,6 +59,10 @@ class AppSettings:
     log_level: str = "INFO"
     max_concurrent_accounts: int = 3
     shutdown_timeout_seconds: int = 15
+    # Task execution timeout (roadmap item 7): a handler exceeding this
+    # is cancelled and failed with a distinct, recoverable outcome.
+    # ``None`` (default) disables timeouts — backward compatible.
+    task_timeout_seconds: float | None = None
     # Conservative humanization delay (low, high seconds) applied before
     # every send_message; deliberately tighter than the general mutating-
     # action jitter (owner directive 2026-10-28: "minimal, humanize the
@@ -103,6 +107,9 @@ class TaskDefinition:
     id: str
     enabled: bool = True
     retry_limit: int = 3
+    # Per-task timeout override (roadmap item 7): wins over
+    # ``settings.task_timeout_seconds``; ``None`` inherits the default.
+    timeout_seconds: float | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
     ratelimit: RateLimitPolicy | None = None
     priority: int = 0
@@ -152,3 +159,6 @@ class ResolvedTaskConfig:
     enabled: bool
     retry_limit: int
     parameters: dict[str, Any]
+    # Resolved execution timeout: task definition -> settings default
+    # (roadmap item 7). ``None`` disables the timeout.
+    timeout_seconds: float | None = None

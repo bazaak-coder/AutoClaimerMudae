@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -641,7 +642,7 @@ class WorkerManager:
                 credentials=self._credentials,
             )
             try:
-                outcome = await self._registry.execute(context)
+                outcome = await self._run_handler(context, resolved)
             except AccountFatalError as exc:
                 self._health.record_failure(account_id, exc, fatal=True)
                 # Credentials dead / gateway session invalidated / CAPTCHA:
@@ -797,7 +798,14 @@ class WorkerManager:
                     record.id,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"worker retry limit ({resolved_limit}) exhausted",
+                        # Carry the LAST failure reason into the terminal
+                        # row (roadmap items 7/8): the exhaustion alone
+                        # hides whether it was timeouts, cooldowns, or
+                        # handler-reported failures.
+                        message=(
+                            f"worker retry limit ({resolved_limit}) exhausted; "
+                            f"last failure: {outcome.message}"
+                        ),
                     ),
                     retry_at=None,
                 )
@@ -817,6 +825,52 @@ class WorkerManager:
             # Terminal failure returned by the handler (PERMANENT).
             self._health.record_failure(account_id, outcome.message)
             await self._record(record.id, outcome, retry_at=None)
+
+    async def _run_handler(self, context: TaskContext, resolved: ResolvedTaskConfig) -> TaskOutcome:
+        """Execute the handler under the resolved timeout (roadmap item 7).
+
+        Timeout semantics (defined before implementation):
+        - A timed-out handler is CANCELLED and the child task AWAITED, so
+          its cleanup runs and it cannot continue in the background.
+        - A timeout is DISTINCT from a handler raising TimeoutError itself
+          (``asyncio.wait`` + ``task.result()`` preserves exception
+          identity — only a still-pending task after the deadline is a
+          timeout).
+        - A timeout returns FAILED_RECOVERABLE with a distinct message, so
+          the single-owner retry bound and rescheduling apply unchanged.
+        - Cancellation of THIS coroutine (shutdown) cancels the child too —
+          no leaked handler tasks.
+        """
+        timeout = resolved.timeout_seconds
+        if timeout is None:
+            return await self._registry.execute(context)
+
+        task: asyncio.Task[TaskOutcome] = asyncio.create_task(self._registry.execute(context))
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise
+        if pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task  # cleanup completes; nothing keeps running
+            logger.warning(
+                "task execution timed out",
+                extra={
+                    "account_id": context.account_id,
+                    "task_id": context.task_id,
+                    "operation": "task.execute",
+                    "outcome": "task_timeout",
+                },
+            )
+            return TaskOutcome(
+                TaskStatus.FAILED_RECOVERABLE,
+                message=f"task execution timed out after {timeout}s",
+            )
+        return task.result()  # handler exceptions keep their identity
 
     async def _record(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None

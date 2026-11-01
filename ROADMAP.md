@@ -137,19 +137,23 @@ Introduce an account health model that distinguishes connection state from accou
 
 **Dependencies:** Discord adapter and account runtime.
 
-### [ ] 7. Task Execution Timeouts
+### [x] 7. Task Execution Timeouts
 
 Prevent individual tasks from remaining active indefinitely.
 
 **Acceptance criteria:**
 
-- [ ] Support configurable task timeouts.
-- [ ] Ensure timeout cancellation propagates correctly.
-- [ ] Persist timeout outcomes.
-- [ ] Distinguish timeout failures from ordinary exceptions.
-- [ ] Ensure cleanup executes after cancellation.
-- [ ] Prevent a timed-out task from continuing in the background.
-- [ ] Test timeout behavior during adapter operations.
+- [x] Support configurable task timeouts. — `settings.task_timeout_seconds` (default) + per-task `timeout_seconds` override; precedence task → settings; `null`/absent disables (backward compatible); validated (finite, (0, 86400], booleans rejected)
+- [x] Ensure timeout cancellation propagates correctly. — `asyncio.wait` + explicit cancel-and-await: the handler's cancellation cleanup provably runs
+- [x] Persist timeout outcomes. — FAILED_RECOVERABLE with a distinct message via the normal outcome recording; terminal rows now carry the last failure reason ("…; last failure: task execution timed after Xs")
+- [x] Distinguish timeout failures from ordinary exceptions. — a still-pending task after the deadline is a timeout; a handler *raising* `TimeoutError` keeps its exception identity (handler-crash path, different message) — tested both ways
+- [x] Ensure cleanup executes after cancellation. — cleanup-tracking handler: the `except CancelledError` block provably runs
+- [x] Prevent a timed-out task from continuing in the background. — the child task is cancelled AND awaited; stray-task assertion in tests
+- [x] Test timeout behavior during adapter operations. — timeout fires mid `send_message` on a stalled adapter: op cancelled (nothing sent), outcome recorded
+
+Also fixed en passant: the retry-exhaustion terminal message now includes the last failure reason (observability for every recoverable failure — groundwork for item 8), and shutdown during the timeout window leaks no handler tasks (worker-cancel propagation).
+
+**Completed:** 2026-11-01 (`tests/test_task_timeouts.py` — 12 scenarios incl. config matrix, precedence, cancel/cleanup, adapter-op timeout, shutdown-in-window).
 
 **Dependencies:** Worker lifecycle and task persistence.
 

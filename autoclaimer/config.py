@@ -115,6 +115,18 @@ def _contains_credential_key(value: Any, where: str) -> bool:
     return False
 
 
+def _optional_timeout(value: Any, where: str) -> float | None:
+    """Optional task-execution timeout: absent/null disables; a positive
+    finite number (in (0, 86400]) enables. Booleans are rejected."""
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 86400:
+        raise ConfigValidationError(
+            f"{where} must be a finite number in (0, 86400] seconds, or null to disable."
+        )
+    return float(value)
+
+
 def _parse_channels(raw: Any) -> ChannelsConfig:
     """Global channel section: roll_claim required, mu/rt optional/null.
 
@@ -334,6 +346,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             "max_concurrent_accounts",
             "shutdown_timeout_seconds",
             "send_jitter_seconds",
+            "task_timeout_seconds",
         },
         "config.settings",
     )
@@ -357,6 +370,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             maximum=600,
         ),
         send_jitter_seconds=_jitter_pair(s.get("send_jitter_seconds")),
+        task_timeout_seconds=_optional_timeout(
+            s.get("task_timeout_seconds"), "config.settings.task_timeout_seconds"
+        ),
     )
 
     td = _object(data.get("task_defaults", {}), "config.task_defaults")
@@ -373,7 +389,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         t = _object(raw_definition, f"config.tasks.{task_id}")
         _only_keys(
             t,
-            {"enabled", "retry_limit", "parameters", "ratelimit", "priority"},
+            {"enabled", "retry_limit", "timeout_seconds", "parameters", "ratelimit", "priority"},
             f"config.tasks.{task_id}",
         )
         tasks[task_id] = TaskDefinition(
@@ -381,6 +397,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             enabled=_bool(t.get("enabled", defaults.enabled), f"config.tasks.{task_id}.enabled"),
             retry_limit=_int(
                 t.get("retry_limit", defaults.retry_limit), f"config.tasks.{task_id}.retry_limit"
+            ),
+            timeout_seconds=_optional_timeout(
+                t.get("timeout_seconds"), f"config.tasks.{task_id}.timeout_seconds"
             ),
             parameters=_parameters(t.get("parameters", {}), f"config.tasks.{task_id}.parameters"),
             ratelimit=(
@@ -516,5 +535,12 @@ def resolve_task_config(
         task_id=task_id,
         enabled=task.enabled if override.enabled is None else override.enabled,
         retry_limit=task.retry_limit if override.retry_limit is None else override.retry_limit,
+        # Timeout precedence (roadmap item 7): task definition, then the
+        # settings default; None on both = timeouts disabled.
+        timeout_seconds=(
+            task.timeout_seconds
+            if task.timeout_seconds is not None
+            else app.settings.task_timeout_seconds
+        ),
         parameters=parameters,
     )
