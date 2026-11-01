@@ -120,6 +120,9 @@ session.
 | Scenario | Behavior |
 |---|---|
 | `quit` / `exit` / Ctrl-C / EOF | Graceful: workers drain within `shutdown_timeout_seconds`, stores and adapters close, credentials provider released. |
+| **SIGTERM** | Graceful (same path as Ctrl-C): first signal drains and exits 0; a blocked task is left honestly `running` and recovers on the next start. |
+| **Second signal** (SIGINT/SIGTERM again) | Force-exit escape hatch: default handling is restored, so a stuck graceful shutdown can always be killed. |
+| **SIGKILL** | No guarantees (no handler can run): tested separately — the database stays consistent (rollback journal) and restart recovers. |
 | Crash / kill mid-execution | Any `running` row is recovered to `pending` at next start (at-least-once semantics — a handler may re-run). |
 | Crash mid-transaction | SQLite rollback-journal recovery; per-step migrations are transactional; startup shape-verification rejects tampered schemas. |
 | Restart between rounds | Learned Mudae windows, cooldowns, and retry schedules persist in `state.db` and resume on schedule. |

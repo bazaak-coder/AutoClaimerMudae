@@ -205,20 +205,22 @@ Measurement discipline: pacing tests use the REAL clock with generous floors (no
 
 **Priority: P2**
 
-### [ ] 10. Graceful Shutdown and Restart Hardening
+### [x] 10. Graceful Shutdown and Restart Hardening
 
 Standardize shutdown and recovery behavior across different termination scenarios.
 
 **Acceptance criteria:**
 
-- [ ] Test SIGINT.
-- [ ] Test SIGTERM.
-- [ ] Test graceful shutdown during active tasks.
-- [ ] Test forced process termination separately.
-- [ ] Verify adapters close correctly.
-- [ ] Verify worker tasks do not leak.
-- [ ] Verify eligible tasks resume after restart.
-- [ ] Document which termination scenarios cannot guarantee graceful cleanup.
+- [x] Test SIGINT. — real child process, full composition, termination mid-task
+- [x] Test SIGTERM. — same; previously SIGTERM was completely unhandled (instant death, no cleanup) — now wired to the same graceful path as Ctrl-C (`install_termination_handlers` + `__main__` wiring)
+- [x] Test graceful shutdown during active tasks. — blocked handler mid-execution: exit 0, GRACEFUL marker, row honestly `running`
+- [x] Test forced process termination separately. — SIGKILL: no marker, non-zero exit, database consistent, restart recovers
+- [x] Verify adapters close correctly. — in-process assertion: every adapter `closed` after shutdown
+- [x] Verify worker tasks do not leak. — in-process `asyncio.all_tasks()` baseline; process-level: a leaked-task child would hang the exit timeout
+- [x] Verify eligible tasks resume after restart. — restart with a working handler completes the interrupted row (both after graceful AND forced termination)
+- [x] Document which termination scenarios cannot guarantee graceful cleanup. — `docs/running.md` shutdown matrix: SIGKILL guarantees nothing; a blocked interactive stdin read may delay signal-triggered exit; second signal = documented force-exit escape hatch (tested)
+
+**Completed:** 2026-11-01 (`tests/test_signal_shutdown.py` — 5 scenarios; `install_termination_handlers` in cli.py; `__main__` signal wiring).
 
 **Dependencies:** Runtime lifecycle and persistence.
 

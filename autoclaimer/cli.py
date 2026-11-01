@@ -30,7 +30,9 @@ from __future__ import annotations
 import asyncio
 import getpass
 import logging
+import os
 import shlex
+import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -702,3 +704,56 @@ async def stdin_secret_reader(prompt: str) -> str:
     warning and falls back to echoed stdin — piped/automated use stays
     possible, visibly."""
     return await asyncio.to_thread(getpass.getpass, prompt)
+
+
+def install_termination_handlers(
+    trigger: Callable[[], None],
+    *,
+    signals: tuple[signal.Signals, ...] = (signal.SIGINT, signal.SIGTERM),
+) -> Callable[[], None]:
+    """Install loop-level graceful-termination handlers (roadmap item 10).
+
+    Semantics (failure behavior defined before implementation):
+
+    - The FIRST signal invokes *trigger* once — the composition's
+      graceful path (drain workers, close adapters and stores).
+    - A SECOND signal restores DEFAULT handling: the operator can always
+      force-exit a stuck graceful shutdown. Guaranteed escape hatch.
+    - The handler never raises into the event loop; *trigger* runs as a
+      plain callback (schedule async work yourself, e.g. task.cancel()).
+    - Returns an uninstall callable (tests / embedding).
+
+    Known limitation (documented in docs/running.md): a blocked
+    interactive stdin read lives on a worker thread and cannot be
+    cancelled — exit may wait for the pending line.
+    """
+    loop = asyncio.get_running_loop()
+    fired: list[bool] = []
+
+    def _handle(sig: signal.Signals) -> None:
+        if fired:
+            # Second signal: restore default (force) handling for ALL
+            # installed signals and re-raise so the process dies now.
+            uninstall()
+            os.kill(os.getpid(), sig)
+            return
+        fired.append(True)
+        logger.info(
+            "termination signal received; starting graceful shutdown",
+            extra={"operation": "signal", "outcome": sig.name},
+        )
+        try:
+            trigger()
+        except Exception:  # pragma: no cover - trigger is task.cancel()
+            logger.exception("termination trigger failed")
+
+    def uninstall() -> None:
+        for sig in signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):  # pragma: no cover - win
+                pass
+
+    for sig in signals:
+        loop.add_signal_handler(sig, _handle, sig)
+    return uninstall
