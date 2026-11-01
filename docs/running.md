@@ -92,6 +92,8 @@ The interactive REPL (`help` inside the session shows the same):
 | `queue [account]` | Scheduling order with priorities |
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
+| `retry <account> <task>` | Dead-letter manual retry: failed → pending with a fresh attempt budget (worker woken immediately) |
+| `history <account> <task>` | Bounded execution history: attempt, outcome, message, timestamp per row (newest first) |
 | `status` | Worker status snapshot |
 | `health` | Per-account health: state (`healthy`/`connecting`/`disconnected`/`degraded`/`auth_failed`/`rate_limited`/`disabled`), success/failure totals, current streak, last success, last (redacted) error |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
