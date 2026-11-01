@@ -64,6 +64,7 @@ Rules:
 | `log_level` | `"INFO"` | `CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG` |
 | `max_concurrent_accounts` | `3` (1–64) | Global bound on concurrently executing accounts |
 | `shutdown_timeout_seconds` | `15` (1–600) | Graceful-shutdown budget |
+| `task_timeout_seconds` | `null` (disabled) | Task execution timeout in (0, 86400] s — a handler exceeding it is cancelled and failed with a distinct recoverable outcome |
 | `send_jitter_seconds` | `[0.203, 0.567]` | Humanization delay pair `[low, high]` (≤ 60 s) applied before each send |
 
 ### `task_defaults`
@@ -79,6 +80,7 @@ Map of task id → definition. Ids follow `[a-zA-Z][a-zA-Z0-9_-]{0,63}`.
 |---|---|---|
 | `enabled` | from `task_defaults` | Materialize/execute this task at all |
 | `retry_limit` | from `task_defaults` | Worker-level retry bound for recoverable failures |
+| `timeout_seconds` | inherits `settings.task_timeout_seconds` | Per-task timeout override (`null` inherits; finite (0, 86400]) |
 | `parameters` | `{}` | Task parameters (see [index](index.md#currently-supported-tasks)); credential-like keys rejected recursively |
 | `ratelimit` | — | Policy override layer (fields below) |
 | `priority` | `0` | Scheduling tie-break (higher first) |
