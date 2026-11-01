@@ -831,9 +831,7 @@ class TaskStateStore:
         """
         target = Path(path)
         if target.exists():
-            raise PersistenceError(
-                f"backup target {target} already exists; refusing to overwrite"
-            )
+            raise PersistenceError(f"backup target {target} already exists; refusing to overwrite")
         target.parent.mkdir(parents=True, exist_ok=True)
 
         def _vacuum_into() -> None:
@@ -850,6 +848,7 @@ class TaskStateStore:
     async def database_stats(self) -> dict[str, Any]:
         """Growth-monitoring snapshot (roadmap item 14): file size, page
         counts, and per-table row counts. Read-only."""
+
         def _stats() -> dict[str, Any]:
             conn = self._connection()
             with self._conn_guard:
