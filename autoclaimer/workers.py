@@ -287,11 +287,24 @@ class WorkerManager:
 
     async def _start_sequence(self) -> None:
         await self._store.recover_interrupted()
-        # Audit fix (agents.md section 17.2.1): validate resolved task
-        # parameters against the registry BEFORE spawning workers — a
-        # deterministic configuration defect is a startup/task-config
-        # failure, never a mid-run handler crash. Fail-soft per instance:
-        # the invalid instance is abandoned; unrelated work continues.
+        await self._apply_configuration()
+        # Adopt still-active persisted cooldowns BEFORE any worker can act:
+        # server-directed deadlines must survive restarts (audit F1; a
+        # no-op when the limiter has no store attached).
+        await self._limiter.load_persisted_cooldowns()
+        for account_id in list(self._enabled):
+            if self._enabled[account_id]:
+                await self._materialize(account_id)
+                self._spawn_worker(account_id)
+        logger.info("framework started")
+
+    async def _apply_configuration(self) -> None:
+        """Validate the CURRENT configuration and materialize instances.
+
+        Shared by startup and runtime reload (roadmap item 13): fail-soft
+        per instance — an invalid assignment is abandoned, unrelated work
+        continues.
+        """
         for account_id in list(self._enabled):
             if not self._enabled[account_id]:
                 continue
@@ -363,15 +376,34 @@ class WorkerManager:
                                 "operation": "startup.validate",
                             },
                         )
-        # Adopt still-active persisted cooldowns BEFORE any worker can act:
-        # server-directed deadlines must survive restarts (audit F1; a
-        # no-op when the limiter has no store attached).
-        await self._limiter.load_persisted_cooldowns()
-        for account_id in list(self._enabled):
-            if self._enabled[account_id]:
-                await self._materialize(account_id)
-                self._spawn_worker(account_id)
-        logger.info("framework started")
+
+    def update_configuration(self, app: AppConfig, accounts: AccountsConfig) -> None:
+        """Atomically adopt a newly validated configuration (roadmap 13).
+
+        One SYNCHRONOUS method with no yield points: worker iterations
+        either see the old (app, accounts) pair or the new one — never a
+        mix. In-flight executions are unaffected: each resolved its
+        configuration snapshot when it was claimed (documented snapshot
+        semantics). After the swap, new/changed assignments apply from
+        the next iteration; call :meth:`reload_materialize` for
+        materialization and worker spawning.
+        """
+        self._app_config = app
+        self._accounts = accounts
+
+    async def reload_materialize(self) -> None:
+        """Post-swap materialization: create instances for newly assigned
+        tasks, spawn workers for newly added accounts, nudge everyone so
+        changes take effect promptly."""
+        for profile in self._accounts.accounts:
+            if self._enabled.get(profile.id, profile.enabled):
+                self._enabled.setdefault(profile.id, profile.enabled)
+                await self._materialize(profile.id)
+                worker = self._workers.get(profile.id)
+                if worker is None or worker.task is None or worker.task.done():
+                    self._spawn_worker(profile.id)
+        for worker in self._workers.values():
+            worker.nudge()
 
     async def stop(self, *, timeout: float | None = None) -> None:
         """Graceful shutdown: drain workers, then close adapters.

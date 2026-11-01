@@ -144,18 +144,14 @@ class AutoClaimerController:
     async def credential_set(self, account_id: int, token: str) -> str:
         assert self._credential_store is not None
         await self._credential_store.set_token(account_id, token)
-        await self._audit.emit(
-            category="credential", action="set", account_id=account_id
-        )
+        await self._audit.emit(category="credential", action="set", account_id=account_id)
         return f"credential stored (encrypted) for account {account_id}"
 
     async def credential_delete(self, account_id: int) -> str:
         assert self._credential_store is not None
         removed = await self._credential_store.delete_token(account_id)
         if removed:
-            await self._audit.emit(
-                category="credential", action="deleted", account_id=account_id
-            )
+            await self._audit.emit(category="credential", action="deleted", account_id=account_id)
         return (
             f"credential deleted for account {account_id}"
             if removed
@@ -249,6 +245,53 @@ class AutoClaimerController:
         for attempt, status, message, recorded_at in rows:
             suffix = f" — {message}" if message else ""
             lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
+        return lines
+
+    async def reload_config(self, config_path: str, accounts_path: str) -> list[str]:
+        """Safe runtime configuration reload (roadmap item 13).
+
+        Validate the new files FULLY first — an invalid configuration is
+        rejected and the running one is untouched. Then apply the
+        reloadable surface atomically and report restart-required
+        settings (never partially applied). In-flight executions keep
+        the snapshot they were claimed with.
+        """
+        from .config import load_config
+        from .logging_setup import setup_logging
+
+        new_app, new_accounts = load_config(config_path, accounts_path)  # full validation
+
+        old = self._app_config
+        lines: list[str] = []
+        restart_required: list[str] = []
+        if old.settings.max_concurrent_accounts != new_app.settings.max_concurrent_accounts:
+            restart_required.append(
+                f"max_concurrent_accounts {old.settings.max_concurrent_accounts} -> "
+                f"{new_app.settings.max_concurrent_accounts}"
+            )
+        if old.settings.send_jitter_seconds != new_app.settings.send_jitter_seconds:
+            restart_required.append("settings.send_jitter_seconds")
+        if old.logging != new_app.logging:
+            setup_logging(new_app.logging)  # idempotent: replaces handlers
+            lines.append(f"logging reconfigured (level {new_app.logging.level})")
+
+        # Atomic adoption (single synchronous swap — no partial states).
+        self._manager.update_configuration(new_app, new_accounts)
+        self._app_config = new_app
+        self._accounts = new_accounts
+        await self._manager.reload_materialize()
+        await self._audit.emit(
+            category="configuration",
+            action="changed",
+            detail=f"reloaded from {config_path}",
+        )
+        lines.insert(0, "configuration reloaded (validated; applied atomically)")
+        if restart_required:
+            lines.append(
+                "restart required for: "
+                + "; ".join(restart_required)
+                + " (running values kept until restart)"
+            )
         return lines
 
     async def audit_report(self, limit: int) -> list[str]:
@@ -652,6 +695,14 @@ class CliSession:
         account_id = self._account_arg(args[0])
         return await self._controller.retry_task(account_id, args[1])
 
+    async def _cmd_reload(self, args: list[str]) -> list[str]:
+        """Runtime configuration reload (validated, atomic, audited)."""
+        if len(args) not in (0, 2):
+            raise ValueError("usage: reload [config.json accounts.json]")
+        config_path = args[0] if args else "config.json"
+        accounts_path = args[1] if args else "accounts.json"
+        return await self._controller.reload_config(config_path, accounts_path)
+
     async def _cmd_audit(self, args: list[str]) -> list[str]:
         """Recent audit events (newest first)."""
         limit = 20
@@ -699,6 +750,7 @@ class CliSession:
         "retry": _cmd_retry,
         "history": _cmd_history,
         "audit": _cmd_audit,
+        "reload": _cmd_reload,
     }
 
 
@@ -728,6 +780,7 @@ USAGE = """commands:
   retry <account> <task>          requeue a dead-lettered (failed) task with fresh attempts
   history <account> <task>        execution history (attempts, outcomes, timestamps)
   audit [limit]                  recent audit events (lifecycle, controls, credentials)
+  reload [config accounts]       validate + atomically apply new configuration at runtime
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 

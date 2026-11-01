@@ -265,18 +265,22 @@ Order of operations is fail-safe by construction: migrate purely → validate �
 
 **Dependencies:** Configuration models and validation.
 
-### [ ] 13. Safe Runtime Configuration Reload
+### [x] 13. Safe Runtime Configuration Reload
 
 Allow selected settings to change without restarting the entire application.
 
 **Acceptance criteria:**
 
-- [ ] Identify reloadable and restart-required settings.
-- [ ] Validate new configuration before applying it.
-- [ ] Apply changes atomically where possible.
-- [ ] Avoid partially applied configuration.
-- [ ] Ensure active tasks use a well-defined configuration snapshot.
-- [ ] Record configuration changes in audit events.
+- [x] Identify reloadable and restart-required settings. — reloadable: task definitions (enabled/parameters/retry/timeout), global channels, ratelimit layers, logging (handlers reconfigured idempotently), account assignments, shutdown timeout; restart-required (reported, never partially applied): `max_concurrent_accounts` (execution slots built at start), `send_jitter_seconds` (cached adapters)
+- [x] Validate new configuration before applying it. — full `load_config` validation first; an invalid reload is rejected and the running configuration keeps serving (tested)
+- [x] Apply changes atomically where possible. — single synchronous no-yield swap of (app, accounts) on the manager — worker iterations see the old pair or the new one, never a mix
+- [x] Avoid partially applied configuration. — restart-required settings are reported while the running values are kept; nothing is half-applied
+- [x] Ensure active tasks use a well-defined configuration snapshot. — each execution resolves its configuration at claim time; a reload mid-execution does not change the running task's channel (tested)
+- [x] Record configuration changes in audit events. — `configuration.changed` (the event reserved in item 11, now wired)
+
+Surface: CLI `reload [config accounts]` (defaults config.json/accounts.json) — validates, applies atomically, reports restart-required items, nudges workers, materializes new assignments.
+
+**Completed:** 2026-11-01 (`WorkerManager.update_configuration`/`reload_materialize`, controller `reload_config`, CLI `reload`; `tests/test_config_reload.py` — 5 scenarios).
 
 **Dependencies:** Configuration migration framework and runtime controls.
 

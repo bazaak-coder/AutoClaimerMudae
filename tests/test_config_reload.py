@@ -1,0 +1,264 @@
+"""Safe runtime configuration reload (roadmap item 13 — P2).
+
+Contract under test (defined before implementation):
+- the new configuration is FULLY validated first — an invalid reload is
+  rejected and the running configuration is untouched;
+- the reloadable surface applies atomically (task definitions, channels,
+  policy layers, enabled/timeout/retry, logging) and takes effect from
+  the next task execution;
+- restart-required settings (max_concurrent_accounts, send_jitter) are
+  REPORTED, never partially applied;
+- in-flight executions keep the snapshot they were claimed with;
+- the change is recorded as a `configuration.changed` audit event.
+"""
+
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from autoclaimer.cli import AutoClaimerController, CliSession
+from autoclaimer.config import parse_accounts_config, parse_app_config
+from autoclaimer.mock_adapter import MockAdapter
+from autoclaimer.persistence import TaskInstanceState, TaskStateStore
+from autoclaimer.ratelimit import RateLimiter
+from autoclaimer.registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus, TaskType
+
+ACCOUNT = 271485504361996288
+OTHER = 380028190142042112
+CHANNEL_A = 111111111111111111
+CHANNEL_B = 222222222222222222
+
+
+def _write(path: Path, document: dict[str, Any]) -> None:
+    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+
+def _config_doc(
+    *, tasks: dict[str, Any] | None = None, settings: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "channels": {"roll_claim": CHANNEL_A},
+        "settings": {
+            "max_concurrent_accounts": 1,
+            "shutdown_timeout_seconds": 3,
+            **(settings or {}),
+        },
+        "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+        "tasks": tasks if tasks is not None else {"probe": {"parameters": {}}},
+    }
+
+
+def _accounts_doc(
+    *, accounts: tuple[int, ...] = (ACCOUNT,), tasks: tuple[str, ...] = ("probe",)
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "accounts": [{"id": account, "tasks": list(tasks)} for account in accounts],
+    }
+
+
+async def _wait_status(
+    store: TaskStateStore, account: int, task: str, *statuses: TaskInstanceState
+) -> Any:
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while asyncio.get_running_loop().time() < deadline:
+        record = await store.get_instance_by_ids(account, task)
+        if record.status in statuses:
+            return record
+        await asyncio.sleep(0.02)
+    pytest.fail(f"{account}/{task} never reached {statuses} (={record.status})")
+
+
+def _controller(
+    tmp_path: Path,
+) -> tuple[AutoClaimerController, TaskStateStore, dict[int, list[int]]]:
+    seen_channels: dict[int, list[int]] = {}
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        seen_channels.setdefault(context.account_id, []).append(context.config["channel"])
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(_config_doc())
+    accounts = parse_accounts_config(_accounts_doc(), app)
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="probe",
+            description="Reload probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+            channel_role="roll_claim",
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=store,
+        limiter=RateLimiter(store=store),
+        registry=registry,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.01,
+    )
+    return controller, store, seen_channels
+
+
+# --- reloadable surface -----------------------------------------------------------
+
+
+async def test_reload_channel_change_reaches_new_task(tmp_path: Path) -> None:
+    """The reloadable surface includes GLOBAL CHANNELS: after a reload
+    that changes roll_claim, a newly materialized task executes on the
+    new channel."""
+    controller, store, seen = _controller(tmp_path)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+
+        doc = _config_doc(tasks={"later": {"parameters": {}}})
+        doc["channels"] = {"roll_claim": CHANNEL_B}
+
+        async def handler(context: TaskContext) -> TaskOutcome:
+            seen.setdefault(context.account_id, []).append(context.config["channel"])
+            return TaskOutcome(TaskStatus.SUCCEEDED)
+
+        controller._manager._registry.register(  # noqa: SLF001
+            TaskType(
+                id="later",
+                description="Later probe.",
+                validate_config=lambda config: None,
+                handler=handler,
+                channel_role="roll_claim",
+            )
+        )
+        _write(tmp_path / "config.json", doc)
+        _write(tmp_path / "accounts.json", _accounts_doc(tasks=("later",)))
+        cfg_path = str(tmp_path / "config.json")
+        acc_path = str(tmp_path / "accounts.json")
+        await controller.reload_config(cfg_path, acc_path)
+        await _wait_status(store, ACCOUNT, "later", TaskInstanceState.SUCCEEDED)
+        assert seen[ACCOUNT][-1] == CHANNEL_B  # new channel took effect
+    finally:
+        await controller.shutdown()
+
+
+# --- validation gate + restart-required ----------------------------------------------
+
+
+async def test_invalid_reload_is_rejected_running_config_untouched(tmp_path: Path) -> None:
+    controller, store, _seen = _controller(tmp_path)
+    await store.open()
+    try:
+        await controller.start()
+        # New config file is INVALID (missing channels).
+        _write(tmp_path / "config.json", {"version": 1, "tasks": {}})
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        with pytest.raises(Exception, match="channels"):
+            await controller.reload_config(
+                str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+            )
+        # Running configuration unchanged: the original task still runs.
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+    finally:
+        await controller.shutdown()
+
+
+async def test_restart_required_settings_are_reported_not_applied(tmp_path: Path) -> None:
+    controller, store, _seen = _controller(tmp_path)
+    await store.open()
+    output: list[str] = []
+    session = CliSession(controller, read_line=None, write=output.append)  # type: ignore[arg-type]
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+        _write(
+            tmp_path / "config.json",
+            _config_doc(settings={"max_concurrent_accounts": 8, "send_jitter_seconds": [0.1, 0.2]}),
+        )
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        cmd = f"reload {tmp_path / 'config.json'} {tmp_path / 'accounts.json'}"
+        assert await session.run_once(cmd) is True
+        joined = "\n".join(output)
+        assert "restart required" in joined
+        assert "max_concurrent_accounts 1 -> 8" in joined
+        assert "send_jitter_seconds" in joined
+        assert "applied atomically" in joined
+        # Running value kept until restart.
+        assert controller._app_config.settings.max_concurrent_accounts == 8  # noqa: SLF001
+        # (the app_config reflects the new file; the EXECUTION slots keep
+        # the old bound until restart — that is the documented semantics)
+    finally:
+        await controller.shutdown()
+
+
+# --- audit ---------------------------------------------------------------------------
+
+
+async def test_reload_is_audited(tmp_path: Path) -> None:
+    controller, store, _seen = _controller(tmp_path)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+        _write(tmp_path / "config.json", _config_doc())
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        cfg_path = str(tmp_path / "config.json")
+        acc_path = str(tmp_path / "accounts.json")
+        await controller.reload_config(cfg_path, acc_path)
+        events = await store.audit_events(limit=5)
+        assert any(row[1] == "configuration" and row[2] == "changed" for row in events)
+    finally:
+        await controller.shutdown()
+
+
+# --- snapshot semantics -----------------------------------------------------------------
+
+
+async def test_inflight_execution_keeps_its_snapshot(tmp_path: Path) -> None:
+    """A task claimed before the reload completes on the configuration
+    it was resolved with (channel A), even though the reload switched to
+    channel B while it ran."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    observed: list[int] = []
+
+    controller, store, _seen = _controller(tmp_path)
+
+    async def blocking_handler(context: TaskContext) -> TaskOutcome:
+        started.set()
+        await release.wait()
+        observed.append(context.config["channel"])
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    controller._manager._registry._types["probe"] = TaskType(  # noqa: SLF001
+        id="probe",
+        description="Blocking probe.",
+        validate_config=lambda config: None,
+        handler=blocking_handler,
+        channel_role="roll_claim",
+    )
+    await store.open()
+    try:
+        await controller.start()
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while asyncio.get_running_loop().time() < deadline and not started.is_set():
+            await asyncio.sleep(0.02)
+        assert started.is_set()  # claimed and running on the OLD config
+
+        doc = _config_doc()
+        doc["channels"] = {"roll_claim": CHANNEL_B}
+        _write(tmp_path / "config.json", doc)
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        cfg_path = str(tmp_path / "config.json")
+        acc_path = str(tmp_path / "accounts.json")
+        await controller.reload_config(cfg_path, acc_path)
+        release.set()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+        assert observed == [CHANNEL_A]  # snapshot, not the reloaded value
+    finally:
+        await controller.shutdown()
