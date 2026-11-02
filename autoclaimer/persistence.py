@@ -700,9 +700,11 @@ class TaskStateStore:
           timestamps, unsupported status values),
         - malformed ``scope_cooldowns`` rows,
         - malformed ``mudae_state`` rows,
-        - orphaned references: task/credential rows for accounts absent
-          from *known_account_ids* (when supplied by the caller, e.g.
-          from the parsed accounts.json).
+        - orphaned references: task/credential/Mudae-state rows for
+          accounts absent from *known_account_ids* (when supplied by the
+          caller, e.g. from the parsed accounts.json); one warning per
+          account regardless of how many tables hold its rows
+          (VERIFY-004).
         """
         findings: list[IntegrityFinding] = []
 
@@ -785,7 +787,8 @@ class TaskStateStore:
             if known_account_ids is not None:
                 for row in conn.execute(
                     "SELECT DISTINCT account_id FROM task_instances "
-                    "UNION SELECT account_id FROM account_credentials"
+                    "UNION SELECT account_id FROM account_credentials "
+                    "UNION SELECT account_id FROM mudae_state"
                 ):
                     if row[0] not in known_account_ids:
                         out.append(

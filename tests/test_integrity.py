@@ -225,3 +225,31 @@ async def test_integrity_reports_blob_timestamps(tmp_path: Path) -> None:
         assert "mudae_state" in tables
     finally:
         await store.close()
+
+
+async def test_orphaned_mudae_state_row_is_reported(tmp_path: Path) -> None:
+    """VERIFY-004: a removed account with ONLY a persisted Mudae deadline
+    is an orphaned reference — reported once, read-only."""
+    from datetime import UTC, datetime
+
+    store = await opened(tmp_path)
+    try:
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                "VALUES (?, 'claim', ?, ?)",
+                (
+                    OTHER,
+                    datetime(2026, 11, 2, 12, 0, 0, tzinfo=UTC).isoformat(),
+                    datetime(2026, 11, 2, 11, 0, 0, tzinfo=UTC).isoformat(),
+                ),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        warnings = [f for f in findings if f.severity == "warning"]
+        assert any(f"account={OTHER}" in f.key for f in warnings), warnings
+        # Single warning for the account even with rows across tables.
+        assert len([f for f in warnings if f"account={OTHER}" in f.key]) == 1
+    finally:
+        await store.close()

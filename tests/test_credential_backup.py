@@ -530,3 +530,189 @@ async def test_export_cleanup_failure_is_contained(tmp_path: Path) -> None:
     finally:
         locked.chmod(0o700)
         store.close()
+
+
+# PR #8 remediation round: BUG-016 (uncontained decrypt/decode in export),
+# VERIFY-003 (export connection guard), VERIFY-004 (mudae_state orphans)
+
+
+def _write_raw_ciphertext(db: Path, account_id: int, blob: bytes) -> None:
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            "INSERT INTO account_credentials "
+            "(account_id, encrypted_token, key_version, created_at, updated_at) "
+            "VALUES (?, ?, 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00') "
+            "ON CONFLICT(account_id) DO UPDATE SET encrypted_token = excluded.encrypted_token",
+            (account_id, blob),
+        )
+    conn.close()
+
+
+async def test_export_invalid_fernet_ciphertext_is_typed(tmp_path: Path) -> None:
+    """BUG-016 (a): a bytes row that is not a valid Fernet envelope
+    (e.g. encrypted under an unloaded key) raises the TYPED error naming
+    the account — never a raw InvalidToken."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        _write_raw_ciphertext(tmp_path / "state.db", ACCOUNT, b"garbage-not-fernet")
+        with pytest.raises(_CPE, match=str(ACCOUNT)) as excinfo:
+            await store.export_ciphertext(tmp_path / "b.json")
+        assert "garbage-not-fernet" not in str(excinfo.value)  # no ciphertext echo
+    finally:
+        store.close()
+
+
+async def test_export_invalid_utf8_payload_is_typed(tmp_path: Path) -> None:
+    """BUG-016 (b): a VALID envelope decrypting to non-UTF-8 bytes raises
+    the typed error — never a raw UnicodeDecodeError."""
+    from cryptography.fernet import Fernet
+
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        # Encrypt non-UTF-8 bytes directly into the stored row.
+        key = Fernet(env[PRIMARY_KEY_ENV])
+        _write_raw_ciphertext(tmp_path / "state.db", ACCOUNT, key.encrypt(b"\xff\xfe\x00not-utf8"))
+        with pytest.raises(_CPE, match=str(ACCOUNT)):
+            await store.export_ciphertext(tmp_path / "b.json")
+    finally:
+        store.close()
+
+
+async def test_export_failure_leaves_existing_backup_intact(tmp_path: Path) -> None:
+    """A failing export must never damage a previously written bundle:
+    the failure happens in the read phase, before any file write."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        target = tmp_path / "b.json"
+        await store.export_ciphertext(target)  # good bundle
+        good = target.read_text()
+        _write_raw_ciphertext(tmp_path / "state.db", ACCOUNT, b"garbage-not-fernet")
+        with pytest.raises(_CPE):
+            await store.export_ciphertext(target)  # fails in _dump
+        assert target.read_text() == good  # untouched
+    finally:
+        store.close()
+
+
+async def test_cli_export_corrupt_row_survives(tmp_path: Path) -> None:
+    """BUG-016 (c): the CLI reports the typed error, the controller stays
+    open, and no ciphertext appears in the output."""
+    from autoclaimer.cli import AutoClaimerController, CliSession
+    from autoclaimer.config import parse_accounts_config, parse_app_config
+    from autoclaimer.mock_adapter import MockAdapter
+    from autoclaimer.persistence import TaskStateStore
+    from autoclaimer.ratelimit import RateLimiter
+    from autoclaimer.registry import TaskRegistry
+
+    app = parse_app_config({"version": 1, "channels": {"roll_claim": 1}, "tasks": {}})
+    accounts = parse_accounts_config({"version": 1, "accounts": []}, app)
+    creds = await _open(tmp_path / "creds.db", {PRIMARY_KEY_ENV: generate_fernet_key()})
+    await creds.set_token(ACCOUNT, TOKEN_A)
+    _write_raw_ciphertext(tmp_path / "creds.db", ACCOUNT, b"garbage-not-fernet")
+    task_store = TaskStateStore(tmp_path / "state.db")
+    await task_store.open()
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=task_store,
+        limiter=RateLimiter(store=task_store),
+        registry=TaskRegistry(),
+        adapter_factory=lambda account_id: MockAdapter(),
+        credential_store=creds,
+    )
+    output: list[str] = []
+    session = CliSession(controller, read_line=None, write=output.append)  # type: ignore[arg-type]
+    try:
+        target = tmp_path / "b.json"
+        assert await session.run_once(f"credential export {target} confirm") is True
+        joined = "\n".join(output)
+        assert "error" in joined.lower()
+        assert "garbage-not-fernet" not in joined  # no ciphertext echo
+        assert controller.closed is False
+    finally:
+        creds.close()
+        await task_store.close()
+
+
+class _BlockFirstDecrypt:
+    """MultiFernet proxy blocking the first decrypt() — used to park the
+    EXPORT thread mid-iteration with its SELECT cursor still open."""
+
+    def __init__(
+        self, inner: MultiFernet, entered: threading.Event, release: threading.Event
+    ) -> None:
+        self.inner = inner
+        self.entered = entered
+        self.release = release
+        self.fired = False
+
+    def encrypt(self, token: bytes) -> bytes:
+        result: bytes = self.inner.encrypt(token)
+        return result
+
+    def decrypt(self, token: bytes) -> bytes:
+        if not self.fired:
+            self.fired = True
+            self.entered.set()
+            assert self.release.wait(5.0)
+        result: bytes = self.inner.decrypt(token)
+        return result
+
+
+async def test_export_holds_connection_guard_against_writers(tmp_path: Path) -> None:
+    """VERIFY-003: with the export parked mid-iteration, a concurrent
+    set_token on the same store must WAIT (guard held) rather than commit
+    underneath the open SELECT cursor — proving the export serializes
+    with every other credential operation on the connection. The bundle
+    is a consistent snapshot (pre-write state), and the concurrent write
+    lands afterwards."""
+    from typing import cast
+
+    from autoclaimer.credential_store import FernetKeys as _FK
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        entered = threading.Event()
+        release = threading.Event()
+        real_keys = store._keys  # noqa: SLF001
+        blocking = _BlockFirstDecrypt(real_keys.multi, entered, release)
+        store._keys = _FK(  # noqa: SLF001
+            multi=cast(MultiFernet, blocking),
+            primary=cast(MultiFernet, blocking),
+            version=real_keys.version,
+        )
+
+        await store.set_token(OTHER, TOKEN_A)  # second row, pre-write state
+        export_task = asyncio.create_task(store.export_ciphertext(tmp_path / "b.json"))
+        assert await asyncio.to_thread(entered.wait, 5.0)  # parked mid-iteration
+        set_task = asyncio.create_task(store.set_token(OTHER, TOKEN_B))
+        await asyncio.sleep(0.2)  # give set_token its chance to misbehave
+        release.set()
+        await export_task
+        await set_task  # must complete WITHOUT exception (waits on the guard)
+        assert store.get_token(OTHER) == TOKEN_B  # the write landed
+        # The bundle is a CONSISTENT SNAPSHOT: OTHER captured at its
+        # pre-write value (TOKEN_A), not a torn mid-write state.
+        restored = await _open(tmp_path / "snapshot.db", env)
+        try:
+            await restored.import_ciphertext(tmp_path / "b.json")
+            assert restored.get_token(OTHER) == TOKEN_A
+            assert restored.get_token(ACCOUNT) == TOKEN_A
+        finally:
+            restored.close()
+    finally:
+        store.close()

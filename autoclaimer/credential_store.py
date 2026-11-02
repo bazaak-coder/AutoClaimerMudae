@@ -494,31 +494,53 @@ class SQLiteCredentialStore:
         def _dump() -> list[dict[str, object]]:
             conn = self._connection()
             records: list[dict[str, object]] = []
-            for r in conn.execute(
-                "SELECT account_id, encrypted_token, key_version, "
-                "created_at, updated_at FROM account_credentials "
-                "ORDER BY account_id"
-            ):
-                value = r[1]
-                if not isinstance(value, (bytes, bytearray)):
-                    # BUG-015: SQLite permits TEXT in BLOB columns; a
-                    # corrupt row is a typed error, never a raw TypeError.
-                    raise CredentialDecryptError(
-                        f"stored credential for account {r[0]} is malformed; "
-                        "fix or delete the row before exporting"
+            # VERIFY-003: hold the connection guard for the whole read —
+            # the same discipline as every other credential operation.
+            # (SQLite's same-connection statement snapshots make an
+            # unguarded read *observable-safe*, verified below, but the
+            # class contract is that ALL connection use serializes on
+            # the guard; the export must not be the one exception.)
+            with self._guard:
+                for r in conn.execute(
+                    "SELECT account_id, encrypted_token, key_version, "
+                    "created_at, updated_at FROM account_credentials "
+                    "ORDER BY account_id"
+                ):
+                    value = r[1]
+                    if not isinstance(value, (bytes, bytearray)):
+                        # BUG-015: SQLite permits TEXT in BLOB columns; a
+                        # corrupt row is a typed error, never a raw TypeError.
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} is malformed; "
+                            "fix or delete the row before exporting"
+                        )
+                    # BUG-016: decryption/decoding failures are contained
+                    # per row, naming the account, never echoing material.
+                    try:
+                        token = self._keys.multi.decrypt(bytes(value)).decode("utf-8")
+                    except InvalidToken as exc:
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} cannot be "
+                            "decrypted with the configured keys (wrong or "
+                            "rotated-away key?); fix or delete the row before "
+                            "exporting"
+                        ) from exc
+                    except UnicodeDecodeError as exc:
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} is malformed "
+                            "(decrypted value is not valid UTF-8)"
+                        ) from exc
+                    inner = _json.dumps({"account_id": int(r[0]), "token": token})
+                    envelope = self._keys.multi.encrypt(inner.encode("utf-8"))
+                    records.append(
+                        {
+                            "account_id": int(r[0]),
+                            "encrypted_token": base64.b64encode(envelope).decode("ascii"),
+                            "key_version": int(r[2]),
+                            "created_at": str(r[3]),
+                            "updated_at": str(r[4]),
+                        }
                     )
-                token = self._keys.multi.decrypt(bytes(value)).decode("utf-8")
-                inner = _json.dumps({"account_id": int(r[0]), "token": token})
-                envelope = self._keys.multi.encrypt(inner.encode("utf-8"))
-                records.append(
-                    {
-                        "account_id": int(r[0]),
-                        "encrypted_token": base64.b64encode(envelope).decode("ascii"),
-                        "key_version": int(r[2]),
-                        "created_at": str(r[3]),
-                        "updated_at": str(r[4]),
-                    }
-                )
             return records
 
         try:

@@ -32,7 +32,7 @@ Investigate database behavior under abrupt process termination, rather than rely
 - [x] Test termination during an active transaction. — `test_kill_during_active_transaction_rolls_back` (hot-journal rollback, store usable)
 - [x] Test termination during state updates. — uncommitted rolled back / committed durable (`test_kill_after_committed_update_is_durable`)
 - [x] Test termination during task claiming and completion. — `test_kill_while_claimed_recovers_without_stranding`, `test_kill_during_completion_rolls_back_and_reschedules` (at-least-once)
-- [x] Verify SQLite WAL recovery after process restart. — the store deliberately runs the rollback journal (WAL's shared memory is unreliable in the target environment); hot-journal recovery verified instead and the mode pinned by test (`test_rollback_journal_mode_is_the_deployment_mode`)
+- [x] Verify journal-based crash recovery after process restart. — WAL is deliberately NOT used (its shared memory mapping is unreliable in the target environment; see `persistence._connect`), so WAL recovery was NOT tested and is NOT claimed: rollback-journal (hot-journal) recovery is what was verified, with the deployment mode pinned by test (`test_rollback_journal_mode_is_the_deployment_mode`)
 - [x] Verify no permanently stranded task states. — `test_recovery_leaves_terminal_states_untouched` (status matrix)
 - [x] Verify eligible tasks are recovered without duplicate execution. — `test_recovered_task_cannot_be_double_claimed` (atomic claim CAS; terminal rows never re-claimable)
 - [x] Document expected behavior for each interruption point. — `docs/running.md` → "Crash recovery by interruption point"
