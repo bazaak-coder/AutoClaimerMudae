@@ -538,7 +538,13 @@ class SQLiteCredentialStore:
             tmp.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
             tmp.replace(target)
         except OSError as exc:
-            tmp.unlink(missing_ok=True)
+            # Re-review edge: on an inaccessible directory even this
+            # CLEANUP can raise (unlink only suppresses FileNotFoundError)
+            # — contain it so the typed error is what reaches the caller.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise CredentialProviderError(
                 f"credential export failed: {type(exc).__name__}: {exc}"
             ) from exc

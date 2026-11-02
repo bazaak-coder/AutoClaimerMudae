@@ -505,3 +505,28 @@ async def test_import_concurrent_update_is_not_lost(tmp_path: Path) -> None:
     finally:
         target.close()
         writer.close()
+
+
+async def test_export_cleanup_failure_is_contained(tmp_path: Path) -> None:
+    """BUG-014 edge (re-review): when even the temp-file CLEANUP fails
+    (inaccessible directory), the typed export error must still be the
+    one that reaches the caller — never the raw PermissionError."""
+    import os
+    import sys
+
+    if sys.platform != "linux" or os.geteuid() == 0:  # pragma: no cover
+        pytest.skip("requires a non-root POSIX environment")
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        from autoclaimer.credentials import CredentialProviderError as _CPE
+
+        with pytest.raises(_CPE, match="credential export failed"):
+            await store.export_ciphertext(locked / "b.json")
+    finally:
+        locked.chmod(0o700)
+        store.close()
