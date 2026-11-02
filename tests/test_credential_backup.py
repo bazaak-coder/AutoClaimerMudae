@@ -606,6 +606,31 @@ async def test_export_failure_leaves_existing_backup_intact(tmp_path: Path) -> N
         store.close()
 
 
+async def test_export_corrupt_key_version_is_typed(tmp_path: Path) -> None:
+    """Review finding 2: a corrupt key_version (TEXT/BLOB — SQLite's
+    numeric affinity does not convert non-numeric values) raises the
+    typed account-named error at the STORE boundary, never a raw
+    ValueError from int()."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        conn = sqlite3.connect(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE account_credentials SET key_version = ? WHERE account_id = ?",
+                ("one", ACCOUNT),
+            )
+        conn.close()
+        with pytest.raises(_CPE, match=f"account {ACCOUNT}") as excinfo:
+            await store.export_ciphertext(tmp_path / "b.json")
+        assert "one" not in str(excinfo.value)  # corrupt value not echoed
+    finally:
+        store.close()
+
+
 async def test_cli_export_corrupt_row_survives(tmp_path: Path) -> None:
     """BUG-016 (c): the CLI reports the typed error, the controller stays
     open, and no ciphertext appears in the output."""
@@ -700,7 +725,13 @@ async def test_export_holds_connection_guard_against_writers(tmp_path: Path) -> 
         export_task = asyncio.create_task(store.export_ciphertext(tmp_path / "b.json"))
         assert await asyncio.to_thread(entered.wait, 5.0)  # parked mid-iteration
         set_task = asyncio.create_task(store.set_token(OTHER, TOKEN_B))
-        await asyncio.sleep(0.2)  # give set_token its chance to misbehave
+        await asyncio.sleep(0.2)  # give set_token its chance to complete
+        # Review finding 1 — THE discriminating assertion: with the guard
+        # held by the parked export, the writer thread must still be
+        # parked on the guard (SQLite same-connection snapshots make an
+        # unguarded read observably safe, so every LATER assertion alone
+        # is vacuous — this one is what proves serialization).
+        assert not set_task.done(), "set_token completed under a parked export"
         release.set()
         await export_task
         await set_task  # must complete WITHOUT exception (waits on the guard)

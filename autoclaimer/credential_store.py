@@ -530,13 +530,23 @@ class SQLiteCredentialStore:
                             f"stored credential for account {r[0]} is malformed "
                             "(decrypted value is not valid UTF-8)"
                         ) from exc
+                    key_version = r[2]
+                    if type(key_version) is not int:
+                        # Review finding 2: a corrupt key_version would
+                        # escape as a raw ValueError from int(); validate
+                        # it typed, naming the account, echoing nothing.
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} has a "
+                            "malformed key_version; fix or delete the row "
+                            "before exporting"
+                        )
                     inner = _json.dumps({"account_id": int(r[0]), "token": token})
                     envelope = self._keys.multi.encrypt(inner.encode("utf-8"))
                     records.append(
                         {
                             "account_id": int(r[0]),
                             "encrypted_token": base64.b64encode(envelope).decode("ascii"),
-                            "key_version": int(r[2]),
+                            "key_version": key_version,
                             "created_at": str(r[3]),
                             "updated_at": str(r[4]),
                         }

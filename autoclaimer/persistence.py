@@ -794,7 +794,7 @@ class TaskStateStore:
                         out.append(
                             IntegrityFinding(
                                 severity="warning",
-                                table="task_instances/account_credentials",
+                                table="task_instances/account_credentials/mudae_state",
                                 key=f"account={row[0]}",
                                 problem="account is not present in accounts.json",
                                 hint="Leftovers from a removed account. Rows are "
