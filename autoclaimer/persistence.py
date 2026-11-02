@@ -230,6 +230,12 @@ def _format_ts(value: datetime) -> str:
 
 
 def _parse_ts(value: str) -> datetime:
+    # PR #8 audit BUG-011: SQLite permits BLOB values in TEXT columns —
+    # fromisoformat(bytes) raises TypeError, which previously escaped
+    # containment. Normalize to ValueError so every existing handler
+    # reports malformed persisted timestamps as findings.
+    if not isinstance(value, str):
+        raise ValueError(f"persisted timestamp must be text, got {type(value).__name__}")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         # Naive timestamps are invalid persisted data: every write path

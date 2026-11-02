@@ -39,8 +39,8 @@ Interactive CLI commands (the database lives next to `config.json`):
 | `credential delete <account_id>` | Explicitly deletes the stored token. |
 | `credential accounts` | Lists accounts with stored (encrypted) credentials. |
 | `credential rotate` | Re-encrypts all credentials under the primary key (below). |
-| `credential export <path> confirm` | Writes all credentials to a JSON **ciphertext bundle** — never plaintext; the explicit `confirm` argument prevents accidents. |
-| `credential import <path> confirm` | Restores from a bundle: every record is validated by decrypting it with the configured keys **before anything is written** (a non-matching bundle is rejected whole), then re-encrypted under the current primary key. Idempotent. |
+| `credential export <path> confirm` | Writes all credentials to a JSON **ciphertext bundle** (format v2: each record's ciphertext AUTHENTICATES the account id together with the token — editing the bundle's JSON account mapping is rejected at import); never plaintext; the explicit `confirm` argument prevents accidents. Export writes atomically (temp + rename) and filesystem failures are typed CLI errors. |
+| `credential import <path> confirm` | Restores from a bundle: every record is validated by decrypting it with the configured keys and checking its authenticated account id against the metadata **before anything is written** (non-matching keys, tampered account mappings, and duplicate account ids are rejected whole with zero rows written), then re-encrypted under the current primary key on worker threads (the event loop never blocks on SQLite). Each upsert's read and write share one transaction, so a concurrent update is never silently discarded mid-import — the restore is authoritative for its accounts; a later `credential set` wins. Idempotent. v1 bundles (pre-merge, unauthenticated metadata) are rejected with instructions to re-export. |
 
 Without a controlling terminal, token entry falls back to echoed input **with
 an explicit warning** — piped/automated use stays possible, visibly.

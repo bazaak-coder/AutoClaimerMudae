@@ -198,3 +198,30 @@ async def test_cli_integrity_command_reports_and_never_modifies(tmp_path: Path) 
         assert "nothing was modified" in joined
     finally:
         await store.close()
+
+
+async def test_integrity_reports_blob_timestamps(tmp_path: Path) -> None:
+    """ChatGPT PR #8 audit BUG-011: SQLite permits BLOB values in TEXT
+    columns — fromisoformat(bytes) raises TypeError, which previously
+    escaped the scanner (only ValueError was contained). Both tables
+    must produce findings, never a crash."""
+    store = await opened(tmp_path)
+    try:
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "INSERT INTO scope_cooldowns (scope, deadline, server_directed) "
+                "VALUES ('account:9', CAST('garbage' AS BLOB), 1)"
+            )
+            conn.execute(
+                "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                "VALUES (?, 'claim', CAST('garbage' AS BLOB), '2026-01-01T00:00:00+00:00')",
+                (ACCOUNT,),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        tables = {f.table for f in findings if f.severity == "error"}
+        assert "scope_cooldowns" in tables
+        assert "mudae_state" in tables
+    finally:
+        await store.close()
