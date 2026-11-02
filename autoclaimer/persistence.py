@@ -699,7 +699,8 @@ class TaskStateStore:
         - undecodable task rows (corrupt JSON outcomes, malformed
           timestamps, unsupported status values),
         - malformed ``scope_cooldowns`` rows,
-        - malformed ``mudae_state`` rows,
+        - malformed ``mudae_state`` rows (unsupported kind enums AND
+          malformed deadlines — independently detected per row, BUG-017),
         - orphaned references: task/credential/Mudae-state rows for
           accounts absent from *known_account_ids* (when supplied by the
           caller, e.g. from the parsed accounts.json); one warning per
@@ -770,6 +771,28 @@ class TaskStateStore:
                     )
             # 4. Malformed mudae_state rows.
             for row in conn.execute("SELECT account_id, kind, deadline FROM mudae_state"):
+                # BUG-017: the kind must be a supported enum value — an
+                # unsupported kind is silently skipped by the runtime's
+                # deadline loader, so without this check the diagnostic
+                # could report a healthy database over dead rows. Validated
+                # INDEPENDENTLY of the deadline so one invalid field never
+                # masks the other. Read-only: the row is never touched.
+                try:
+                    MudaeStateKind(str(row[1]))
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="mudae_state",
+                            key=f"account={row[0]} kind={row[1]!r}",
+                            problem=(
+                                f"unsupported kind {row[1]!r} "
+                                f"(expected one of: {', '.join(k.value for k in MudaeStateKind)})"
+                            ),
+                            hint="Delete the row with the sqlite3 CLI; the task "
+                            "re-learns the window on its next round.",
+                        )
+                    )
                 try:
                     _parse_ts(row[2])
                 except ValueError:

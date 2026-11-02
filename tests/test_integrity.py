@@ -253,3 +253,77 @@ async def test_orphaned_mudae_state_row_is_reported(tmp_path: Path) -> None:
         assert len([f for f in warnings if f"account={OTHER}" in f.key]) == 1
     finally:
         await store.close()
+
+
+async def test_integrity_reports_unsupported_mudae_kind(tmp_path: Path) -> None:
+    """BUG-017: a persisted kind outside the enum (claim/rt/rolls) with a
+    VALID deadline is an error finding naming the account and the kind —
+    previously silently ignored (false-healthy database). The row is
+    never modified."""
+    from datetime import UTC, datetime
+
+    store = await opened(tmp_path)
+    try:
+        conn = raw(tmp_path / "state.db")
+        conn.execute("PRAGMA ignore_check_constraints = ON")  # hand-edit path
+        with conn:
+            conn.execute(
+                "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                "VALUES (?, 'unknown', ?, ?)",
+                (
+                    ACCOUNT,
+                    datetime(2026, 11, 2, 12, 0, 0, tzinfo=UTC).isoformat(),
+                    datetime(2026, 11, 2, 11, 0, 0, tzinfo=UTC).isoformat(),
+                ),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        matches = [
+            f
+            for f in findings
+            if f.table == "mudae_state"
+            and f.severity == "error"
+            and f"account={ACCOUNT}" in f.key
+            and "unknown" in f.problem
+        ]
+        assert matches, findings
+        assert "kind" in matches[0].problem.lower()
+        # Read-only guarantee: the row is exactly as injected.
+        conn = raw(tmp_path / "state.db")
+        try:
+            row = conn.execute(
+                "SELECT kind, deadline FROM mudae_state WHERE account_id = ?",
+                (ACCOUNT,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "unknown"
+    finally:
+        await store.close()
+
+
+async def test_integrity_reports_kind_and_deadline_independently(tmp_path: Path) -> None:
+    """BUG-017 requirement 6: one invalid field must not mask another —
+    a row with BOTH an unsupported kind and a malformed deadline yields
+    BOTH findings."""
+    store = await opened(tmp_path)
+    try:
+        conn = raw(tmp_path / "state.db")
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        with conn:
+            conn.execute(
+                "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                "VALUES (?, 'bogus', 'garbage-timestamp', '2026-01-01T00:00:00+00:00')",
+                (ACCOUNT,),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        problems = [
+            f.problem
+            for f in findings
+            if f.table == "mudae_state" and f"account={ACCOUNT}" in f.key
+        ]
+        assert any("bogus" in p for p in problems), problems  # kind finding
+        assert any("deadline" in p.lower() for p in problems), problems  # deadline finding
+    finally:
+        await store.close()
