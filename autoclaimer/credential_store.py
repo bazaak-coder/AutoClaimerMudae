@@ -703,9 +703,7 @@ class SQLiteCredentialStore:
             except OSError as exc:
                 # OSError detail (path, errno) is safe and actionable —
                 # the bundle path is operator-supplied CLI input.
-                raise CredentialProviderError(
-                    f"credential bundle is unreadable: {exc}"
-                ) from exc
+                raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
             try:
                 payload = _json.loads(text)
             except (ValueError, RecursionError) as exc:
