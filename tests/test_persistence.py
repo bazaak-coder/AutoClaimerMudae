@@ -735,3 +735,19 @@ async def test_mudae_state_prunes_expired_rows(tmp_path: Path) -> None:
         assert kinds == {"rt"}  # expired claim row pruned
     finally:
         await store.close()
+
+
+async def test_idempotent_rerecord_does_not_duplicate_history(
+    store: TaskStateStore,
+) -> None:
+    """LOW-034: the idempotent re-record path (a double record_success of
+    the identical outcome — crash-recovery re-record) must not append a
+    second task_history row for the same attempt; history is the
+    per-attempt execution trail."""
+    record = await seed(store)
+    await store.claim(record.id)
+    outcome = TaskOutcome(TaskStatus.SUCCEEDED, message="done")
+    await store.record_success(record.id, outcome)
+    await store.record_success(record.id, outcome)  # idempotent path
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, f"history duplicated for one attempt: {rows}"

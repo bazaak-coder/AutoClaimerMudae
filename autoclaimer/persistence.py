@@ -746,6 +746,10 @@ class TaskStateStore:
         record = await self._record_terminal(
             instance_id, "succeeded", outcome, from_states=("running",)
         )
+        if record is None:
+            # LOW-034: idempotent re-record — this attempt's history row
+            # already exists; appending again would duplicate it.
+            return await self.get_instance(instance_id)
         await self._append_history(
             record.id,
             record.account_id,
@@ -764,6 +768,9 @@ class TaskStateStore:
         record = await self._record_terminal(
             instance_id, target, outcome, from_states=("running",), retry_at=retry_at
         )
+        if record is None:
+            # LOW-034: idempotent re-record — see record_success.
+            return await self.get_instance(instance_id)
         await self._append_history(
             record.id,
             record.account_id,
@@ -1369,7 +1376,10 @@ class TaskStateStore:
         *,
         from_states: Sequence[str],
         retry_at: datetime | None = None,
-    ) -> TaskInstanceRecord:
+    ) -> TaskInstanceRecord | None:
+        """``None`` when the row already held this exact outcome (the
+        idempotent re-record path) — callers use that to avoid appending
+        a duplicate history row for the same attempt (LOW-034)."""
         now = _format_ts(self._clock())
         next_attempt = _format_ts(retry_at) if retry_at is not None else None
         changed = await self._run(
@@ -1387,7 +1397,7 @@ class TaskStateStore:
                 and current.last_outcome.status == outcome.status
                 and current.last_outcome.message == outcome.message
             ):
-                return current  # idempotent re-record of the same outcome
+                return None  # idempotent re-record of the same outcome
             raise StateTransitionError(
                 f"Cannot move task instance {instance_id} from state "
                 f"'{current.status.value}' to '{target}'."
