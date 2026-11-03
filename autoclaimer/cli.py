@@ -18,6 +18,9 @@ Commands (REPL)::
     cooldowns                    active cooldowns and permits
     errors                       recent failures and retry times
     status                       worker status snapshot
+    credential ...               encrypted-token administration (set/has/delete/
+                                  accounts/rotate/export/import/generate-key)
+    integrity                    read-only database diagnostic
     help                         usage
     quit | shutdown              graceful shutdown, then exit
 """
@@ -621,9 +624,6 @@ USAGE = """commands:
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
   help                            this help
-  credential ...                 encrypted-token administration (set/has/delete/
-                                  accounts/rotate/export/import/generate-key)
-  integrity                       read-only database diagnostic
   quit | shutdown                 graceful shutdown and exit"""
 
 

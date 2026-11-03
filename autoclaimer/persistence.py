@@ -248,7 +248,7 @@ def _parse_ts(value: str) -> datetime:
         # produces timezone-aware UTC strings, so naive means corrupt or
         # hand-edited state. Refuse to reinterpret it (agents.md
         # section 17.6; audit F4) — callers treat this as a corrupt row.
-        raise ValueError(f"timezone-naive persisted timestamp {value!r}")
+        raise ValueError(f"timezone-naive persisted timestamp {value[:60]!r}")
     # Final-review fix (agent-2 F2): every write path stores UTC
     # isoformat() so SQL string-comparison orders timestamps
     # chronologically; an aware-but-OFFSET value parses yet silently
@@ -793,7 +793,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="scope_cooldowns",
-                            key=f"scope={row[0]!r}",
+                            key=f"scope={_clip(row[0])}",
                             problem=f"malformed deadline {_clip(row[1])}",
                             hint="Delete the row with the sqlite3 CLI; the limiter "
                             "re-learns cooldowns from the server.",
@@ -804,7 +804,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="scope_cooldowns",
-                            key=f"scope={row[0]!r}",
+                            key=f"scope={_clip(row[0])}",
                             problem=f"server_directed flag is {row[2]!r} (expected 0/1)",
                             hint="Delete the row with the sqlite3 CLI.",
                         )
@@ -824,7 +824,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="mudae_state",
-                            key=f"account={row[0]} kind={row[1]!r}",
+                            key=f"account={row[0]} kind={_clip(row[1])}",
                             problem=(
                                 f"unsupported kind {row[1]!r} "
                                 f"(expected one of: {', '.join(k.value for k in MudaeStateKind)})"
@@ -840,8 +840,8 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="mudae_state",
-                            key=f"account={row[0]} kind={row[1]!r}",
-                            problem=f"malformed deadline {row[2]!r}",
+                            key=f"account={row[0]} kind={_clip(row[1])}",
+                            problem=f"malformed deadline {_clip(row[2])}",
                             hint="Delete the row with the sqlite3 CLI; the task "
                             "re-learns the window on its next round.",
                         )
@@ -875,7 +875,10 @@ class TaskStateStore:
                 # the diagnostic's own queries fail — sqlite errors AND
                 # any hostile-row surprise (the scanner is the tool you
                 # reach for when rows are corrupt; it must never be the
-                # crash). That failure IS the finding.
+                # crash). That failure IS the finding. The traceback is
+                # logged so scan-code BUGS stay distinguishable from
+                # data corruption.
+                logger.exception("integrity scan hit an unexpected error")
                 findings.append(
                     IntegrityFinding(
                         severity="error",

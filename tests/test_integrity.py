@@ -410,33 +410,32 @@ async def test_outcome_deeply_nested_json_is_contained(tmp_path: Path) -> None:
         await store.close()
 
 
-def test_scan_never_crashes_on_arbitrary_row_garbage(tmp_path: Path) -> None:
-    """Defense in depth: the scanner's own loop contains ANY exception
-    from a hostile row as a finding — the diagnostic is the tool you
-    reach for when rows are corrupt, so it must never be the crash."""
-    import asyncio
+async def test_scan_contains_injected_unexpected_exceptions(tmp_path: Path) -> None:
+    """Defense in depth (injection-based, per independent review): even
+    an exception NO per-row handler anticipates becomes a database
+    finding — the scanner is the tool you reach for when rows are
+    corrupt, so it must never be the crash."""
+    import autoclaimer.persistence as persistence_module
 
-    from autoclaimer.persistence import TaskStateStore
+    store = await opened(tmp_path)
+    try:
+        await store.create_instance(ACCOUNT, "probe")
 
-    async def main() -> tuple[object, ...]:
-        store = TaskStateStore(tmp_path / "state.db")
-        await store.open()
+        def exploding(row: object) -> object:
+            raise RuntimeError("injected scan-code failure")
+
+        original = persistence_module._row_to_record
+        persistence_module._row_to_record = exploding  # type: ignore[assignment]
         try:
-            conn = raw(tmp_path / "state.db")
-            with conn:
-                conn.execute(
-                    "UPDATE task_instances SET last_outcome = 'null' WHERE id = 1"
-                ) if False else conn.execute(
-                    "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
-                    "VALUES (1, 'claim', 1.5, 'x')"
-                )
-            conn.close()
-            return await store.integrity_report()
+            findings = await store.integrity_report(known_account_ids={ACCOUNT})
         finally:
-            await store.close()
-
-    findings = asyncio.run(main())
-    assert isinstance(findings, tuple)  # returned, did not raise
+            persistence_module._row_to_record = original  # type: ignore[assignment]
+        assert any(
+            f.table == "database" and f.severity == "error" and "RuntimeError" in f.problem
+            for f in findings
+        ), findings
+    finally:
+        await store.close()
 
 
 async def test_noncanonical_timezone_offset_is_a_finding(tmp_path: Path) -> None:

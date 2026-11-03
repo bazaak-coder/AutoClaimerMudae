@@ -246,8 +246,8 @@ class SQLiteCredentialStore:
         """
         _validate_account_id(account_id)
         try:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 row = conn.execute(
                     "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
                     (account_id,),
@@ -473,8 +473,8 @@ class SQLiteCredentialStore:
         """All accounts with stored credentials (management/inspection)."""
 
         def _ids() -> tuple[int, ...]:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 return tuple(
                     int(r[0]) for r in conn.execute("SELECT account_id FROM account_credentials")
                 )
@@ -509,7 +509,6 @@ class SQLiteCredentialStore:
         import json as _json
 
         def _dump() -> list[dict[str, object]]:
-            conn = self._connection()
             records: list[dict[str, object]] = []
             # VERIFY-003: hold the connection guard for the whole read —
             # the same discipline as every other credential operation.

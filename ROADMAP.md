@@ -54,7 +54,7 @@ Add safeguards for detecting database corruption and inconsistent persisted stat
 - [x] Never automatically delete potentially recoverable user data. — the diagnostic is strictly read-only (asserted by tests)
 - [x] Document a recovery procedure. — `docs/running.md` → "Database diagnostics and recovery"
 
-**Completed:** 2026-10-31 (`tests/test_integrity.py` — 13 scenarios incl. page corruption, CLI surface, and read-only assertions).
+**Completed:** 2026-10-31 (`tests/test_integrity.py` — 15 scenarios incl. page corruption, CLI surface, and read-only assertions).
 
 **Dependencies:** SQLite persistence layer.
 
@@ -87,7 +87,7 @@ Establish a safe procedure for backing up and restoring credential-related data.
 - [x] Test restoration using a separate temporary environment. — round-trip test exports from one database and restores into a fresh store/database; plus a re-encryption-under-new-primary test proving the old key can be discarded afterwards
 - [x] Document key and backup compatibility requirements. — bundle usable only with the export-time primary or any still-configured retired key; restored rows re-encrypted under the current primary
 
-**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 21 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
+**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 23 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
 
 **Dependencies:** Credential recovery documentation.
 
