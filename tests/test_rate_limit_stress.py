@@ -377,3 +377,120 @@ async def test_cancellation_releases_permits_and_pacing(tmp_path: Path) -> None:
     status = limiter.status()
     for permit in status.permits:
         assert permit.in_use == 0, permit
+
+
+# --- BUG-035: the per-account permit semaphore must follow the policy's
+# max_concurrency (per-task policies, runtime reloads) ---
+
+
+class _ConcurrencyProbe:
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.peak = 0
+
+    async def op(self) -> None:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0.05)
+        self.in_flight -= 1
+
+
+async def _run_batch(
+    limiter: RateLimiter, account_id: int, probe: _ConcurrencyProbe, n: int, limit: int
+) -> None:
+    from autoclaimer.ratelimit import EffectivePolicy
+
+    await asyncio.gather(
+        *(
+            limiter.run(
+                probe.op,
+                account_id=account_id,
+                route=f"op{i}",
+                policy=EffectivePolicy(max_concurrency=limit),
+            )
+            for i in range(n)
+        )
+    )
+
+
+async def test_permit_capacity_shrinks_when_policy_lowers_limit(tmp_path: Path) -> None:
+    """BUG-035 (shrink): after the semaphore exists at capacity 4, ops
+    under a limit-1 policy must never run more than one at a time — the
+    semaphore previously kept its creation capacity forever."""
+    from autoclaimer.ratelimit import EffectivePolicy
+
+    limiter = RateLimiter()
+    probe = _ConcurrencyProbe()
+    # Initialize the account semaphore at capacity 4 (one op, released).
+    await limiter.run(
+        probe.op,
+        account_id=101,
+        route="init",
+        policy=EffectivePolicy(max_concurrency=4),
+    )
+    assert probe.peak == 1  # setup sanity
+    await _run_batch(limiter, 101, probe, n=8, limit=1)
+    assert probe.peak <= 1, f"peak concurrency {probe.peak} exceeded the limit-1 policy"
+
+
+async def test_permit_capacity_grows_when_policy_raises_limit(tmp_path: Path) -> None:
+    """BUG-035 (grow): a later HIGHER limit must actually raise capacity —
+    the creation-time capacity was previously a permanent ceiling (and a
+    reload raising max_concurrency silently did nothing)."""
+    from autoclaimer.ratelimit import EffectivePolicy
+
+    limiter = RateLimiter()
+    probe = _ConcurrencyProbe()
+    await limiter.run(
+        probe.op,
+        account_id=102,
+        route="init",
+        policy=EffectivePolicy(max_concurrency=1),
+    )
+    await _run_batch(limiter, 102, probe, n=8, limit=4)
+    assert 2 <= probe.peak <= 4, f"peak concurrency {probe.peak} never used the raised capacity"
+
+
+async def test_permit_capacity_follows_reloaded_configuration(tmp_path: Path) -> None:
+    """BUG-035 (reload): the limit resolved from CONFIGURATION (what a
+    runtime reload changes) flows into the semaphore — policy_for after a
+    config change must cap the account at the new limit."""
+    from autoclaimer.ratelimit import policy_for
+
+    def app_with(limit: int) -> Any:
+        return parse_app_config(
+            {
+                "version": 1,
+                "channels": {"roll_claim": 111111111111111111},
+                "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 2},
+                "ratelimit": {"max_concurrency": limit},
+                "tasks": {"job": {"parameters": {}}},
+            }
+        )
+
+    accounts_cfg = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": 103, "tasks": ["job"]}]}, app_with(4)
+    )
+    limiter = RateLimiter()
+    probe = _ConcurrencyProbe()
+    # Pre-reload config: limit 4 (one op initializes the semaphore).
+    await limiter.run(
+        probe.op,
+        account_id=103,
+        route="init",
+        policy=policy_for(app_with(4), accounts_cfg, 103, "job"),
+    )
+    # Simulated reload: the SAME account now resolves to limit 1.
+    await asyncio.gather(
+        *(
+            limiter.run(
+                probe.op,
+                account_id=103,
+                route=f"op{i}",
+                policy=policy_for(app_with(1), accounts_cfg, 103, "job"),
+            )
+            for i in range(8)
+        )
+    )
+    assert probe.peak <= 1, f"peak concurrency {probe.peak} exceeded the reloaded limit"
+    assert limiter.status().permits[0].limit == 1  # reported honestly

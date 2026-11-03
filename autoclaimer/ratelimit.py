@@ -288,8 +288,24 @@ class RateLimiter:
     # ----- permits -----
 
     def _semaphore(self, scope: str, limit: int) -> asyncio.Semaphore:
+        """BUG-035: the permit semaphore must follow the caller's limit —
+        per-task policies and runtime reloads change an account's
+        ``max_concurrency`` after the semaphore exists, and the creation
+        capacity was previously permanent.
+
+        Safe capacity semantics: the semaphore is REPLACED only while the
+        scope is completely idle (no permits held, no waiters queued) —
+        replacing one with permits outstanding would let the old
+        in-flight operations drain while the new semaphore admits fresh
+        ones, exceeding BOTH limits. While the scope is busy the current
+        capacity stands; the next idle operation applies the new limit
+        (and ``_permit_limits`` reports it). The check-then-assign is
+        atomic: no await between them, and ``_acquire_permit`` increments
+        the in-use/waiting counters before its first await.
+        """
         existing = self._permits.get(scope)
-        if existing is None:
+        idle = self._permit_in_use.get(scope, 0) == 0 and self._waiting.get(scope, 0) == 0
+        if existing is None or (limit != self._permit_limits.get(scope) and idle):
             existing = asyncio.Semaphore(limit)
             self._permits[scope] = existing
             self._permit_limits[scope] = limit
