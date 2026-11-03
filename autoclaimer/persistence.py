@@ -194,11 +194,6 @@ class MudaeStateKind(Enum):
 
 
 RESUMABLE_STATES = frozenset({TaskInstanceState.PENDING, TaskInstanceState.WAITING})
-TERMINAL_STATES = frozenset(
-    {TaskInstanceState.SUCCEEDED, TaskInstanceState.FAILED, TaskInstanceState.CANCELLED}
-)
-
-_CLAIMABLE = (TaskInstanceState.PENDING, TaskInstanceState.WAITING)
 
 
 @dataclass(frozen=True)
@@ -229,6 +224,15 @@ def _format_ts(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 
+def _clip(value: object, limit: int = 60) -> str:
+    """Bounded repr for finding text (final review): unbounded echoes
+    dumped up to 100 KB of hostile row content into CLI output/logs."""
+    text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + f"...({len(text)} chars)"
+    return text
+
+
 def _parse_ts(value: str) -> datetime:
     # PR #8 audit BUG-011: SQLite permits BLOB values in TEXT columns —
     # fromisoformat(bytes) raises TypeError, which previously escaped
@@ -236,6 +240,8 @@ def _parse_ts(value: str) -> datetime:
     # reports malformed persisted timestamps as findings.
     if not isinstance(value, str):
         raise ValueError(f"persisted timestamp must be text, got {type(value).__name__}")
+    if value == "":
+        raise ValueError("persisted timestamp is empty")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         # Naive timestamps are invalid persisted data: every write path
@@ -243,6 +249,15 @@ def _parse_ts(value: str) -> datetime:
         # hand-edited state. Refuse to reinterpret it (agents.md
         # section 17.6; audit F4) — callers treat this as a corrupt row.
         raise ValueError(f"timezone-naive persisted timestamp {value!r}")
+    # Final-review fix (agent-2 F2): every write path stores UTC
+    # isoformat() so SQL string-comparison orders timestamps
+    # chronologically; an aware-but-OFFSET value parses yet silently
+    # breaks that contract (a +14:00 deadline hid an overdue task for
+    # ~11 h). Only the exact canonical form is valid persisted data.
+    if parsed.astimezone(UTC).isoformat() != value:
+        raise ValueError(
+            f"non-canonical persisted timestamp {value[:60]!r} (expected UTC isoformat)"
+        )
     return parsed.astimezone(UTC)
 
 
@@ -311,14 +326,19 @@ class TaskStateStore:
         async with self._lock:
             try:
                 self._conn = await asyncio.to_thread(_connect)
-                await asyncio.to_thread(self._migrate_sync, self._conn)
+                # Final-review fix: migration/verification run through
+                # the GUARDED threaded call (a raw to_thread bypassed the
+                # connection guard), and ANY failure — including
+                # cancellation — closes and nulls the half-open
+                # connection instead of leaking it.
+                await self._call_threaded(self._migrate_sync, self._conn)
                 # Repo-sweep fix: CREATE TABLE IF NOT EXISTS no-ops on a
                 # tampered/foreign schema and user_version still claims
                 # current — verify the actual column shapes post-migrate
                 # so a mismatched database fails FAST with a typed,
                 # named error instead of forever-recoverable write errors.
-                await asyncio.to_thread(self._verify_shape_sync, self._conn)
-            except (sqlite3.Error, PersistenceError) as exc:
+                await self._call_threaded(self._verify_shape_sync, self._conn)
+            except BaseException as exc:
                 if self._conn is not None:
                     # Guarded close (repo-sweep): waits for any in-flight
                     # call to drain instead of closing underneath it.
@@ -332,13 +352,21 @@ class TaskStateStore:
                 raise
 
     async def close(self) -> None:
-        """Close the connection; safe to call more than once."""
+        """Close the connection; safe to call more than once.
+
+        Final-review fix (agent-3 #3): ``_conn`` is nulled in a
+        ``finally`` — a cancellation of the close await previously left
+        the store holding a reference to the (thread-completed) closed
+        connection, producing misleading typed errors afterwards."""
         async with self._lock:
             if self._conn is not None:
-                # Guarded (repo-sweep): an abandoned in-flight call must
-                # finish before the connection closes underneath it.
-                await self._call_threaded(self._conn.close)
-                self._conn = None
+                conn = self._conn
+                try:
+                    # Guarded (repo-sweep): an abandoned in-flight call
+                    # must finish before the connection closes under it.
+                    await self._call_threaded(conn.close)
+                finally:
+                    self._conn = None
 
     @property
     def schema_version(self) -> int:
@@ -631,7 +659,19 @@ class TaskStateStore:
         return await self.get_instance_by_ids(account_id, task_id)
 
     async def claim(self, instance_id: int) -> TaskInstanceRecord:
-        """pending|waiting -> running, counting one new attempt."""
+        """pending|waiting -> running, counting one new attempt.
+
+        Known limitation (final review, agent-3 #2 / agent-5 F1): the
+        CAS UPDATE and the read-back SELECT are two lock acquisitions —
+        a writer landing between them returns the LATER writer's state.
+        Wrapping them in one transaction changes the lock profile and
+        breaks the verified cancellation contracts (the transaction
+        fast-path bypasses the store lock), so the tear is accepted and
+        documented instead: the only running->pending actor is
+        recover_interrupted (startup-only, behind the _started guard);
+        the plausible interleaving is stop()-cancels-a-claim-in-flight
+        followed by restart — bounded by at-least-once semantics and
+        the attempt-count CAS itself."""
         now = _format_ts(self._clock())
         changed = await self._run(
             self._update_sync,
@@ -709,7 +749,7 @@ class TaskStateStore:
         """
         findings: list[IntegrityFinding] = []
 
-        def _scan_rows(conn: sqlite3.Connection, out: list[IntegrityFinding]) -> None:
+        def _scan_rows(conn: sqlite3.Connection, out: list[IntegrityFinding]) -> None:  # noqa: C901
             # 1. SQLite-level integrity.
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             problems = [str(r[0]) for r in rows if str(r[0]).lower() != "ok"]
@@ -754,7 +794,7 @@ class TaskStateStore:
                             severity="error",
                             table="scope_cooldowns",
                             key=f"scope={row[0]!r}",
-                            problem=f"malformed deadline {row[1]!r}",
+                            problem=f"malformed deadline {_clip(row[1])}",
                             hint="Delete the row with the sqlite3 CLI; the limiter "
                             "re-learns cooldowns from the server.",
                         )
@@ -830,15 +870,18 @@ class TaskStateStore:
             conn = self._connection()
             try:
                 _scan_rows(conn, findings)
-            except sqlite3.Error as exc:
-                # Heavy corruption can make even the diagnostic's own
-                # queries fail: that IS the finding, never a crash.
+            except Exception as exc:  # noqa: BLE001
+                # Final-review widening: heavy corruption can make even
+                # the diagnostic's own queries fail — sqlite errors AND
+                # any hostile-row surprise (the scanner is the tool you
+                # reach for when rows are corrupt; it must never be the
+                # crash). That failure IS the finding.
                 findings.append(
                     IntegrityFinding(
                         severity="error",
                         table="database",
                         key="-",
-                        problem=f"sqlite could not complete the scan: {exc}",
+                        problem=f"scan could not complete: {type(exc).__name__}: {exc}",
                         hint="Restore state.db from a backup (see docs/running.md: "
                         "Database diagnostics and recovery).",
                     )
@@ -918,8 +961,6 @@ class TaskStateStore:
                 if not isinstance(raw_flag, int) or raw_flag not in (0, 1):
                     raise ValueError(f"server_directed flag is {raw_flag!r}")
                 server_directed = raw_flag
-                if server_directed not in (0, 1):
-                    raise ValueError(f"server_directed flag is {row['server_directed']!r}")
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
                     f"corrupt scope_cooldowns row scope={scope!r}: {type(exc).__name__}: {exc}"
@@ -1104,7 +1145,7 @@ def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]
 def _row_to_record(row: sqlite3.Row) -> TaskInstanceRecord:
     try:
         return _decode_row(row)
-    except (ValueError, KeyError, TypeError, IndexError) as exc:
+    except (ValueError, KeyError, TypeError, IndexError, RecursionError) as exc:
         # Corrupt row (bad JSON / timestamp / enum / MISSING COLUMN —
         # repo-sweep: IndexError from a hand-made schema previously
         # skipped containment entirely): a typed error carrying the row
@@ -1119,11 +1160,19 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
     outcome: TaskOutcome | None = None
     if outcome_raw is not None:
         payload = json.loads(outcome_raw)
+        # Final-review fix: valid JSON that is NOT an object ('null',
+        # numbers, strings, arrays) previously reached .get() and raised
+        # an AttributeError OUTSIDE every containment — crashing the
+        # integrity scanner, the worker loop, and the REPL.
+        if not isinstance(payload, dict):
+            raise ValueError(f"outcome JSON is not an object: {type(payload).__name__}")
         retry_at_raw = payload.get("retry_at")
+        if retry_at_raw == "":
+            raise ValueError("outcome retry_at is an empty string")
         outcome = TaskOutcome(
             status=TaskStatus(payload["status"]),
             message=payload.get("message", ""),
-            retry_at=_parse_ts(retry_at_raw) if retry_at_raw else None,
+            retry_at=_parse_ts(retry_at_raw) if retry_at_raw is not None else None,
         )
     return TaskInstanceRecord(
         id=row["id"],
@@ -1134,7 +1183,11 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
         created_at=_parse_ts(row["created_at"]),
         updated_at=_parse_ts(row["updated_at"]),
         last_outcome=outcome,
-        next_attempt_at=_parse_ts(row["next_attempt_at"]) if row["next_attempt_at"] else None,
-        cooldown_until=_parse_ts(row["cooldown_until"]) if row["cooldown_until"] else None,
+        next_attempt_at=(
+            _parse_ts(row["next_attempt_at"]) if row["next_attempt_at"] is not None else None
+        ),
+        cooldown_until=(
+            _parse_ts(row["cooldown_until"]) if row["cooldown_until"] is not None else None
+        ),
         cooldown_scope=row["cooldown_scope"],
     )

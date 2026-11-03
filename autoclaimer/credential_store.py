@@ -57,6 +57,9 @@ RETIRED_KEYS_ENV = "AUTOCLAIMER_FERNET_RETIRED_KEYS"
 
 _MAX_SNOWFLAKE = 2**63 - 1
 
+#: Bounded wait for in-flight guarded work during close() (final review).
+_CLOSE_GUARD_TIMEOUT_SECONDS = 6.0
+
 
 class CredentialKeyError(CredentialProviderError):
     """Encryption key material is missing or invalid (fail closed)."""
@@ -204,10 +207,24 @@ class SQLiteCredentialStore:
         self._closed = True
         conn, self._conn = self._conn, None
         if conn is not None:
+            # Final-review fix: a plain (unbounded) guard acquire could
+            # freeze the event loop behind a long in-flight operation
+            # (measured: up to busy_timeout + crypto). Wait bounded,
+            # then proceed best-effort with a logged warning.
+            if not self._guard.acquire(timeout=_CLOSE_GUARD_TIMEOUT_SECONDS):
+                logger.warning(
+                    "credential store closing while an operation is still in flight; proceeding",
+                    extra={"operation": "credential.close", "outcome": "busy"},
+                )
             try:
-                self._guarded(conn.close)
+                conn.close()
             except sqlite3.Error as exc:
                 raise _map_sqlite_error(exc) from exc
+            finally:
+                try:
+                    self._guard.release()
+                except RuntimeError:  # pragma: no cover - not held
+                    pass
 
     def _guarded(self, fn: Any, *args: Any) -> Any:
         with self._guard:
@@ -272,8 +289,8 @@ class SQLiteCredentialStore:
         now = self._clock().isoformat()
 
         def _write() -> None:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     conn.execute(
@@ -310,8 +327,8 @@ class SQLiteCredentialStore:
         _validate_account_id(account_id)
 
         def _delete() -> int:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 cur = conn.execute(
                     "DELETE FROM account_credentials WHERE account_id = ?", (account_id,)
                 )
@@ -333,8 +350,8 @@ class SQLiteCredentialStore:
         _validate_account_id(account_id)
 
         def _probe() -> bool:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 row = conn.execute(
                     "SELECT 1 FROM account_credentials WHERE account_id = ?", (account_id,)
                 ).fetchone()
@@ -361,8 +378,8 @@ class SQLiteCredentialStore:
 
         Returns True if the row was re-encrypted, False if already current.
         """
-        conn = self._connection()
         with self._guard:
+            conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -423,8 +440,8 @@ class SQLiteCredentialStore:
         reencrypted = 0
 
         def _row_ids() -> list[int]:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 return [
                     int(r[0])
                     for r in conn.execute(
@@ -501,6 +518,7 @@ class SQLiteCredentialStore:
             # class contract is that ALL connection use serializes on
             # the guard; the export must not be the one exception.)
             with self._guard:
+                conn = self._connection()
                 for r in conn.execute(
                     "SELECT account_id, encrypted_token, key_version, "
                     "created_at, updated_at FROM account_credentials "
@@ -565,18 +583,34 @@ class SQLiteCredentialStore:
         # BUG-014: typed error + atomic write — an interrupted export can
         # never leave an existing bundle truncated.
         target = Path(path)
-        tmp = target.with_name(f"{target.name}.tmp")
-        try:
-            tmp.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
-            tmp.replace(target)
-        except OSError as exc:
-            # Re-review edge: on an inaccessible directory even this
-            # CLEANUP can raise (unlink only suppresses FileNotFoundError)
-            # — contain it so the typed error is what reaches the caller.
+
+        def _write_bundle() -> None:
+            """BUG-014 + final review: atomic write via a UNIQUE mkstemp
+            temp file — a deterministic tmp name followed a planted
+            symlink (clobbering the victim) and collided across
+            concurrent exports. The write is O_EXCL-safe and runs on a
+            worker thread (never blocks the loop); cleanup ALWAYS runs."""
+            import os
+            import tempfile
+
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+            )
+            tmp = Path(tmp_name)
             try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(_json.dumps(payload, indent=2))
+                os.replace(tmp, target)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+        try:
+            await asyncio.to_thread(_write_bundle)
+        except OSError as exc:
             raise CredentialProviderError(
                 f"credential export failed: {type(exc).__name__}: {exc}"
             ) from exc
@@ -608,9 +642,16 @@ class SQLiteCredentialStore:
         import json as _json
 
         try:
-            payload = _json.loads(Path(path).read_text(encoding="utf-8"))
+            payload = _json.loads(await asyncio.to_thread(Path(path).read_text, encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
+        except RecursionError as exc:
+            # Final-review fix: a hostile deeply-nested bundle raised
+            # RecursionError straight through json.loads — killing the
+            # CLI session and the running framework.
+            raise CredentialProviderError(
+                "credential bundle is unreadable: nesting too deep"
+            ) from exc
         if not isinstance(payload, dict):
             raise CredentialProviderError("credential bundle is not an object")
         version = payload.get("version")
@@ -667,11 +708,17 @@ class SQLiteCredentialStore:
         # Phase 2: upsert on worker threads (BUG-012) — never block the loop.
         imported = 0
         skipped = 0
-        for account_id, blob in staged:
-            if await asyncio.to_thread(self._upsert_restored_row, account_id, blob):
-                imported += 1
-            else:
-                skipped += 1
+        try:
+            for account_id, blob in staged:
+                if await asyncio.to_thread(self._upsert_restored_row, account_id, blob):
+                    imported += 1
+                else:
+                    skipped += 1
+        except sqlite3.Error as exc:
+            # Final-review fix: a lock held past busy_timeout previously
+            # escaped as a RAW sqlite3.OperationalError, killing the CLI
+            # session — every other SQLite call in this class maps.
+            raise _map_sqlite_error(exc) from exc
         logger.info(
             "credential ciphertext imported",
             extra={"operation": "credential.import", "outcome": f"{imported}+{skipped}"},
@@ -714,8 +761,8 @@ class SQLiteCredentialStore:
         malformed non-bytes value (BUG-015) — is REPLACED: the restore is
         the documented repair path for corrupt rows. Verify before commit.
         """
-        conn = self._connection()
         with self._guard:
+            conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(

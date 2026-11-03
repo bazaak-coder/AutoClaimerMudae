@@ -8,6 +8,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from autoclaimer.persistence import (
     TaskStateStore,
 )
@@ -104,6 +106,14 @@ async def test_malformed_cooldown_and_state_rows_reported(tmp_path: Path) -> Non
         assert ("scope_cooldowns", "error") in tables
         assert ("mudae_state", "error") in tables
         assert all("sqlite3 CLI" in f.hint for f in findings)
+        conn = raw(tmp_path / "state.db")
+        try:
+            kept = conn.execute(
+                "SELECT deadline FROM scope_cooldowns WHERE scope = 'account:9'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert kept[0] == "garbage"  # read-only: row untouched
     finally:
         await store.close()
 
@@ -123,6 +133,8 @@ async def test_orphaned_account_rows_are_warnings_with_hints(tmp_path: Path) -> 
         assert "harmless" in orphans[0].problem or "harmless" in orphans[0].hint
         # Not supplying the account set skips the orphan check entirely.
         assert await store.integrity_report() == ()
+        # Read-only: both rows survive the scan.
+        assert len(await store.list_instances()) == 2
     finally:
         await store.close()
 
@@ -223,6 +235,14 @@ async def test_integrity_reports_blob_timestamps(tmp_path: Path) -> None:
         tables = {f.table for f in findings if f.severity == "error"}
         assert "scope_cooldowns" in tables
         assert "mudae_state" in tables
+        conn = raw(tmp_path / "state.db")
+        try:
+            blob = conn.execute(
+                "SELECT deadline FROM scope_cooldowns WHERE scope = 'account:9'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert isinstance(blob[0], bytes)  # read-only: BLOB survives
     finally:
         await store.close()
 
@@ -325,5 +345,146 @@ async def test_integrity_reports_kind_and_deadline_independently(tmp_path: Path)
         ]
         assert any("bogus" in p for p in problems), problems  # kind finding
         assert any("deadline" in p.lower() for p in problems), problems  # deadline finding
+    finally:
+        await store.close()
+
+
+# PR #8 final review: crash-class corruption (agent-2 F1, agent-7 #1)
+
+
+async def test_outcome_non_object_json_is_contained_everywhere(tmp_path: Path) -> None:
+    """`last_outcome` = valid JSON but NOT an object ('null', '5',
+    '"x"', '[1]'): the row decodes to a typed corrupt finding, the
+    scanner reports it, and due_queries skip it — never an AttributeError
+    cascade into the worker loop or the REPL."""
+    store = await opened(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE task_instances SET last_outcome = 'null' WHERE id = ?",
+                (record.id,),
+            )
+        conn.close()
+
+        # Scanner: a finding, not a crash.
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        assert any(f.table == "task_instances" and f.severity == "error" for f in findings), (
+            findings
+        )
+
+        # Query path: skipped as corrupt, never an AttributeError.
+        assert await store.list_instances() == ()
+
+        # Direct row read: typed PersistenceError.
+        from autoclaimer.persistence import PersistenceError as _PE
+
+        with pytest.raises(_PE, match="corrupt"):
+            await store.get_instance(record.id)
+    finally:
+        await store.close()
+
+
+async def test_outcome_deeply_nested_json_is_contained(tmp_path: Path) -> None:
+    """~100k-deep nested JSON in last_outcome raises RecursionError from
+    json.loads — must land in the typed corrupt-row containment, never
+    escape into the scanner or the REPL."""
+    store = await opened(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+        deep = "[" * 100_000 + "]" * 100_000
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE task_instances SET last_outcome = ? WHERE id = ?",
+                (deep, record.id),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        assert any(f.table == "task_instances" and f.severity == "error" for f in findings), (
+            findings
+        )
+        assert await store.list_instances() == ()
+    finally:
+        await store.close()
+
+
+def test_scan_never_crashes_on_arbitrary_row_garbage(tmp_path: Path) -> None:
+    """Defense in depth: the scanner's own loop contains ANY exception
+    from a hostile row as a finding — the diagnostic is the tool you
+    reach for when rows are corrupt, so it must never be the crash."""
+    import asyncio
+
+    from autoclaimer.persistence import TaskStateStore
+
+    async def main() -> tuple[object, ...]:
+        store = TaskStateStore(tmp_path / "state.db")
+        await store.open()
+        try:
+            conn = raw(tmp_path / "state.db")
+            with conn:
+                conn.execute(
+                    "UPDATE task_instances SET last_outcome = 'null' WHERE id = 1"
+                ) if False else conn.execute(
+                    "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                    "VALUES (1, 'claim', 1.5, 'x')"
+                )
+            conn.close()
+            return await store.integrity_report()
+        finally:
+            await store.close()
+
+    findings = asyncio.run(main())
+    assert isinstance(findings, tuple)  # returned, did not raise
+
+
+async def test_noncanonical_timezone_offset_is_a_finding(tmp_path: Path) -> None:
+    """PR #8 final review (agent-2 F2): an aware-but-offset timestamp
+    parses yet breaks the module's UTC-string-sortability contract (an
+    overdue task hidden ~11 h). The scanner must flag it."""
+    store = await opened(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE task_instances SET next_attempt_at = ? WHERE id = ?",
+                ("2026-11-02T23:00:00+14:00", record.id),
+            )
+            conn.execute(
+                "UPDATE scope_cooldowns SET deadline = ? WHERE scope = ?",
+                ("2026-11-02T23:00:00+14:00", "x"),
+            )
+            conn.execute(
+                "INSERT INTO scope_cooldowns (scope, deadline, server_directed) VALUES ('y', ?, 1)",
+                ("2026-11-02T23:00:00+14:00",),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        problems = [f.problem for f in findings if f.severity == "error"]
+        assert any("non-canonical" in p or "timezone" in p.lower() for p in problems), problems
+    finally:
+        await store.close()
+
+
+async def test_empty_string_timestamp_is_a_finding_not_due_now(tmp_path: Path) -> None:
+    """PR #8 final review (agent-2 F3): '' in a timestamp column is
+    corrupt data (no write path produces it) — reported, and never
+    silently treated as absent (which made the row due immediately)."""
+    store = await opened(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+        conn = raw(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE task_instances SET next_attempt_at = ? WHERE id = ?",
+                ("", record.id),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        assert any(f.table == "task_instances" and f.severity == "error" for f in findings), (
+            findings
+        )
     finally:
         await store.close()

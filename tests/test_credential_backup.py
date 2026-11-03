@@ -378,6 +378,9 @@ async def test_import_rejects_duplicate_account_ids(tmp_path: Path) -> None:
     try:
         with pytest.raises(CredentialProviderError, match="duplicate"):
             await target.import_ciphertext(bundle)
+        # Negative control (agent-8 F1, mutation-proven gap): nothing
+        # was written — a validate-as-you-write regression must fail.
+        assert not await target.has_token(ACCOUNT)
     finally:
         target.close()
 
@@ -745,5 +748,152 @@ async def test_export_holds_connection_guard_against_writers(tmp_path: Path) -> 
             assert restored.get_token(ACCOUNT) == TOKEN_A
         finally:
             restored.close()
+    finally:
+        store.close()
+
+
+async def test_import_deeply_nested_bundle_is_typed(tmp_path: Path) -> None:
+    """PR #8 final review (agent-7 #1): a hostile bundle with ~100k-deep
+    nesting raises RecursionError from json.loads — a typed CLI error,
+    never a session/framework shutdown."""
+    from autoclaimer.cli import AutoClaimerController, CliSession
+    from autoclaimer.config import parse_accounts_config, parse_app_config
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+    from autoclaimer.mock_adapter import MockAdapter
+    from autoclaimer.persistence import TaskStateStore
+    from autoclaimer.ratelimit import RateLimiter
+    from autoclaimer.registry import TaskRegistry
+
+    deep = "[" * 100_000 + "]" * 100_000
+    bundle = tmp_path / "deep.json"
+    bundle.write_text('{"version": 2, "accounts": ' + deep + "}")
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    creds = await _open(tmp_path / "creds.db", env)
+    app = parse_app_config({"version": 1, "channels": {"roll_claim": 1}, "tasks": {}})
+    accounts = parse_accounts_config({"version": 1, "accounts": []}, app)
+    task_store = TaskStateStore(tmp_path / "state.db")
+    await task_store.open()
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=task_store,
+        limiter=RateLimiter(store=task_store),
+        registry=TaskRegistry(),
+        adapter_factory=lambda account_id: MockAdapter(),
+        credential_store=creds,
+    )
+    output: list[str] = []
+    session = CliSession(controller, read_line=None, write=output.append)  # type: ignore[arg-type]
+    try:
+        # Store level: typed.
+        with pytest.raises(_CPE):
+            await creds.import_ciphertext(bundle)
+        # CLI level: survives, controller open.
+        assert await session.run_once(f"credential import {bundle} confirm") is True
+        assert any("error" in line.lower() for line in output)
+        assert controller.closed is False
+    finally:
+        creds.close()
+        await task_store.close()
+
+
+async def test_import_phase2_sqlite_failure_is_typed(tmp_path: Path) -> None:
+    """PR #8 final review (agent-1 #1): another connection holding the
+    write lock past busy_timeout makes the phase-2 upsert fail — the
+    error must arrive typed (DatabaseBusyError), and the CLI session
+    must survive it."""
+    import time
+
+    from autoclaimer.cli import AutoClaimerController, CliSession
+    from autoclaimer.config import parse_accounts_config, parse_app_config
+    from autoclaimer.mock_adapter import MockAdapter
+    from autoclaimer.persistence import DatabaseBusyError, TaskStateStore
+    from autoclaimer.ratelimit import RateLimiter
+    from autoclaimer.registry import TaskRegistry
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    source = await _open(tmp_path / "source.db", env)
+    try:
+        await source.set_token(ACCOUNT, TOKEN_A)
+        bundle = tmp_path / "b.json"
+        await source.export_ciphertext(bundle)
+    finally:
+        source.close()
+
+    target = await _open(tmp_path / "target.db", env)
+    app = parse_app_config({"version": 1, "channels": {"roll_claim": 1}, "tasks": {}})
+    accounts = parse_accounts_config({"version": 1, "accounts": []}, app)
+    task_store = TaskStateStore(tmp_path / "state.db")
+    await task_store.open()
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=task_store,
+        limiter=RateLimiter(store=task_store),
+        registry=TaskRegistry(),
+        adapter_factory=lambda account_id: MockAdapter(),
+        credential_store=target,
+    )
+    output: list[str] = []
+    session = CliSession(controller, read_line=None, write=output.append)  # type: ignore[arg-type]
+    holder = sqlite3.connect(tmp_path / "target.db", isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Event()
+
+    def release_later() -> None:
+        time.sleep(6.5)  # past busy_timeout (5 s)
+        holder.execute("ROLLBACK")
+        holder.close()
+        release.set()
+
+    thread = threading.Thread(target=release_later, daemon=True)
+    thread.start()
+    try:
+        # Store level: the lock-held upsert arrives TYPED.
+        with pytest.raises(DatabaseBusyError):
+            await target.import_ciphertext(bundle)
+        # CLI level: the session survives the same failure (the store
+        # error is caught by run_once's typed tuple).
+        assert await session.run_once(f"credential import {bundle} confirm") is True
+        assert controller.closed is False
+        # After the lock releases, the restore completes (whether the
+        # CLI retry or this final import landed it — both are the same
+        # idempotent operation) and the token is readable.
+        await asyncio.to_thread(release.wait, 10)
+        if not await target.has_token(ACCOUNT):
+            imported, _ = await target.import_ciphertext(bundle)
+            assert imported == 1
+        assert target.get_token(ACCOUNT) == TOKEN_A
+    finally:
+        release.set()
+        thread.join(timeout=10)
+        target.close()
+        await task_store.close()
+
+
+async def test_export_does_not_follow_planted_tmp_symlink(tmp_path: Path) -> None:
+    """PR #8 final review (agent-7 #2): a symlink planted at the export
+    temp path must NOT be followed — the victim file stays untouched and
+    the bundle lands only at the real target."""
+    import os
+
+    if os.geteuid() == 0:  # pragma: no cover
+        pytest.skip("symlink semantics unreliable as root")
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        target = tmp_path / "b.json"
+        victim = tmp_path / "victim.txt"
+        victim.write_text("PRECIOUS", encoding="utf-8")
+        os.symlink(victim, tmp_path / "b.json.tmp")  # the planted trap
+
+        count = await store.export_ciphertext(target)
+        assert count == 1
+        assert victim.read_text() == "PRECIOUS"  # NOT clobbered
+        assert target.exists() and not target.is_symlink()
+        payload = json.loads(target.read_text())
+        assert len(payload["accounts"]) == 1
     finally:
         store.close()

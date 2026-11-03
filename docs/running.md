@@ -93,6 +93,7 @@ The interactive REPL (`help` inside the session shows the same):
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
 | `status` | Worker status snapshot |
+| `integrity` | Read-only database diagnostic (never modifies data) |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
 | `help` | Command help |
 | `quit` / `exit` / `shutdown` | Graceful shutdown and exit |

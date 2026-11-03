@@ -479,11 +479,17 @@ class CliSession:
         return account_id
 
     async def _cmd_credential(self, args: list[str]) -> str | list[str]:
-        """Encrypted credential administration (Fernet key required)."""
+        """Encrypted credential administration.
+
+        Stored-credential actions require the Fernet key; ``generate-key``
+        works keyless by design (first-time setup)."""
         from .credential_store import CredentialKeyError, generate_fernet_key
 
         if not args:
-            return "usage: credential set|has|delete|accounts|rotate|generate-key <account>"
+            return (
+                "usage: credential set|has|delete <account> | accounts | rotate | "
+                "generate-key | export|import <path> confirm"
+            )
         action = args[0].lower()
         if action == "generate-key":
             self._exact_args(args, 1)
@@ -502,7 +508,10 @@ class CliSession:
                     "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY "
                     "(see 'credential generate-key') and restart"
                 )
-            token = await self._read_secret(f"token for account {account_id} (input hidden): ")
+            try:
+                token = await self._read_secret(f"token for account {account_id} (input hidden): ")
+            except (EOFError, KeyboardInterrupt):
+                raise ValueError("no token entered — nothing stored") from None
             token = token.strip()
             if not token:
                 raise ValueError("empty token — nothing stored")
@@ -555,7 +564,8 @@ class CliSession:
             return await self._controller.credential_import(args[1])
         raise ValueError(
             f"unknown credential action {action!r}; "
-            "expected set, has, delete, accounts, rotate, or generate-key"
+            "expected set, has, delete, accounts, rotate, generate-key, "
+            "export, or import"
         )
 
     async def _cmd_integrity(self, args: list[str]) -> list[str]:
@@ -611,6 +621,9 @@ USAGE = """commands:
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
   help                            this help
+  credential ...                 encrypted-token administration (set/has/delete/
+                                  accounts/rotate/export/import/generate-key)
+  integrity                       read-only database diagnostic
   quit | shutdown                 graceful shutdown and exit"""
 
 
