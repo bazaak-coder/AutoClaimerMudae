@@ -694,8 +694,12 @@ class SQLiteCredentialStore:
         def _phase1() -> list[tuple[int, bytes]]:
             try:
                 text = Path(path).read_text(encoding="utf-8")
-            except OSError as exc:
-                raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
+            except (OSError, UnicodeDecodeError) as exc:
+                # BUG-028: invalid UTF-8 in the bundle file is a typed
+                # error, never a raw UnicodeDecodeError escape.
+                raise CredentialProviderError(
+                    f"credential bundle is unreadable: {type(exc).__name__}"
+                ) from exc
             try:
                 payload = _json.loads(text)
             except (ValueError, RecursionError) as exc:
@@ -725,7 +729,16 @@ class SQLiteCredentialStore:
             for index, record in enumerate(raw_accounts):
                 if not isinstance(record, dict):
                     raise CredentialProviderError(f"bundle record {index} is not an object")
-                account_id = _validate_account_id(record.get("account_id"))
+                # BUG-028: translate the plain ValueError from
+                # _validate_account_id into the credential-domain typed
+                # error — external bundle metadata must never leak a
+                # raw ValueError through the import API.
+                try:
+                    account_id = _validate_account_id(record.get("account_id"))
+                except ValueError as exc:
+                    raise CredentialProviderError(
+                        f"bundle record {index} has an invalid account id"
+                    ) from exc
                 if account_id in seen:
                     raise CredentialProviderError(
                         f"bundle contains duplicate records for account {account_id}"

@@ -1394,3 +1394,62 @@ async def test_boolean_account_id_in_inner_is_typed(tmp_path: Path) -> None:
         assert not await target.has_token(ACCOUNT)
     finally:
         target.close()
+
+
+# BUG-028 completion: _phase1 typed-error contract for malformed bundles
+
+
+async def test_import_invalid_utf8_bundle_is_typed(tmp_path: Path) -> None:
+    """A bundle file with invalid UTF-8 bytes raises a typed
+    CredentialProviderError — never a raw UnicodeDecodeError."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        bundle = tmp_path / "bad.json"
+        bundle.write_bytes(b'{"version": 2, "accounts": [{"account_id": 1, \xff\xfe\x00bad}]}')
+        with pytest.raises(_CPE, match="unreadable") as excinfo:
+            await target.import_ciphertext(bundle)
+        assert b"\xff" not in str(excinfo.value).encode()  # no raw bytes
+        assert not await target.has_token(1)
+    finally:
+        target.close()
+
+
+@pytest.mark.parametrize("bad_id,kind", [
+    ("123", "string"),
+    (True, "boolean"),
+    (None, "null"),
+    ([1, 2], "list"),
+    ({"x": 1}, "dict"),
+    (0, "zero"),
+    (-1, "negative"),
+    (2**63, "overflow"),
+], ids=["string", "boolean", "null", "list", "dict", "zero", "negative", "overflow"])
+async def test_import_invalid_account_id_metadata_is_typed(
+    tmp_path: Path, bad_id: object, kind: str
+) -> None:
+    """BUG-028: any invalid account_id in the bundle metadata raises a
+    typed CredentialProviderError (not a raw ValueError), writes
+    nothing, and exposes no unbounded values."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        bundle = tmp_path / "bad.json"
+        bundle.write_text(
+            json.dumps({"version": 2, "exported_at": "x", "accounts": [
+                {"account_id": bad_id, "encrypted_token": "dGVzdA==",
+                 "key_version": 1, "created_at": "x", "updated_at": "x"}
+            ]})
+        )
+        with pytest.raises(_CPE) as excinfo:
+            await target.import_ciphertext(bundle)
+        message = str(excinfo.value)
+        assert len(message) < 200, f"unbounded error ({len(message)} chars)"
+        # No credential was written (whole-bundle reject).
+        assert not await target.has_token(1)
+    finally:
+        target.close()
