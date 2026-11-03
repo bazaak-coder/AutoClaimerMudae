@@ -778,7 +778,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="task_instances",
-                            key=f"id={row[0]} account={row[1]} task={row[2]!r}",
+                            key=f"id={row[0]} account={row[1]} task={_clip(row[2])}",
                             problem=str(exc),
                             hint="Quarantine the row (sqlite3 CLI) or restore the "
                             "backup; runtime queries already skip it.",
@@ -805,7 +805,7 @@ class TaskStateStore:
                             severity="error",
                             table="scope_cooldowns",
                             key=f"scope={_clip(row[0])}",
-                            problem=f"server_directed flag is {row[2]!r} (expected 0/1)",
+                            problem=(f"server_directed flag is {_clip(row[2])} (expected 0/1)"),
                             hint="Delete the row with the sqlite3 CLI.",
                         )
                     )
@@ -826,7 +826,7 @@ class TaskStateStore:
                             table="mudae_state",
                             key=f"account={row[0]} kind={_clip(row[1])}",
                             problem=(
-                                f"unsupported kind {row[1]!r} "
+                                f"unsupported kind {_clip(row[1])} "
                                 f"(expected one of: {', '.join(k.value for k in MudaeStateKind)})"
                             ),
                             hint="Delete the row with the sqlite3 CLI; the task "
@@ -962,11 +962,11 @@ class TaskStateStore:
                 # Repo-sweep fix: float values (0.9, 1.7) previously
                 # truncated silently — require an exact 0/1 integer.
                 if not isinstance(raw_flag, int) or raw_flag not in (0, 1):
-                    raise ValueError(f"server_directed flag is {raw_flag!r}")
+                    raise ValueError(f"server_directed flag is {_clip(raw_flag)}")
                 server_directed = raw_flag
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
-                    f"corrupt scope_cooldowns row scope={scope!r}: {type(exc).__name__}: {exc}"
+                    f"corrupt scope_cooldowns row scope={_clip(scope)}: {type(exc).__name__}: {_clip(str(exc), 120)}"
                 )
                 logger.error("skipping %s", error)
                 continue
@@ -1074,7 +1074,7 @@ class TaskStateStore:
                 deadline = _parse_ts(row["deadline"])
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
-                    f"corrupt mudae_state row account={account_id} kind={kind_raw!r}: "
+                    f"corrupt mudae_state row account={account_id} kind={_clip(kind_raw)}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 logger.error("skipping %s", error)

@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Proposed — not yet implemented or merged.
+**Backlog status:** Phase 1 (items 1–4) is implemented in PR #8 (open, CI-green, audited through seven review rounds) and pending merge. Items 5–20 are implemented on the stacked PRs #9–#11 (open, CI-green). Items 21–25, 26, and 27 are not started; item 26 is planned.
 
 ## Priority Definitions
 

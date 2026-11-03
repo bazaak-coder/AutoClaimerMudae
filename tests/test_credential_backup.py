@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import MultiFernet
 
+import autoclaimer.credential_store
+import autoclaimer.credentials
 from autoclaimer.credential_store import (
     PRIMARY_KEY_ENV,
     CredentialDecryptError,
@@ -897,3 +899,72 @@ async def test_export_does_not_follow_planted_tmp_symlink(tmp_path: Path) -> Non
         assert len(payload["accounts"]) == 1
     finally:
         store.close()
+
+
+async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
+    """BUG-018: close() while a worker thread holds _guard must NOT
+    close the connection underneath it — the in-flight operation
+    completes successfully, and cleanup happens after the guard is
+    released (deferred via a release-hooked watcher thread)."""
+    import time
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def hold_guard() -> None:
+        with store._guard:  # noqa: SLF001 — the condition under test
+            entered.set()
+            assert release.wait(5.0)
+            # While the guard is ours, the CAPTURED connection must
+            # still work (close() already nulled the store's reference —
+            # that's bookkeeping, not closure): an in-flight credential
+            # write completes (not discarded, not raced).
+            conn.execute(
+                "INSERT INTO account_credentials "
+                "(account_id, encrypted_token, key_version, created_at, updated_at) "
+                "VALUES (?, ?, 1, 'x', 'x') "
+                "ON CONFLICT(account_id) DO UPDATE SET updated_at = 'x'",
+                (ACCOUNT, b"placeholder"),
+            )
+            completed.set()
+
+    holder = threading.Thread(target=hold_guard, daemon=True)
+    holder.start()
+    assert await asyncio.to_thread(entered.wait, 5.0)
+    conn = store._conn  # noqa: SLF001 — captured BEFORE close() nulls it
+    assert conn is not None
+
+    # Shortened close timeout: close returns promptly WITHOUT closing
+    # the connection (bounded shutdown, no race).
+    original_timeout = autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS
+    autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = 0.2
+    try:
+        start = time.monotonic()
+        store.close()
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, "close() blocked unboundedly"
+
+        # The in-flight operation completes on the STILL-OPEN connection.
+        release.set()
+        holder.join(timeout=5.0)
+        assert completed.is_set(), "in-flight write was discarded"
+
+        # Eventual cleanup: the deferred watcher closed the connection
+        # after the guard was released.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                probe = sqlite3.connect(tmp_path / "state.db")
+                probe.execute("SELECT 1").fetchone()
+                probe.close()
+                break
+            except sqlite3.Error:
+                await asyncio.sleep(0.05)
+        # The store's own connection is closed now.
+        with pytest.raises(autoclaimer.credentials.CredentialProviderError):
+            store.get_token(ACCOUNT)
+    finally:
+        autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = original_timeout

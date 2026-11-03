@@ -201,30 +201,50 @@ class SQLiteCredentialStore:
         """Close the connection; safe to call more than once.
 
         SYNCHRONOUS by protocol requirement: ``CredentialProvider.close``
-        is a sync hook the controller calls during shutdown. Closing one
-        dedicated connection is a single fast C call under the guard.
+        is a sync hook the controller calls during shutdown.
+
+        BUG-018 fix: NEVER close the connection while another thread
+        owns ``_guard`` — an in-flight credential write must complete,
+        not be discarded or raced. If the bounded wait expires, cleanup
+        is DEFERRED to a watcher thread that acquires the guard after
+        the in-flight operation releases it, then closes. Shutdown
+        stays bounded; the connection stays safe.
         """
         self._closed = True
         conn, self._conn = self._conn, None
-        if conn is not None:
-            # Final-review fix: a plain (unbounded) guard acquire could
-            # freeze the event loop behind a long in-flight operation
-            # (measured: up to busy_timeout + crypto). Wait bounded,
-            # then proceed best-effort with a logged warning.
-            if not self._guard.acquire(timeout=_CLOSE_GUARD_TIMEOUT_SECONDS):
-                logger.warning(
-                    "credential store closing while an operation is still in flight; proceeding",
-                    extra={"operation": "credential.close", "outcome": "busy"},
-                )
+        if conn is None:
+            return
+        if self._guard.acquire(timeout=_CLOSE_GUARD_TIMEOUT_SECONDS):
+            # The guard is free (or we got it within the bound): close
+            # synchronously — the common, fast path.
             try:
                 conn.close()
             except sqlite3.Error as exc:
                 raise _map_sqlite_error(exc) from exc
             finally:
+                self._guard.release()
+            return
+        # Timeout: an operation still holds the guard. Closing now would
+        # race it (BUG-018). Defer to a watcher: it waits for the guard
+        # (unbounded — the operation MUST finish), then closes. We log
+        # and return promptly: shutdown is bounded; cleanup is eventual.
+        logger.warning(
+            "credential store busy at close; deferring connection cleanup "
+            "until the in-flight operation completes",
+            extra={"operation": "credential.close", "outcome": "deferred"},
+        )
+
+        def _deferred_close() -> None:
+            with self._guard:
                 try:
-                    self._guard.release()
-                except RuntimeError:  # pragma: no cover - not held
-                    pass
+                    conn.close()
+                except sqlite3.Error:
+                    logger.exception(
+                        "deferred credential connection close failed",
+                        extra={"operation": "credential.close", "outcome": "deferred_error"},
+                    )
+
+        threading.Thread(target=_deferred_close, daemon=True).start()
 
     def _guarded(self, fn: Any, *args: Any) -> Any:
         with self._guard:
