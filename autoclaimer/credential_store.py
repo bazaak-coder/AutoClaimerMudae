@@ -71,11 +71,19 @@ class CredentialDecryptError(CredentialProviderError):
     key, or corrupted ciphertext). Never carries token or key material."""
 
 
-def _validate_account_id(account_id: int) -> int:
-    # bool is a subclass of int — reject it explicitly.
+def _validate_account_id(account_id: object) -> int:
+    """Validate an account id from UNTRUSTED input (JSON bundles included):
+    true int in snowflake range — ``bool`` is a subclass of ``int`` and is
+    rejected explicitly."""
     if type(account_id) is not int or not 0 < account_id <= _MAX_SNOWFLAKE:
+        # BUG-025: the raw repr of an untrusted bundle value can be
+        # arbitrarily large — report the type and a bounded form only.
+        bounded = repr(account_id)
+        if len(bounded) > 60:
+            bounded = bounded[:60] + "..."
         raise ValueError(
-            f"account id must be a positive Discord snowflake integer, got {account_id!r}"
+            f"account id must be a positive Discord snowflake integer, "
+            f"got {type(account_id).__name__}: {bounded}"
         )
     return account_id
 
@@ -168,6 +176,7 @@ class SQLiteCredentialStore:
         self._clock = clock
         self._conn: sqlite3.Connection | None = None
         self._guard = threading.RLock()
+        self._close_watcher: threading.Thread | None = None
         self._closed = False
 
     # ----- lifecycle -----
@@ -196,16 +205,63 @@ class SQLiteCredentialStore:
         """Close the connection; safe to call more than once.
 
         SYNCHRONOUS by protocol requirement: ``CredentialProvider.close``
-        is a sync hook the controller calls during shutdown. Closing one
-        dedicated connection is a single fast C call under the guard.
+        is a sync hook the controller calls during shutdown.
+
+        BUG-018 fix: NEVER close the connection while another thread
+        owns ``_guard`` — an in-flight credential write must complete,
+        not be discarded or raced. If the bounded wait expires, cleanup
+        is DEFERRED to a watcher thread that acquires the guard after
+        the in-flight operation releases it, then closes. Shutdown
+        stays bounded; the connection stays safe.
         """
         self._closed = True
         conn, self._conn = self._conn, None
-        if conn is not None:
+        if conn is None:
+            return
+        # BUG-024: NON-BLOCKING acquisition — a synchronous wait on a
+        # held guard froze the event loop during shutdown. If the guard
+        # is free we close synchronously (the common fast path);
+        # otherwise we defer IMMEDIATELY (no wait on the loop thread).
+        if self._guard.acquire(blocking=False):
             try:
-                self._guarded(conn.close)
+                conn.close()
             except sqlite3.Error as exc:
                 raise _map_sqlite_error(exc) from exc
+            finally:
+                self._guard.release()
+            return
+        # Timeout: an operation still holds the guard. Closing now would
+        # race it (BUG-018). Defer to a watcher: it waits for the guard
+        # (unbounded — the operation MUST finish), then closes. We log
+        # and return promptly: shutdown is bounded; cleanup is eventual.
+        logger.warning(
+            "credential store busy at close; deferring connection cleanup "
+            "until the in-flight operation completes",
+            extra={"operation": "credential.close", "outcome": "deferred"},
+        )
+
+        def _deferred_close() -> None:
+            with self._guard:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    logger.exception(
+                        "deferred credential connection close failed",
+                        extra={"operation": "credential.close", "outcome": "deferred_error"},
+                    )
+
+        try:
+            # Tracked (not anonymous): callers/tests can join it before
+            # interpreter teardown — an anonymous daemon thread racing
+            # py3.12's shutdown caused a SIGSEGV in CI.
+            self._close_watcher = threading.Thread(target=_deferred_close, daemon=True)
+            self._close_watcher.start()
+        except RuntimeError:  # pragma: no cover — interpreter finalization
+            logger.warning(
+                "could not start deferred credential close (interpreter "
+                "shutting down); the connection closes at process exit",
+                extra={"operation": "credential.close", "outcome": "watcher_failed"},
+            )
 
     def _guarded(self, fn: Any, *args: Any) -> Any:
         with self._guard:
@@ -227,8 +283,8 @@ class SQLiteCredentialStore:
         """
         _validate_account_id(account_id)
         try:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 row = conn.execute(
                     "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
                     (account_id,),
@@ -270,8 +326,8 @@ class SQLiteCredentialStore:
         now = self._clock().isoformat()
 
         def _write() -> None:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     conn.execute(
@@ -308,8 +364,8 @@ class SQLiteCredentialStore:
         _validate_account_id(account_id)
 
         def _delete() -> int:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 cur = conn.execute(
                     "DELETE FROM account_credentials WHERE account_id = ?", (account_id,)
                 )
@@ -331,8 +387,8 @@ class SQLiteCredentialStore:
         _validate_account_id(account_id)
 
         def _probe() -> bool:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 row = conn.execute(
                     "SELECT 1 FROM account_credentials WHERE account_id = ?", (account_id,)
                 ).fetchone()
@@ -359,8 +415,8 @@ class SQLiteCredentialStore:
 
         Returns True if the row was re-encrypted, False if already current.
         """
-        conn = self._connection()
         with self._guard:
+            conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -421,8 +477,8 @@ class SQLiteCredentialStore:
         reencrypted = 0
 
         def _row_ids() -> list[int]:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 return [
                     int(r[0])
                     for r in conn.execute(
@@ -454,8 +510,8 @@ class SQLiteCredentialStore:
         """All accounts with stored credentials (management/inspection)."""
 
         def _ids() -> tuple[int, ...]:
-            conn = self._connection()
             with self._guard:
+                conn = self._connection()
                 return tuple(
                     int(r[0]) for r in conn.execute("SELECT account_id FROM account_credentials")
                 )
@@ -464,6 +520,379 @@ class SQLiteCredentialStore:
             return await asyncio.to_thread(_ids)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
+
+    # ----- ciphertext backup / restore (roadmap item 4) -----------------
+    #
+    # Format v2 (ChatGPT PR #8 audit BUG-013): each exported ciphertext
+    # is an AUTHENTICATED structured record {"account_id", "token"} — the
+    # account mapping travels INSIDE the Fernet envelope, so editing the
+    # bundle's JSON account_id cannot reassign a credential to another
+    # account. v1 bundles (unauthenticated metadata) are REJECTED with an
+    # actionable error; nothing silently treats them as authenticated.
+
+    _EXPORT_FORMAT = 2
+
+    async def export_ciphertext(self, path: str | Path) -> int:
+        """Write every credential row to *path* as CIPHERTEXT-only JSON.
+
+        Each record's ciphertext authenticates BOTH the token and its
+        account id (format v2). The plaintext tokens never appear in the
+        file. The write is ATOMIC (temp + rename) and filesystem
+        failures raise the TYPED credential error (PR #8 audit BUG-014:
+        an invalid destination must never tear down the CLI runtime).
+        Returns the exported row count.
+        """
+        import base64
+        import json as _json
+
+        def _dump() -> list[dict[str, object]]:
+            records: list[dict[str, object]] = []
+            # VERIFY-003: hold the connection guard for the whole read —
+            # the same discipline as every other credential operation.
+            # (SQLite's same-connection statement snapshots make an
+            # unguarded read *observable-safe*, verified below, but the
+            # class contract is that ALL connection use serializes on
+            # the guard; the export must not be the one exception.)
+            with self._guard:
+                conn = self._connection()
+                for r in conn.execute(
+                    "SELECT account_id, encrypted_token, key_version, "
+                    "created_at, updated_at FROM account_credentials "
+                    "ORDER BY account_id"
+                ):
+                    value = r[1]
+                    if not isinstance(value, (bytes, bytearray)):
+                        # BUG-015: SQLite permits TEXT in BLOB columns; a
+                        # corrupt row is a typed error, never a raw TypeError.
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} is malformed; "
+                            "fix or delete the row before exporting"
+                        )
+                    # BUG-016: decryption/decoding failures are contained
+                    # per row, naming the account, never echoing material.
+                    try:
+                        token = self._keys.multi.decrypt(bytes(value)).decode("utf-8")
+                    except InvalidToken as exc:
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} cannot be "
+                            "decrypted with the configured keys (wrong or "
+                            "rotated-away key?); fix or delete the row before "
+                            "exporting"
+                        ) from exc
+                    except UnicodeDecodeError as exc:
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} is malformed "
+                            "(decrypted value is not valid UTF-8)"
+                        ) from exc
+                    key_version = r[2]
+                    if type(key_version) is not int:
+                        # Review finding 2: a corrupt key_version would
+                        # escape as a raw ValueError from int(); validate
+                        # it typed, naming the account, echoing nothing.
+                        raise CredentialDecryptError(
+                            f"stored credential for account {r[0]} has a "
+                            "malformed key_version; fix or delete the row "
+                            "before exporting"
+                        )
+                    inner = _json.dumps({"account_id": int(r[0]), "token": token})
+                    envelope = self._keys.multi.encrypt(inner.encode("utf-8"))
+                    records.append(
+                        {
+                            "account_id": int(r[0]),
+                            "encrypted_token": base64.b64encode(envelope).decode("ascii"),
+                            "key_version": key_version,
+                            "created_at": str(r[3]),
+                            "updated_at": str(r[4]),
+                        }
+                    )
+            return records
+
+        try:
+            records = await asyncio.to_thread(_dump)
+        except sqlite3.Error as exc:
+            raise _map_sqlite_error(exc) from exc
+        payload = {
+            "version": self._EXPORT_FORMAT,
+            "exported_at": self._clock().isoformat(),
+            "accounts": records,
+        }
+        # BUG-014: typed error + atomic write — an interrupted export can
+        # never leave an existing bundle truncated.
+        target = Path(path)
+
+        def _write_bundle() -> None:
+            """BUG-014 + final review: atomic write via a UNIQUE mkstemp
+            temp file — a deterministic tmp name followed a planted
+            symlink (clobbering the victim) and collided across
+            concurrent exports. The write is O_EXCL-safe and runs on a
+            worker thread (never blocks the loop); cleanup ALWAYS runs."""
+            import os
+            import tempfile
+
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+            )
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(_json.dumps(payload, indent=2))
+                os.replace(tmp, target)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+        try:
+            await asyncio.to_thread(_write_bundle)
+        except OSError as exc:
+            raise CredentialProviderError(
+                f"credential export failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        logger.info(
+            "credential ciphertext exported",
+            extra={"operation": "credential.export", "outcome": str(len(records))},
+        )
+        return len(records)
+
+    async def import_ciphertext(self, path: str | Path) -> tuple[int, int]:
+        """Restore credentials from an export bundle. Validate, then write.
+
+        Every record is validated by DECRYPTING it with the configured
+        keys and checking its AUTHENTICATED account id against the JSON
+        metadata (BUG-013: a tampered mapping is rejected whole) before
+        anything is written. Duplicate account ids are rejected (the
+        last-write-wins ambiguity is a defect, not a feature). Accepted
+        records are re-encrypted under the CURRENT primary key, and each
+        upsert runs on a WORKER THREAD with its read and write inside
+        ONE transaction (BUG-012/VERIFY-002): the event loop never
+        blocks on SQLite, and a concurrent ``set_token`` for the same
+        account either completes before the import's transaction (the
+        authoritative restore overwrites it) or waits and lands after —
+        the import never discards a committed update mid-transaction.
+
+        RESTORE CONTRACT (VERIFY-005): validation is ALL-OR-NOTHING —
+        a malformed, wrong-key, tampered, duplicate, or empty-token
+        record rejects the WHOLE bundle with zero rows written. Storage
+        failures in phase 2 are PER-RECORD RESUMABLE: a database error
+        after some rows have committed leaves the committed prefix in
+        place; retrying the same bundle converges to the full restore
+        (idempotent: already-restored rows are skipped). This is the
+        documented and tested behavior, not a bug.
+
+        Returns ``(imported, skipped_current)``.
+        """
+        import base64
+        import json as _json
+
+        # BUG-023: the ENTIRE phase-1 (file read + JSON parse + structural
+        # validation + Fernet authentication + duplicate detection +
+        # staging) runs on a WORKER THREAD — json.loads and per-record
+        # crypto on the event loop stalled it for seconds on large
+        # bundles. Only the validated staged data returns to the caller.
+        def _phase1() -> list[tuple[int, bytes]]:
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                # BUG-028: invalid UTF-8 in the bundle file is a typed
+                # error — type name only (no raw bytes in the message).
+                raise CredentialProviderError(
+                    f"credential bundle is unreadable: {type(exc).__name__}"
+                ) from exc
+            except OSError as exc:
+                # OSError detail (path, errno) is safe and actionable —
+                # the bundle path is operator-supplied CLI input.
+                raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
+            try:
+                payload = _json.loads(text)
+            except (ValueError, RecursionError) as exc:
+                kind = "nesting too deep" if isinstance(exc, RecursionError) else str(exc)
+                raise CredentialProviderError(f"credential bundle is unreadable: {kind}") from exc
+
+            if not isinstance(payload, dict):
+                raise CredentialProviderError("credential bundle is not an object")
+            version = payload.get("version")
+            if version == 1:
+                raise CredentialProviderError(
+                    "bundle format v1 is not supported: its account mapping is "
+                    "unauthenticated (pre-merge format). Re-export with the "
+                    "current version to produce an authenticated bundle."
+                )
+            if version != self._EXPORT_FORMAT:
+                raise CredentialProviderError(
+                    "credential bundle format not recognized (expected version "
+                    f"{self._EXPORT_FORMAT}; produced by 'credential export')"
+                )
+            raw_accounts = payload.get("accounts")
+            if not isinstance(raw_accounts, list):
+                raise CredentialProviderError("credential bundle has no 'accounts' list")
+
+            staged_local: list[tuple[int, bytes]] = []
+            seen: set[int] = set()
+            for index, record in enumerate(raw_accounts):
+                if not isinstance(record, dict):
+                    raise CredentialProviderError(f"bundle record {index} is not an object")
+                # BUG-028: translate the plain ValueError from
+                # _validate_account_id into the credential-domain typed
+                # error — external bundle metadata must never leak a
+                # raw ValueError through the import API.
+                try:
+                    account_id = _validate_account_id(record.get("account_id"))
+                except ValueError as exc:
+                    raise CredentialProviderError(
+                        f"bundle record {index} has an invalid account id"
+                    ) from exc
+                if account_id in seen:
+                    raise CredentialProviderError(
+                        f"bundle contains duplicate records for account {account_id}"
+                    )
+                seen.add(account_id)
+                blob_b64 = record.get("encrypted_token")
+                if not isinstance(blob_b64, str):
+                    raise CredentialProviderError(
+                        f"bundle record for account {account_id} has no ciphertext"
+                    )
+                try:
+                    blob = base64.b64decode(blob_b64, validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise CredentialProviderError(
+                        f"bundle record for account {account_id} is malformed"
+                    ) from exc
+                inner = self._decrypt_bundle_record(account_id, blob)
+                if inner["account_id"] != account_id:
+                    raise CredentialProviderError(
+                        f"bundle record account mismatch: ciphertext authenticates "
+                        f"account {inner['account_id']}, metadata says {account_id} "
+                        "(tampered bundle?)"
+                    )
+                staged_local.append((account_id, blob))
+            return staged_local
+
+        staged = await asyncio.to_thread(_phase1)
+
+        # Phase 2: upsert on worker threads (BUG-012) — never block the loop.
+        imported = 0
+        skipped = 0
+        try:
+            for account_id, blob in staged:
+                if await asyncio.to_thread(self._upsert_restored_row, account_id, blob):
+                    imported += 1
+                else:
+                    skipped += 1
+        except sqlite3.Error as exc:
+            # Final-review fix: a lock held past busy_timeout previously
+            # escaped as a RAW sqlite3.OperationalError, killing the CLI
+            # session — every other SQLite call in this class maps.
+            raise _map_sqlite_error(exc) from exc
+        logger.info(
+            "credential ciphertext imported",
+            extra={"operation": "credential.import", "outcome": f"{imported}+{skipped}"},
+        )
+        return (imported, skipped)
+
+    def _decrypt_bundle_record(self, account_id: int, blob: bytes) -> dict[str, object]:
+        """Decrypt + parse one bundle envelope; typed errors throughout."""
+        import json as _json
+
+        try:
+            inner_raw = self._keys.multi.decrypt(blob)
+        except InvalidToken as exc:
+            raise CredentialDecryptError(
+                f"bundle record for account {account_id} cannot be decrypted "
+                "with the configured keys — restore the matching "
+                "AUTOCLAIMER_FERNET_KEY (or retired keys) and retry"
+            ) from exc
+        try:
+            inner = _json.loads(inner_raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise CredentialProviderError(
+                f"bundle record for account {account_id} is malformed"
+            ) from exc
+        except RecursionError as exc:
+            # BUG-027: a deeply-nested inner JSON payload raises
+            # RecursionError (not ValueError) — must be typed, bounded.
+            raise CredentialProviderError(
+                f"bundle record for account {account_id} is malformed (inner JSON nesting too deep)"
+            ) from exc
+        if (
+            not isinstance(inner, dict)
+            or type(inner.get("account_id")) is not int
+            or not isinstance(inner.get("token"), str)
+            or not inner["token"]
+        ):
+            # BUG-022: empty tokens are rejected — set_token() refuses
+            # them; the restore path accepts no less. Checked BEFORE
+            # any phase-2 write (whole-bundle reject).
+            raise CredentialProviderError(
+                f"bundle record for account {account_id} is malformed "
+                "(empty tokens are never valid)"
+            )
+        return inner
+
+    def _upsert_restored_row(self, account_id: int, blob: bytes) -> bool:
+        """Upsert one bundle record under the primary key (worker thread).
+
+        VERIFY-002: ``BEGIN IMMEDIATE`` precedes the row READ, so the
+        read-compare-write is one transaction (the rotation discipline).
+        Skips when the account already stores the SAME TOKEN (token
+        equality). A stored row that cannot be decrypted — including a
+        malformed non-bytes value (BUG-015) — is REPLACED: the restore is
+        the documented repair path for corrupt rows. Verify before commit.
+        """
+        with self._guard:
+            conn = self._connection()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT encrypted_token FROM account_credentials WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+                inner = self._decrypt_bundle_record(account_id, blob)
+                bundle_token = str(inner["token"])
+                if row is not None:
+                    value = row[0]
+                    if isinstance(value, (bytes, bytearray)):
+                        try:
+                            # BUG-026: skip ONLY when the PRIMARY key
+                            # decrypts the stored ciphertext AND the token
+                            # matches. A row under a retired key must be
+                            # re-encrypted under the primary — skipping it
+                            # leaves it bricked when the retired key is
+                            # eventually discarded.
+                            stored_token = self._keys.primary.decrypt(bytes(value)).decode("utf-8")
+                            if stored_token == bundle_token:
+                                conn.execute("ROLLBACK")
+                                return False  # identical token already stored
+                        except (InvalidToken, UnicodeDecodeError):
+                            pass  # retired-key or corrupt row: re-encrypt
+                new_blob = self._keys.multi.encrypt(bundle_token.encode("utf-8"))
+                # Verify the re-encrypted row decrypts back BEFORE commit.
+                if (
+                    self._keys.primary.decrypt(new_blob).decode("utf-8") != bundle_token
+                ):  # pragma: no cover - AEAD
+                    raise CredentialProviderError(
+                        f"restore verification failed for account {account_id}"
+                    )
+                now = self._clock().isoformat()
+                conn.execute(
+                    "INSERT INTO account_credentials "
+                    "(account_id, encrypted_token, key_version, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(account_id) DO UPDATE SET "
+                    "encrypted_token = excluded.encrypted_token, "
+                    "key_version = excluded.key_version, "
+                    "updated_at = excluded.updated_at",
+                    (account_id, new_blob, self._keys.version, now, now),
+                )
+                conn.execute("COMMIT")
+                return True
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:  # pragma: no cover - already rolled back
+                    logger.exception("rollback during failed restore row also failed")
+                raise
 
 
 __all__ = [

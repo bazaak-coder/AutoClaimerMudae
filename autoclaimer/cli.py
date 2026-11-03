@@ -18,6 +18,9 @@ Commands (REPL)::
     cooldowns                    active cooldowns and permits
     errors                       recent failures and retry times
     status                       worker status snapshot
+    credential ...               encrypted-token administration (set/has/delete/
+                                  accounts/rotate/export/import/generate-key)
+    integrity                    read-only database diagnostic
     help                         usage
     quit | shutdown              graceful shutdown, then exit
 """
@@ -172,6 +175,40 @@ class AutoClaimerController:
         assert self._credential_store is not None
         count = await self._credential_store.rotate()
         return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
+
+    async def credential_export(self, path: str) -> str:
+        """Ciphertext-only export (roadmap item 4). Confirmation is
+        enforced by the CLI layer; this stays a single loud operation."""
+        assert self._credential_store is not None
+        count = await self._credential_store.export_ciphertext(path)
+        return (
+            f"exported {count} credential(s) as CIPHERTEXT to {path} — the file "
+            "contains no plaintext tokens; protect it exactly like the "
+            "database (it is only usable together with the key)"
+        )
+
+    async def credential_import(self, path: str) -> str:
+        assert self._credential_store is not None
+        imported, skipped = await self._credential_store.import_ciphertext(path)
+        return (
+            f"imported {imported} credential(s) from {path} "
+            f"({skipped} already current); every record was validated and "
+            "re-encrypted under the current primary key"
+        )
+
+    async def integrity_report(self) -> list[str]:
+        """Read-only database diagnostic (roadmap item 2)."""
+        known = {account.id for account in self._accounts.accounts}
+        findings = await self._store.integrity_report(known_account_ids=known)
+        if not findings:
+            return ["integrity: OK — database, task rows, cooldowns, and state rows are consistent"]
+        lines = [f"integrity: {len(findings)} finding(s) (nothing was modified)"]
+        for finding in findings:
+            lines.append(
+                f"  [{finding.severity}] {finding.table} {finding.key}: "
+                f"{finding.problem}\n    → {finding.hint}"
+            )
+        return lines
 
     # ----- account controls (valid before start) -----
 
@@ -445,11 +482,17 @@ class CliSession:
         return account_id
 
     async def _cmd_credential(self, args: list[str]) -> str | list[str]:
-        """Encrypted credential administration (Fernet key required)."""
+        """Encrypted credential administration.
+
+        Stored-credential actions require the Fernet key; ``generate-key``
+        works keyless by design (first-time setup)."""
         from .credential_store import CredentialKeyError, generate_fernet_key
 
         if not args:
-            return "usage: credential set|has|delete|accounts|rotate|generate-key <account>"
+            return (
+                "usage: credential set|has|delete <account> | accounts | rotate | "
+                "generate-key | export|import <path> confirm"
+            )
         action = args[0].lower()
         if action == "generate-key":
             self._exact_args(args, 1)
@@ -468,7 +511,10 @@ class CliSession:
                     "credential storage unavailable: set AUTOCLAIMER_FERNET_KEY "
                     "(see 'credential generate-key') and restart"
                 )
-            token = await self._read_secret(f"token for account {account_id} (input hidden): ")
+            try:
+                token = await self._read_secret(f"token for account {account_id} (input hidden): ")
+            except (EOFError, KeyboardInterrupt):
+                raise ValueError("no token entered — nothing stored") from None
             token = token.strip()
             if not token:
                 raise ValueError("empty token — nothing stored")
@@ -504,10 +550,31 @@ class CliSession:
                     "(new primary) and AUTOCLAIMER_FERNET_RETIRED_KEYS (old keys)"
                 )
             return await self._controller.credential_rotate()
+        if action in ("export", "import"):
+            # Destructive-adjacent operations: an explicit literal
+            # ``confirm`` is required so they can never run by accident.
+            if len(args) != 3 or args[2] != "confirm":
+                raise ValueError(
+                    f"credential {action} requires an explicit confirmation: "
+                    f"'credential {action} <path> confirm'"
+                )
+            if not self._controller.credential_store_ready():
+                raise CredentialKeyError(
+                    f"credential {action} unavailable: set AUTOCLAIMER_FERNET_KEY and restart"
+                )
+            if action == "export":
+                return await self._controller.credential_export(args[1])
+            return await self._controller.credential_import(args[1])
         raise ValueError(
             f"unknown credential action {action!r}; "
-            "expected set, has, delete, accounts, rotate, or generate-key"
+            "expected set, has, delete, accounts, rotate, generate-key, "
+            "export, or import"
         )
+
+    async def _cmd_integrity(self, args: list[str]) -> list[str]:
+        """Read-only database diagnostic: reports findings, modifies nothing."""
+        self._exact_args(args, 0)
+        return await self._controller.integrity_report()
 
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
@@ -530,6 +597,7 @@ class CliSession:
         "errors": _cmd_errors,
         "status": _cmd_status,
         "credential": _cmd_credential,
+        "integrity": _cmd_integrity,
     }
 
 
@@ -549,7 +617,12 @@ USAGE = """commands:
   credential delete <account>     delete the stored credential
   credential accounts             accounts with stored credentials
   credential rotate               re-encrypt all credentials under the primary key
+  credential export <path> confirm
+                                  write all credentials as CIPHERTEXT (no plaintext)
+  credential import <path> confirm
+                                  restore credentials (validated, re-encrypted under primary)
   credential generate-key         print a fresh Fernet key (first-time setup only)
+  integrity                       read-only database diagnostic (never modifies data)
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 

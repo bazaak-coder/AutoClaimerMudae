@@ -138,6 +138,24 @@ class UnsupportedSchemaVersionError(PersistenceError):
     """The database schema version is newer than this code supports."""
 
 
+@dataclass(frozen=True)
+class IntegrityFinding:
+    """One problem found by the read-only integrity diagnostic.
+
+    Severity ``error``: the database or a row is unusable/undecodable.
+    Severity ``warning``: suspicious but harmless to operation (e.g.
+    leftovers from a removed account). Hints are actionable and NEVER
+    involve automatic deletion — potentially recoverable user data is
+    only ever touched by an explicit operator action.
+    """
+
+    severity: str  # "error" | "warning"
+    table: str
+    key: str
+    problem: str
+    hint: str
+
+
 class UnknownInstanceError(PersistenceError):
     """No task instance exists for the given identifier."""
 
@@ -176,11 +194,6 @@ class MudaeStateKind(Enum):
 
 
 RESUMABLE_STATES = frozenset({TaskInstanceState.PENDING, TaskInstanceState.WAITING})
-TERMINAL_STATES = frozenset(
-    {TaskInstanceState.SUCCEEDED, TaskInstanceState.FAILED, TaskInstanceState.CANCELLED}
-)
-
-_CLAIMABLE = (TaskInstanceState.PENDING, TaskInstanceState.WAITING)
 
 
 @dataclass(frozen=True)
@@ -211,14 +224,40 @@ def _format_ts(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 
+def _clip(value: object, limit: int = 60) -> str:
+    """Bounded repr for finding text (final review): unbounded echoes
+    dumped up to 100 KB of hostile row content into CLI output/logs."""
+    text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + f"...({len(text)} chars)"
+    return text
+
+
 def _parse_ts(value: str) -> datetime:
+    # PR #8 audit BUG-011: SQLite permits BLOB values in TEXT columns —
+    # fromisoformat(bytes) raises TypeError, which previously escaped
+    # containment. Normalize to ValueError so every existing handler
+    # reports malformed persisted timestamps as findings.
+    if not isinstance(value, str):
+        raise ValueError(f"persisted timestamp must be text, got {type(value).__name__}")
+    if value == "":
+        raise ValueError("persisted timestamp is empty")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         # Naive timestamps are invalid persisted data: every write path
         # produces timezone-aware UTC strings, so naive means corrupt or
         # hand-edited state. Refuse to reinterpret it (agents.md
         # section 17.6; audit F4) — callers treat this as a corrupt row.
-        raise ValueError(f"timezone-naive persisted timestamp {value!r}")
+        raise ValueError(f"timezone-naive persisted timestamp {value[:60]!r}")
+    # Final-review fix (agent-2 F2): every write path stores UTC
+    # isoformat() so SQL string-comparison orders timestamps
+    # chronologically; an aware-but-OFFSET value parses yet silently
+    # breaks that contract (a +14:00 deadline hid an overdue task for
+    # ~11 h). Only the exact canonical form is valid persisted data.
+    if parsed.astimezone(UTC).isoformat() != value:
+        raise ValueError(
+            f"non-canonical persisted timestamp {value[:60]!r} (expected UTC isoformat)"
+        )
     return parsed.astimezone(UTC)
 
 
@@ -287,14 +326,19 @@ class TaskStateStore:
         async with self._lock:
             try:
                 self._conn = await asyncio.to_thread(_connect)
-                await asyncio.to_thread(self._migrate_sync, self._conn)
+                # Final-review fix: migration/verification run through
+                # the GUARDED threaded call (a raw to_thread bypassed the
+                # connection guard), and ANY failure — including
+                # cancellation — closes and nulls the half-open
+                # connection instead of leaking it.
+                await self._call_threaded(self._migrate_sync, self._conn)
                 # Repo-sweep fix: CREATE TABLE IF NOT EXISTS no-ops on a
                 # tampered/foreign schema and user_version still claims
                 # current — verify the actual column shapes post-migrate
                 # so a mismatched database fails FAST with a typed,
                 # named error instead of forever-recoverable write errors.
-                await asyncio.to_thread(self._verify_shape_sync, self._conn)
-            except (sqlite3.Error, PersistenceError) as exc:
+                await self._call_threaded(self._verify_shape_sync, self._conn)
+            except BaseException as exc:
                 if self._conn is not None:
                     # Guarded close (repo-sweep): waits for any in-flight
                     # call to drain instead of closing underneath it.
@@ -308,13 +352,21 @@ class TaskStateStore:
                 raise
 
     async def close(self) -> None:
-        """Close the connection; safe to call more than once."""
+        """Close the connection; safe to call more than once.
+
+        Final-review fix (agent-3 #3): ``_conn`` is nulled in a
+        ``finally`` — a cancellation of the close await previously left
+        the store holding a reference to the (thread-completed) closed
+        connection, producing misleading typed errors afterwards."""
         async with self._lock:
             if self._conn is not None:
-                # Guarded (repo-sweep): an abandoned in-flight call must
-                # finish before the connection closes underneath it.
-                await self._call_threaded(self._conn.close)
-                self._conn = None
+                conn = self._conn
+                try:
+                    # Guarded (repo-sweep): an abandoned in-flight call
+                    # must finish before the connection closes under it.
+                    await self._call_threaded(conn.close)
+                finally:
+                    self._conn = None
 
     @property
     def schema_version(self) -> int:
@@ -607,7 +659,19 @@ class TaskStateStore:
         return await self.get_instance_by_ids(account_id, task_id)
 
     async def claim(self, instance_id: int) -> TaskInstanceRecord:
-        """pending|waiting -> running, counting one new attempt."""
+        """pending|waiting -> running, counting one new attempt.
+
+        Known limitation (final review, agent-3 #2 / agent-5 F1): the
+        CAS UPDATE and the read-back SELECT are two lock acquisitions —
+        a writer landing between them returns the LATER writer's state.
+        Wrapping them in one transaction changes the lock profile and
+        breaks the verified cancellation contracts (the transaction
+        fast-path bypasses the store lock), so the tear is accepted and
+        documented instead: the only running->pending actor is
+        recover_interrupted (startup-only, behind the _started guard);
+        the plausible interleaving is stop()-cancels-a-claim-in-flight
+        followed by restart — bounded by at-least-once semantics and
+        the attempt-count CAS itself."""
         now = _format_ts(self._clock())
         changed = await self._run(
             self._update_sync,
@@ -662,6 +726,175 @@ class TaskStateStore:
                     f"'{current.status.value}'."
                 )
         return await self.get_instance(instance_id)
+
+    async def integrity_report(
+        self, known_account_ids: set[int] | None = None
+    ) -> tuple[IntegrityFinding, ...]:
+        """Read-only database diagnostic (roadmap item 2 — P0).
+
+        Never writes, never deletes, never repairs: every problem is
+        reported as an actionable finding for the operator. Covers:
+
+        - ``PRAGMA integrity_check`` (page-level corruption),
+        - undecodable task rows (corrupt JSON outcomes, malformed
+          timestamps, unsupported status values),
+        - malformed ``scope_cooldowns`` rows,
+        - malformed ``mudae_state`` rows (unsupported kind enums AND
+          malformed deadlines — independently detected per row, BUG-017),
+        - orphaned references: task/credential/Mudae-state rows for
+          accounts absent from *known_account_ids* (when supplied by the
+          caller, e.g. from the parsed accounts.json); one warning per
+          account regardless of how many tables hold its rows
+          (VERIFY-004).
+        """
+        findings: list[IntegrityFinding] = []
+
+        def _scan_rows(conn: sqlite3.Connection, out: list[IntegrityFinding]) -> None:  # noqa: C901
+            # 1. SQLite-level integrity.
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            problems = [_clip(str(r[0]), 80) for r in rows if str(r[0]).lower() != "ok"]
+            if problems:
+                out.append(
+                    IntegrityFinding(
+                        severity="error",
+                        table="database",
+                        key="-",
+                        problem="; ".join(problems[:5])
+                        + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else ""),
+                        hint="Restore state.db from a backup (see docs/running.md: "
+                        "Database diagnostics and recovery).",
+                    )
+                )
+            # 2. Task rows the application cannot decode.
+            for row in conn.execute(
+                "SELECT id, account_id, task_id FROM task_instances ORDER BY id"
+            ):
+                try:
+                    full = conn.execute(
+                        "SELECT * FROM task_instances WHERE id = ?", (row[0],)
+                    ).fetchone()
+                    _row_to_record(full)
+                except PersistenceError as exc:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="task_instances",
+                            key=f"id={_clip(row[0])} account={_clip(row[1])} task={_clip(row[2])}",
+                            problem=_clip(str(exc), 200),
+                            hint="Quarantine the row (sqlite3 CLI) or restore the "
+                            "backup; runtime queries already skip it.",
+                        )
+                    )
+            # 3. Malformed cooldown rows.
+            for row in conn.execute("SELECT scope, deadline, server_directed FROM scope_cooldowns"):
+                try:
+                    _parse_ts(row[1])
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="scope_cooldowns",
+                            key=f"scope={_clip(row[0])}",
+                            problem=f"malformed deadline {_clip(row[1])}",
+                            hint="Delete the row with the sqlite3 CLI; the limiter "
+                            "re-learns cooldowns from the server.",
+                        )
+                    )
+                if row[2] not in (0, 1):
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="scope_cooldowns",
+                            key=f"scope={_clip(row[0])}",
+                            problem=(f"server_directed flag is {_clip(row[2])} (expected 0/1)"),
+                            hint="Delete the row with the sqlite3 CLI.",
+                        )
+                    )
+            # 4. Malformed mudae_state rows.
+            for row in conn.execute("SELECT account_id, kind, deadline FROM mudae_state"):
+                # BUG-017: the kind must be a supported enum value — an
+                # unsupported kind is silently skipped by the runtime's
+                # deadline loader, so without this check the diagnostic
+                # could report a healthy database over dead rows. Validated
+                # INDEPENDENTLY of the deadline so one invalid field never
+                # masks the other. Read-only: the row is never touched.
+                try:
+                    MudaeStateKind(str(row[1]))
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="mudae_state",
+                            key=f"account={_clip(row[0])} kind={_clip(row[1])}",
+                            problem=(
+                                f"unsupported kind {_clip(row[1])} "
+                                f"(expected one of: {', '.join(k.value for k in MudaeStateKind)})"
+                            ),
+                            hint="Delete the row with the sqlite3 CLI; the task "
+                            "re-learns the window on its next round.",
+                        )
+                    )
+                try:
+                    _parse_ts(row[2])
+                except ValueError:
+                    out.append(
+                        IntegrityFinding(
+                            severity="error",
+                            table="mudae_state",
+                            key=f"account={_clip(row[0])} kind={_clip(row[1])}",
+                            problem=f"malformed deadline {_clip(row[2])}",
+                            hint="Delete the row with the sqlite3 CLI; the task "
+                            "re-learns the window on its next round.",
+                        )
+                    )
+            # 5. Orphaned account references (needs the caller's account set).
+            if known_account_ids is not None:
+                for row in conn.execute(
+                    "SELECT DISTINCT account_id FROM task_instances "
+                    "UNION SELECT account_id FROM account_credentials "
+                    "UNION SELECT account_id FROM mudae_state"
+                ):
+                    if row[0] not in known_account_ids:
+                        out.append(
+                            IntegrityFinding(
+                                severity="warning",
+                                table="task_instances/account_credentials/mudae_state",
+                                key=f"account={_clip(row[0])}",
+                                problem="account is not present in accounts.json",
+                                hint="Leftovers from a removed account. Rows are "
+                                "harmless; remove them explicitly (sqlite3 CLI / "
+                                "'credential delete') if the account is gone for good.",
+                            )
+                        )
+
+        def _scan_sync() -> None:
+            conn = self._connection()
+            try:
+                _scan_rows(conn, findings)
+            except Exception as exc:  # noqa: BLE001
+                # Final-review widening: heavy corruption can make even
+                # the diagnostic's own queries fail — sqlite errors AND
+                # any hostile-row surprise (the scanner is the tool you
+                # reach for when rows are corrupt; it must never be the
+                # crash). That failure IS the finding. The traceback is
+                # logged so scan-code BUGS stay distinguishable from
+                # data corruption.
+                logger.exception("integrity scan hit an unexpected error")
+                findings.append(
+                    IntegrityFinding(
+                        severity="error",
+                        table="database",
+                        key="-",
+                        problem=(
+                            f"scan could not complete: {type(exc).__name__}: {_clip(str(exc), 120)}"
+                        ),
+                        hint="Restore state.db from a backup (see docs/running.md: "
+                        "Database diagnostics and recovery).",
+                    )
+                )
+
+        await self._call_threaded(_scan_sync)
+        return tuple(findings)
 
     async def fail_account_queue(self, account_id: int, message: str) -> int:
         """Bulk ``pending|waiting -> failed`` for one account's instances.
@@ -732,13 +965,12 @@ class TaskStateStore:
                 # Repo-sweep fix: float values (0.9, 1.7) previously
                 # truncated silently — require an exact 0/1 integer.
                 if not isinstance(raw_flag, int) or raw_flag not in (0, 1):
-                    raise ValueError(f"server_directed flag is {raw_flag!r}")
+                    raise ValueError(f"server_directed flag is {_clip(raw_flag)}")
                 server_directed = raw_flag
-                if server_directed not in (0, 1):
-                    raise ValueError(f"server_directed flag is {row['server_directed']!r}")
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
-                    f"corrupt scope_cooldowns row scope={scope!r}: {type(exc).__name__}: {exc}"
+                    f"corrupt scope_cooldowns row scope={_clip(scope)}: "
+                    f"{type(exc).__name__}: {_clip(str(exc), 120)}"
                 )
                 logger.error("skipping %s", error)
                 continue
@@ -846,7 +1078,7 @@ class TaskStateStore:
                 deadline = _parse_ts(row["deadline"])
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
-                    f"corrupt mudae_state row account={account_id} kind={kind_raw!r}: "
+                    f"corrupt mudae_state row account={account_id} kind={_clip(kind_raw)}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 logger.error("skipping %s", error)
@@ -920,13 +1152,14 @@ def _safe_records(rows: Sequence[sqlite3.Row]) -> tuple[TaskInstanceRecord, ...]
 def _row_to_record(row: sqlite3.Row) -> TaskInstanceRecord:
     try:
         return _decode_row(row)
-    except (ValueError, KeyError, TypeError, IndexError) as exc:
+    except (ValueError, KeyError, TypeError, IndexError, RecursionError) as exc:
         # Corrupt row (bad JSON / timestamp / enum / MISSING COLUMN —
         # repo-sweep: IndexError from a hand-made schema previously
         # skipped containment entirely): a typed error carrying the row
         # id so callers can quarantine instead of crashing raw.
         raise PersistenceError(
-            f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: {exc}"
+            f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: "
+            f"{_clip(str(exc), 120)}"
         ) from exc
 
 
@@ -935,11 +1168,19 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
     outcome: TaskOutcome | None = None
     if outcome_raw is not None:
         payload = json.loads(outcome_raw)
+        # Final-review fix: valid JSON that is NOT an object ('null',
+        # numbers, strings, arrays) previously reached .get() and raised
+        # an AttributeError OUTSIDE every containment — crashing the
+        # integrity scanner, the worker loop, and the REPL.
+        if not isinstance(payload, dict):
+            raise ValueError(f"outcome JSON is not an object: {type(payload).__name__}")
         retry_at_raw = payload.get("retry_at")
+        if retry_at_raw == "":
+            raise ValueError("outcome retry_at is an empty string")
         outcome = TaskOutcome(
             status=TaskStatus(payload["status"]),
             message=payload.get("message", ""),
-            retry_at=_parse_ts(retry_at_raw) if retry_at_raw else None,
+            retry_at=_parse_ts(retry_at_raw) if retry_at_raw is not None else None,
         )
     return TaskInstanceRecord(
         id=row["id"],
@@ -950,7 +1191,11 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
         created_at=_parse_ts(row["created_at"]),
         updated_at=_parse_ts(row["updated_at"]),
         last_outcome=outcome,
-        next_attempt_at=_parse_ts(row["next_attempt_at"]) if row["next_attempt_at"] else None,
-        cooldown_until=_parse_ts(row["cooldown_until"]) if row["cooldown_until"] else None,
+        next_attempt_at=(
+            _parse_ts(row["next_attempt_at"]) if row["next_attempt_at"] is not None else None
+        ),
+        cooldown_until=(
+            _parse_ts(row["cooldown_until"]) if row["cooldown_until"] is not None else None
+        ),
         cooldown_scope=row["cooldown_scope"],
     )

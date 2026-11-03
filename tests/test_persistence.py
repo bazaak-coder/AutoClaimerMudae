@@ -502,10 +502,13 @@ async def test_parse_ts_rejects_naive_timestamps() -> None:
 
     with pytest.raises(ValueError, match="timezone-naive"):
         _parse_ts("2026-01-01T00:00:00")
-    aware = _parse_ts("2026-01-01T00:00:00+02:00")
-    offset = aware.utcoffset()
-    assert offset is not None
-    assert offset.total_seconds() == 0  # normalized to UTC
+    # Final-review tightening (agent-2 F2): aware-but-offset values are
+    # NON-CANONICAL persisted data — every write path stores UTC
+    # isoformat() so SQL string-comparison stays chronological; an
+    # offset value silently broke that ordering. Parsed-and-normalized
+    # acceptance was the old (unsafe) contract.
+    with pytest.raises(ValueError, match="non-canonical"):
+        _parse_ts("2026-01-01T00:00:00+02:00")
 
 
 async def test_naive_timestamp_row_is_treated_as_corrupt(tmp_path: Path) -> None:

@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Proposed — not yet implemented or merged.
+**Backlog status:** Phase 1 (items 1–4) is implemented in PR #8 (open, CI-green, audited through seven review rounds) and pending merge. Items 5–20 are implemented on the stacked PRs #9–#11 (open, CI-green). Items 21–25, 26, and 27 are not started; item 26 is planned.
 
 ## Priority Definitions
 
@@ -23,63 +23,71 @@
 
 **Priority: P0**
 
-### [ ] 1. SQLite Crash-Recovery Audit
+### [x] 1. SQLite Crash-Recovery Audit
 
 Investigate database behavior under abrupt process termination, rather than relying exclusively on graceful shutdown tests.
 
 **Acceptance criteria:**
 
-- [ ] Test termination during an active transaction.
-- [ ] Test termination during state updates.
-- [ ] Test termination during task claiming and completion.
-- [ ] Verify SQLite WAL recovery after process restart.
-- [ ] Verify no permanently stranded task states.
-- [ ] Verify eligible tasks are recovered without duplicate execution.
-- [ ] Document expected behavior for each interruption point.
+- [x] Test termination during an active transaction. — `test_kill_during_active_transaction_rolls_back` (hot-journal rollback, store usable)
+- [x] Test termination during state updates. — uncommitted rolled back / committed durable (`test_kill_after_committed_update_is_durable`)
+- [x] Test termination during task claiming and completion. — `test_kill_while_claimed_recovers_without_stranding`, `test_kill_during_completion_rolls_back_and_reschedules` (at-least-once)
+- [x] Verify journal-based crash recovery after process restart. — WAL is deliberately NOT used (its shared memory mapping is unreliable in the target environment; see `persistence._connect`), so WAL recovery was NOT tested and is NOT claimed: rollback-journal (hot-journal) recovery is what was verified, with the deployment mode pinned by test (`test_rollback_journal_mode_is_the_deployment_mode`)
+- [x] Verify no permanently stranded task states. — `test_recovery_leaves_terminal_states_untouched` (status matrix)
+- [x] Verify eligible tasks are recovered without duplicate execution. — `test_recovered_task_cannot_be_double_claimed` (atomic claim CAS; terminal rows never re-claimable)
+- [x] Document expected behavior for each interruption point. — `docs/running.md` → "Crash recovery by interruption point"
+
+**Completed:** 2026-10-31 (`tests/test_crash_recovery.py` — real child-process SIGKILL at each interruption point).
 
 **Dependencies:** Existing SQLite persistence and runtime recovery implementation.
 
-### [ ] 2. Database Integrity Checks
+### [x] 2. Database Integrity Checks
 
 Add safeguards for detecting database corruption and inconsistent persisted state.
 
 **Acceptance criteria:**
 
-- [ ] Run `PRAGMA integrity_check` through a diagnostic operation.
-- [ ] Detect orphaned task and account references.
-- [ ] Detect invalid or unsupported persisted states.
-- [ ] Provide actionable diagnostic output.
-- [ ] Never automatically delete potentially recoverable user data.
-- [ ] Document a recovery procedure.
+- [x] Run `PRAGMA integrity_check` through a diagnostic operation. — `integrity` CLI command → `TaskStateStore.integrity_report()`; heavy corruption that fails the scan itself is contained as a finding, never a crash
+- [x] Detect orphaned task and account references. — rows for accounts absent from accounts.json (warnings with hints; opt-in via the caller's account set)
+- [x] Detect invalid or unsupported persisted states. — corrupt outcome JSON, malformed timestamps, invalid cooldown flags/state rows
+- [x] Provide actionable diagnostic output. — severity + table + key + problem + a concrete hint per finding
+- [x] Never automatically delete potentially recoverable user data. — the diagnostic is strictly read-only (asserted by tests)
+- [x] Document a recovery procedure. — `docs/running.md` → "Database diagnostics and recovery"
+
+**Completed:** 2026-10-31 (`tests/test_integrity.py` — 15 scenarios incl. page corruption, CLI surface, and read-only assertions).
 
 **Dependencies:** SQLite persistence layer.
 
-### [ ] 3. Credential Recovery Documentation
+### [x] 3. Credential Recovery Documentation
 
 Document what happens when the encryption key is lost, replaced, or becomes inaccessible.
 
 **Acceptance criteria:**
 
-- [ ] Explain the consequences of losing the encryption key.
-- [ ] Document how to restore access to credentials.
-- [ ] Explain which data can and cannot be recovered.
-- [ ] Ensure recovery instructions never expose plaintext credentials.
-- [ ] Document secure key storage and backup recommendations.
+- [x] Explain the consequences of losing the encryption key. — `docs/credentials.md` → "Consequences of losing the key"
+- [x] Document how to restore access to credentials. — replace-key procedure AND backup-restore path, step by step
+- [x] Explain which data can and cannot be recovered. — key-dependency table (tokens vs tasks/cooldowns/state) + explicit never-recoverable case
+- [x] Ensure recovery instructions never expose plaintext credentials. — every artifact in the procedures is ciphertext, a key, or metadata
+- [x] Document secure key storage and backup recommendations. — storage rules, separation/equivalent-secrecy rule, two independent copies, tested restore
+
+**Completed:** 2026-10-31 (documentation; the procedures reference the item-4 export/import commands).
 
 **Dependencies:** Credential store and configuration documentation.
 
-### [ ] 4. Credential Backup and Restore
+### [x] 4. Credential Backup and Restore
 
 Establish a safe procedure for backing up and restoring credential-related data.
 
 **Acceptance criteria:**
 
-- [ ] Define which credential files and database records require backup.
-- [ ] Never export plaintext credentials by default.
-- [ ] Require explicit confirmation for sensitive export operations.
-- [ ] Validate restored encrypted data before accepting it.
-- [ ] Test restoration using a separate temporary environment.
-- [ ] Document key and backup compatibility requirements.
+- [x] Define which credential files and database records require backup. — `docs/credentials.md` (the `state.db` `account_credentials` rows and/or the export bundle, always paired with the key)
+- [x] Never export plaintext credentials by default. — export is ciphertext-only by construction (byte-level test assertion); there is no plaintext export path at all
+- [x] Require explicit confirmation for sensitive export operations. — literal `confirm` argument enforced for both `credential export` and `credential import` (tested)
+- [x] Validate restored encrypted data before accepting it. — phase-1 decrypt validation of every record; a non-matching or malformed bundle is rejected whole with zero rows written (tested)
+- [x] Test restoration using a separate temporary environment. — round-trip test exports from one database and restores into a fresh store/database; plus a re-encryption-under-new-primary test proving the old key can be discarded afterwards
+- [x] Document key and backup compatibility requirements. — bundle usable only with the export-time primary or any still-configured retired key; restored rows re-encrypted under the current primary
+
+**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 23 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
 
 **Dependencies:** Credential recovery documentation.
 
