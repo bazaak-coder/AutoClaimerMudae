@@ -1417,16 +1417,20 @@ async def test_import_invalid_utf8_bundle_is_typed(tmp_path: Path) -> None:
         target.close()
 
 
-@pytest.mark.parametrize("bad_id,kind", [
-    ("123", "string"),
-    (True, "boolean"),
-    (None, "null"),
-    ([1, 2], "list"),
-    ({"x": 1}, "dict"),
-    (0, "zero"),
-    (-1, "negative"),
-    (2**63, "overflow"),
-], ids=["string", "boolean", "null", "list", "dict", "zero", "negative", "overflow"])
+@pytest.mark.parametrize(
+    "bad_id,kind",
+    [
+        ("123", "string"),
+        (True, "boolean"),
+        (None, "null"),
+        ([1, 2], "list"),
+        ({"x": 1}, "dict"),
+        (0, "zero"),
+        (-1, "negative"),
+        (2**63, "overflow"),
+    ],
+    ids=["string", "boolean", "null", "list", "dict", "zero", "negative", "overflow"],
+)
 async def test_import_invalid_account_id_metadata_is_typed(
     tmp_path: Path, bad_id: object, kind: str
 ) -> None:
@@ -1440,10 +1444,21 @@ async def test_import_invalid_account_id_metadata_is_typed(
     try:
         bundle = tmp_path / "bad.json"
         bundle.write_text(
-            json.dumps({"version": 2, "exported_at": "x", "accounts": [
-                {"account_id": bad_id, "encrypted_token": "dGVzdA==",
-                 "key_version": 1, "created_at": "x", "updated_at": "x"}
-            ]})
+            json.dumps(
+                {
+                    "version": 2,
+                    "exported_at": "x",
+                    "accounts": [
+                        {
+                            "account_id": bad_id,
+                            "encrypted_token": "dGVzdA==",
+                            "key_version": 1,
+                            "created_at": "x",
+                            "updated_at": "x",
+                        }
+                    ],
+                }
+            )
         )
         with pytest.raises(_CPE) as excinfo:
             await target.import_ciphertext(bundle)
