@@ -2,13 +2,18 @@
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from autoclaimer.config import parse_accounts_config, parse_app_config
 from autoclaimer.mock_adapter import MockAdapter
-from autoclaimer.persistence import DatabaseBusyError, TaskInstanceState, TaskStateStore
+from autoclaimer.persistence import (
+    DatabaseBusyError,
+    PersistenceError,
+    TaskInstanceState,
+    TaskStateStore,
+)
 from autoclaimer.ratelimit import RateLimiter
 from autoclaimer.registry import TaskOutcome, TaskRegistry, TaskStatus, TaskType
 from autoclaimer.workers import WorkerManager
@@ -339,3 +344,105 @@ async def test_retry_delay_is_finite_at_extreme_attempts(tmp_path: Path) -> None
         delay = manager._retry_delay(attempts, ACCOUNT, "job")  # noqa: SLF001
         assert 0.0 <= delay <= 0.02  # capped by the config's backoff cap
     await store.close()
+
+
+# BUG-033: startup must be all-or-nothing — no worker may survive a failed
+# start (a retry would run recover_interrupted against a live worker's
+# claimed row and re-execute it: duplicate side effects)
+
+
+async def test_failed_startup_leaves_no_workers_and_retry_runs_once(
+    tmp_path: Path,
+) -> None:
+    """BUG-033: materialization failure for a LATER account must not
+    leave the EARLIER account's worker alive with ``_started`` False —
+    retrying start() would reset that worker's in-flight row and execute
+    the task twice. Startup materializes every account BEFORE the first
+    worker spawns."""
+    executions: list[int] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        executions.append(context.account_id)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {
+            "version": 1,
+            "accounts": [
+                {"id": ACCOUNT, "tasks": ["job"]},
+                {"id": OTHER, "tasks": ["job"]},
+            ],
+        },
+        app,
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    real_store = TaskStateStore(tmp_path / "state.db")
+    await real_store.open()
+
+    class FaultySecondAccountStore:
+        """Delegating store: create_instance fails for OTHER until cleared."""
+
+        def __init__(self, inner: TaskStateStore) -> None:
+            self._inner = inner
+            self.fault_active = True
+
+        async def create_instance(self, account_id: int, task_id: str) -> Any:
+            if self.fault_active and account_id == OTHER:
+                raise DatabaseBusyError("fault injected: second account unavailable")
+            return await self._inner.create_instance(account_id, task_id)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    faulty = FaultySecondAccountStore(real_store)
+    manager = WorkerManager(
+        registry=registry,
+        store=cast(Any, faulty),
+        limiter=RateLimiter(store=real_store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        with pytest.raises(PersistenceError, match="second account unavailable"):
+            await manager.start()
+        live = [
+            w
+            for w in manager._workers.values()  # noqa: SLF001 — the contract under test
+            if w.task is not None and not w.task.done()
+        ]
+        assert not live, f"{len(live)} worker(s) survived the failed startup"
+
+        faulty.fault_active = False
+        await manager.start()  # retry: full sequence again
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while asyncio.get_running_loop().time() < deadline:
+            record = await real_store.get_instance_by_ids(ACCOUNT, "job")
+            if record.status is TaskInstanceState.SUCCEEDED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("retry startup never executed the task")
+        assert executions.count(ACCOUNT) == 1, executions  # exactly once
+        assert record.attempt_count == 1
+    finally:
+        await manager.stop()
+        await real_store.close()

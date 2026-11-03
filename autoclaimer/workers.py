@@ -312,9 +312,19 @@ class WorkerManager:
         # server-directed deadlines must survive restarts (audit F1; a
         # no-op when the limiter has no store attached).
         await self._limiter.load_persisted_cooldowns()
+        # BUG-033: startup is all-or-nothing. Materialize EVERY account
+        # before the first worker spawns — every await that can fail now
+        # happens while no worker exists, so a failed start (with
+        # ``_started`` False) never leaves live workers behind. A retry
+        # would otherwise run ``recover_interrupted`` against a live
+        # worker's claimed row and execute it twice (duplicate side
+        # effects). The spawn loop itself is synchronous and cannot fail
+        # partway.
         for account_id in list(self._enabled):
             if self._enabled[account_id]:
                 await self._materialize(account_id)
+        for account_id in list(self._enabled):
+            if self._enabled[account_id]:
                 self._spawn_worker(account_id)
         logger.info("framework started")
 
