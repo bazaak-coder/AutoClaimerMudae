@@ -899,10 +899,9 @@ class TaskStateStore:
             with self._conn_guard:
                 conn.execute("VACUUM INTO ?", (str(target),))
 
-        try:
-            await asyncio.to_thread(_vacuum_into)
-        except sqlite3.Error as exc:
-            raise _map_sqlite_error(exc) from exc
+        # sqlite3.Error is mapped to a typed PersistenceError inside
+        # _call_threaded (via _run).
+        await self._run(_vacuum_into)
         return target.stat().st_size
 
     async def database_stats(self) -> dict[str, Any]:

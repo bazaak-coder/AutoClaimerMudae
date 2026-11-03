@@ -123,3 +123,41 @@ async def test_retention_keeps_growth_bounded(tmp_path: Path) -> None:
         assert stats["rows"]["audit_events"] == _AUDIT_KEEP
     finally:
         await store.close()
+
+
+# --- BUG-039: live backup must serialize at TRANSACTION level, not just
+# per-call guard level ---
+
+
+async def test_backup_waits_for_open_transaction_on_own_connection(
+    tmp_path: Path,
+) -> None:
+    """BUG-039: the store's OWN transaction (BEGIN held between guarded
+    calls) leaves the connection inside an open transaction — SQLite
+    rejects VACUUM INTO there ("cannot VACUUM from within a
+    transaction"). The backup must therefore serialize on the store's
+    async lock (like every other operation) and run AFTER the commit,
+    not race the window between the transaction's guarded calls."""
+    import asyncio
+
+    store = await _seeded(tmp_path)
+    try:
+        backup_path = tmp_path / "live.bak"
+        async with store.transaction():
+            await store.create_instance(ACCOUNT, "txn_body_row")  # txn genuinely open
+            backup = asyncio.create_task(store.backup_to(backup_path))
+            await asyncio.sleep(0.3)  # the backup attempt runs while txn is open
+            assert not backup.done(), (
+                "backup did not wait for the open transaction: "
+                f"{backup.exception() if backup.done() else 'pending'}"
+            )
+        # transaction committed -> the waiting backup completes
+        size = await asyncio.wait_for(backup, timeout=5.0)
+        assert backup_path.exists() and size > 0
+        probe = sqlite3.connect(backup_path)
+        try:
+            assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            probe.close()
+    finally:
+        await store.close()
