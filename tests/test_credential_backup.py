@@ -1178,3 +1178,210 @@ async def test_partial_import_is_resumable_and_converges(tmp_path: Path) -> None
         assert target.get_token(OTHER) == TOKEN_B
     finally:
         target.close()
+
+
+# PR #8 remediation: BUG-026/027/028
+
+
+async def test_skip_only_when_primary_current_retired_key_reencrypts(
+    tmp_path: Path,
+) -> None:
+    """BUG-026: a stored row whose token matches the backup token but is
+    encrypted under a RETIRED key must be RE-ENCRYPTED under the primary
+    (not skipped). Skip only when the primary itself decrypts the stored
+    ciphertext AND the token matches."""
+    old_key = generate_fernet_key()
+    new_key = generate_fernet_key()
+
+    # Seed the store with the OLD key.
+    source = await _open(tmp_path / "target.db", {PRIMARY_KEY_ENV: old_key})
+    try:
+        await source.set_token(ACCOUNT, TOKEN_A)
+    finally:
+        source.close()
+
+    # Re-open with the NEW primary + old retired.
+    target = await _open(
+        tmp_path / "target.db",
+        {PRIMARY_KEY_ENV: new_key, "AUTOCLAIMER_FERNET_RETIRED_KEYS": old_key},
+    )
+    # Export (the export decrypts via multi — retired works).
+    bundle = tmp_path / "b.json"
+    try:
+        await target.export_ciphertext(bundle)
+        # Pre-fix: the stored row is under the OLD key; multi.decrypt
+        # succeeds (retired key loaded); token matches → SKIP. The row
+        # stays under the retired key; dropping the retired key would
+        # brick it. Post-fix: re-encrypted under the primary.
+        imported, skipped = await target.import_ciphertext(bundle)
+        # Post-fix: re-encrypted (imported=1), not skipped.
+        assert imported == 1, (
+            f"BUG-026: row under retired key was skipped (imported={imported}, "
+            f"skipped={skipped}) — it must be re-encrypted under the primary"
+        )
+        # Verify the stored row now decrypts under the PRIMARY alone.
+        store_new_only = await _open(tmp_path / "verify.db", {PRIMARY_KEY_ENV: new_key})
+        try:
+            # Copy the row to a fresh store keyed only under the primary.
+            conn = sqlite3.connect(tmp_path / "target.db")
+            with conn:
+                conn.execute("ATTACH DATABASE ? AS v", (str(tmp_path / "verify.db"),))
+                conn.execute(
+                    "INSERT OR REPLACE INTO v.account_credentials "
+                    "SELECT account_id, encrypted_token, key_version, "
+                    "created_at, updated_at FROM main.account_credentials "
+                    "WHERE account_id = ?",
+                    (ACCOUNT,),
+                )
+            conn.close()
+            assert store_new_only.get_token(ACCOUNT) == TOKEN_A, (
+                "stored row does not decrypt under the primary key alone "
+                "(BUG-026: retired-key row was not re-encrypted)"
+            )
+        finally:
+            store_new_only.close()
+    finally:
+        target.close()
+
+
+async def test_skip_works_when_primary_current(tmp_path: Path) -> None:
+    """BUG-026 control: a row under the CURRENT primary with the same
+    token IS skipped (genuine idempotency)."""
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    source = await _open(tmp_path / "source.db", env)
+    try:
+        await source.set_token(ACCOUNT, TOKEN_A)
+        bundle = tmp_path / "b.json"
+        await source.export_ciphertext(bundle)
+    finally:
+        source.close()
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        imported, _ = await target.import_ciphertext(bundle)
+        assert imported == 1  # first import writes
+        imported2, skipped2 = await target.import_ciphertext(bundle)
+        assert (imported2, skipped2) == (0, 1)  # re-import: skip
+    finally:
+        target.close()
+
+
+def _craft_deep_inner(key: str, account_id: int) -> str:
+    """Craft an authenticated v2 envelope whose INNER JSON is ~100k-deep."""
+    from cryptography.fernet import Fernet
+
+    f = Fernet(key)
+    deep = "[" * 100_000 + "]" * 100_000
+    inner = f'{{"account_id": {account_id}, "token": "t", "x": {deep}}}'
+    envelope = base64.b64encode(f.encrypt(inner.encode("utf-8"))).decode("ascii")
+    return envelope
+
+
+async def test_deep_inner_json_is_typed_not_crash(tmp_path: Path) -> None:
+    """BUG-027: a deeply-nested INNER JSON payload raises RecursionError
+    from json.loads — must arrive typed, with zero writes."""
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        envelope = _craft_deep_inner(env[PRIMARY_KEY_ENV], ACCOUNT)
+        bundle = tmp_path / "deep.json"
+        bundle.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "exported_at": "x",
+                    "accounts": [
+                        {
+                            "account_id": ACCOUNT,
+                            "encrypted_token": envelope,
+                            "key_version": 1,
+                            "created_at": "x",
+                            "updated_at": "x",
+                        }
+                    ],
+                }
+            )
+        )
+        with pytest.raises(_CPE):
+            await target.import_ciphertext(bundle)
+        assert not await target.has_token(ACCOUNT)  # nothing written
+    finally:
+        target.close()
+
+
+async def test_invalid_utf8_inner_is_typed_not_crash(tmp_path: Path) -> None:
+    """BUG-028: an envelope decrypting to non-UTF-8 bytes is a typed
+    error — never a raw UnicodeDecodeError or bytes echo."""
+    from cryptography.fernet import Fernet
+
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        f = Fernet(env[PRIMARY_KEY_ENV])
+        # Encrypt raw non-UTF-8 bytes as the inner payload.
+        envelope = base64.b64encode(f.encrypt(b"\xff\xfe\x00bad")).decode("ascii")
+        bundle = tmp_path / "bad.json"
+        bundle.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "exported_at": "x",
+                    "accounts": [
+                        {
+                            "account_id": ACCOUNT,
+                            "encrypted_token": envelope,
+                            "key_version": 1,
+                            "created_at": "x",
+                            "updated_at": "x",
+                        }
+                    ],
+                }
+            )
+        )
+        with pytest.raises(_CPE, match="malformed") as excinfo:
+            await target.import_ciphertext(bundle)
+        assert b"\xff" not in str(excinfo.value).encode()  # no raw bytes
+        assert not await target.has_token(ACCOUNT)
+    finally:
+        target.close()
+
+
+async def test_boolean_account_id_in_inner_is_typed(tmp_path: Path) -> None:
+    """BUG-028: a boolean account_id in the inner envelope is typed,
+    bounded, and writes nothing."""
+    from cryptography.fernet import Fernet
+
+    from autoclaimer.credentials import CredentialProviderError as _CPE
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        f = Fernet(env[PRIMARY_KEY_ENV])
+        inner = json.dumps({"account_id": True, "token": "x"})
+        envelope = base64.b64encode(f.encrypt(inner.encode("utf-8"))).decode("ascii")
+        bundle = tmp_path / "bool.json"
+        bundle.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "exported_at": "x",
+                    "accounts": [
+                        {
+                            "account_id": ACCOUNT,
+                            "encrypted_token": envelope,
+                            "key_version": 1,
+                            "created_at": "x",
+                            "updated_at": "x",
+                        }
+                    ],
+                }
+            )
+        )
+        with pytest.raises(_CPE):
+            await target.import_ciphertext(bundle)
+        assert not await target.has_token(ACCOUNT)
+    finally:
+        target.close()

@@ -792,6 +792,12 @@ class SQLiteCredentialStore:
             raise CredentialProviderError(
                 f"bundle record for account {account_id} is malformed"
             ) from exc
+        except RecursionError as exc:
+            # BUG-027: a deeply-nested inner JSON payload raises
+            # RecursionError (not ValueError) — must be typed, bounded.
+            raise CredentialProviderError(
+                f"bundle record for account {account_id} is malformed (inner JSON nesting too deep)"
+            ) from exc
         if (
             not isinstance(inner, dict)
             or type(inner.get("account_id")) is not int
@@ -831,12 +837,18 @@ class SQLiteCredentialStore:
                     value = row[0]
                     if isinstance(value, (bytes, bytearray)):
                         try:
-                            stored_token = self._keys.multi.decrypt(bytes(value)).decode("utf-8")
+                            # BUG-026: skip ONLY when the PRIMARY key
+                            # decrypts the stored ciphertext AND the token
+                            # matches. A row under a retired key must be
+                            # re-encrypted under the primary — skipping it
+                            # leaves it bricked when the retired key is
+                            # eventually discarded.
+                            stored_token = self._keys.primary.decrypt(bytes(value)).decode("utf-8")
                             if stored_token == bundle_token:
                                 conn.execute("ROLLBACK")
                                 return False  # identical token already stored
                         except (InvalidToken, UnicodeDecodeError):
-                            pass  # corrupt stored row: replace (documented)
+                            pass  # retired-key or corrupt row: re-encrypt
                 new_blob = self._keys.multi.encrypt(bundle_token.encode("utf-8"))
                 # Verify the re-encrypted row decrypts back BEFORE commit.
                 if (
