@@ -5,12 +5,14 @@ findings AND that the database content is untouched afterwards.
 """
 
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from autoclaimer.persistence import (
+    TaskInstanceRecord,
     TaskStateStore,
 )
 
@@ -421,15 +423,24 @@ async def test_scan_contains_injected_unexpected_exceptions(tmp_path: Path) -> N
     try:
         await store.create_instance(ACCOUNT, "probe")
 
-        def exploding(row: sqlite3.Row) -> "object":
+        original = persistence_module._row_to_record
+
+        def exploding(row: sqlite3.Row) -> object:
             raise RuntimeError("injected scan-code failure")
 
-        original = persistence_module._row_to_record
-        persistence_module._row_to_record = exploding
+        from typing import cast
+
+        record_decoder = cast(
+            "Callable[[sqlite3.Row], TaskInstanceRecord]",
+            exploding,
+        )
+        persistence_module._row_to_record = record_decoder
         try:
             findings = await store.integrity_report(known_account_ids={ACCOUNT})
         finally:
-            persistence_module._row_to_record = original
+            persistence_module._row_to_record = cast(
+                "Callable[[sqlite3.Row], TaskInstanceRecord]", original
+            )
         assert any(
             f.table == "database" and f.severity == "error" and "RuntimeError" in f.problem
             for f in findings
