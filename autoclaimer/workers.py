@@ -524,6 +524,15 @@ class WorkerManager:
             ]
             for task in stragglers:
                 task.cancel()
+            # BUG-037: AWAIT the cancelled workers before closing adapters
+            # and resetting lifecycle state — stop() must not return while
+            # a worker is still unwinding: an immediate restart would run
+            # recover_interrupted() against the still-live worker's
+            # claimed row (duplicate-execution race). Mid-execution
+            # instances deliberately stay running (uncertain outcome;
+            # recovered on next start), matching the budget-timeout path.
+            if stragglers:
+                await asyncio.gather(*stragglers, return_exceptions=True)
             # Adapters close in the finally: outer cancellation of stop()
             # must never leak live clients (N1). Adapter close() is
             # idempotent, so a retried stop() is harmless.

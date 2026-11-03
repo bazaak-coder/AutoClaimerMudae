@@ -446,3 +446,127 @@ async def test_failed_startup_leaves_no_workers_and_retry_runs_once(
     finally:
         await manager.stop()
         await real_store.close()
+
+
+# BUG-037: stop() must not return while cancelled workers are still unwinding
+
+
+async def test_cancelled_stop_awaits_worker_unwind_before_returning(
+    tmp_path: Path,
+) -> None:
+    """BUG-037: the cleanup path cancels straggler workers but must also
+    AWAIT them before closing adapters and resetting lifecycle state —
+    otherwise stop() returns while a worker is still unwinding, and an
+    immediate restart runs recover_interrupted() against a still-live
+    worker's claimed row (duplicate-execution race).
+
+    The window is a cancellation during the audit DRAIN (pre-worker-gather):
+    the gather's own cancellation semantics already await unwinding, but
+    workers cancelled in the finally were never joined. The handler's
+    finally-block models realistic unwind work (0.3s) so the race is
+    deterministic."""
+    from contextlib import suppress
+    from typing import Any, cast
+
+    calls: list[int] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        calls.append(context.account_id)
+        entered.set()
+        try:
+            if len(calls) == 1:
+                await release.wait()  # first execution blocks until cancelled
+        finally:
+            await asyncio.sleep(0.3)  # unwind work that survives cancellation
+
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+
+    class _SlowAudit:
+        """One pending slow emission keeps stop() inside its audit drain."""
+
+        def __init__(self) -> None:
+            self.called = asyncio.Event()
+
+        async def emit(self, **event: Any) -> None:
+            self.called.set()
+            await asyncio.sleep(0.5)
+
+    try:
+        await manager.start()
+        await asyncio.wait_for(entered.wait(), timeout=3.0)  # worker mid-handler
+
+        slow_audit = _SlowAudit()
+        manager._audit = cast(  # noqa: SLF001 — the drain window under test
+            Any, slow_audit
+        )
+        manager.pause_all()  # pending slow emission -> stop() parks in the drain
+        await asyncio.wait_for(slow_audit.called.wait(), timeout=2.0)
+
+        stop_task = asyncio.create_task(manager.stop(timeout=30.0))
+        await asyncio.sleep(0.1)  # stop() is inside the audit drain
+        stop_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stop_task  # stop() has now returned
+
+        # BUG-037: every worker task is DONE by the time stop() returns.
+        live = [
+            w
+            for w in manager._workers.values()  # noqa: SLF001 — the contract
+            if w.task is not None and not w.task.done()
+        ]
+        assert not live, f"stop() returned with {len(live)} worker(s) still unwinding"
+
+        # Restart: the cancelled attempt's row is recovered and executed
+        # exactly once more — no duplicate execution. (resume_all: the
+        # drain setup globally paused the runtime; a restart does not
+        # clear runtime pause state by design.)
+        await manager.start()
+        manager.resume_all()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while (
+            await store.get_instance_by_ids(ACCOUNT, "job")
+        ).status is not TaskInstanceState.SUCCEEDED:
+            if asyncio.get_running_loop().time() > deadline:
+                pytest.fail("recovered instance never succeeded")
+            await asyncio.sleep(0.01)
+        assert len(calls) == 2, calls  # one cancelled attempt + exactly one rerun
+        record = await store.get_instance_by_ids(ACCOUNT, "job")
+        assert record.attempt_count == 2
+    finally:
+        await manager.stop()
+        await store.close()
