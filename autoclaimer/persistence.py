@@ -778,8 +778,8 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="task_instances",
-                            key=f"id={row[0]} account={row[1]} task={_clip(row[2])}",
-                            problem=str(exc),
+                            key=f"id={_clip(row[0])} account={_clip(row[1])} task={_clip(row[2])}",
+                            problem=_clip(str(exc), 200),
                             hint="Quarantine the row (sqlite3 CLI) or restore the "
                             "backup; runtime queries already skip it.",
                         )
@@ -824,7 +824,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="mudae_state",
-                            key=f"account={row[0]} kind={_clip(row[1])}",
+                            key=f"account={_clip(row[0])} kind={_clip(row[1])}",
                             problem=(
                                 f"unsupported kind {_clip(row[1])} "
                                 f"(expected one of: {', '.join(k.value for k in MudaeStateKind)})"
@@ -840,7 +840,7 @@ class TaskStateStore:
                         IntegrityFinding(
                             severity="error",
                             table="mudae_state",
-                            key=f"account={row[0]} kind={_clip(row[1])}",
+                            key=f"account={_clip(row[0])} kind={_clip(row[1])}",
                             problem=f"malformed deadline {_clip(row[2])}",
                             hint="Delete the row with the sqlite3 CLI; the task "
                             "re-learns the window on its next round.",
@@ -858,7 +858,7 @@ class TaskStateStore:
                             IntegrityFinding(
                                 severity="warning",
                                 table="task_instances/account_credentials/mudae_state",
-                                key=f"account={row[0]}",
+                                key=f"account={_clip(row[0])}",
                                 problem="account is not present in accounts.json",
                                 hint="Leftovers from a removed account. Rows are "
                                 "harmless; remove them explicitly (sqlite3 CLI / "

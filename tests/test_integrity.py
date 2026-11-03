@@ -486,3 +486,42 @@ async def test_empty_string_timestamp_is_a_finding_not_due_now(tmp_path: Path) -
         )
     finally:
         await store.close()
+
+
+async def test_oversized_ids_and_account_values_are_clipped(tmp_path: Path) -> None:
+    """BUG-019 completion: oversized TEXT values in id/account columns
+    (SQLite stores them despite INTEGER affinity) produce BOUNDED
+    finding keys — 100 KB junk never floods the diagnostic output."""
+    store = await opened(tmp_path)
+    try:
+        big = "A" * 100_000
+        conn = raw(tmp_path / "state.db")
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        with conn:
+            # task_instances: oversized account_id + already-clipped task_id
+            conn.execute(
+                "INSERT INTO task_instances "
+                "(account_id, task_id, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'pending', 0, 'garbage', 'garbage')",
+                (big, "t"),
+            )
+            # mudae_state: oversized account_id with a valid kind + deadline
+            conn.execute(
+                "INSERT INTO mudae_state (account_id, kind, deadline, updated_at) "
+                "VALUES (?, 'claim', 'garbage-ts', 'garbage')",
+                (big,),
+            )
+        conn.close()
+        findings = await store.integrity_report(known_account_ids={ACCOUNT})
+        assert findings, "expected findings for the corrupt rows"
+        for finding in findings:
+            combined = f"{finding.key} {finding.problem}"
+            assert len(combined) < 500, (
+                f"unclipped output ({len(combined)} chars) in {finding.table}: "
+                f"{combined[:100]}..."
+            )
+        # The oversized account_id appears (clipped) — the findings are
+        # still actionable, just bounded.
+        assert any("A" in f.key for f in findings if "account=" in f.key)
+    finally:
+        await store.close()
