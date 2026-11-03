@@ -269,6 +269,10 @@ class WorkerManager:
         self._credentials = credentials
         self._idle_interval = idle_interval_seconds
         self._wall = wall
+        # LOW-033: strong references for fire-and-forget audit emissions
+        # (the event loop holds only weak task references — an
+        # unreferenced emission can be garbage-collected mid-flight).
+        self._audit_tasks: set[asyncio.Task[None]] = set()
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
         self._paused: set[int] = set()
         self._fatal_accounts: set[int] = set()
@@ -471,6 +475,12 @@ class WorkerManager:
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
         self._shutdown.set()
+        # LOW-033: bounded drain of outstanding audit emissions so control
+        # events fired just before shutdown still land. Before the
+        # worker drain (a cancellation here propagates after the finally
+        # completes the teardown, preserving stop()'s contract).
+        if self._audit_tasks:
+            await asyncio.wait(set(self._audit_tasks), timeout=min(1.0, effective_timeout))
         try:
             for worker in self._workers.values():
                 worker.nudge()
@@ -1236,11 +1246,18 @@ class WorkerManager:
     def _audit_emit(self, **event: Any) -> None:
         """Fire-and-forget audit emission from sync control-plane methods
         (roadmap item 11): best-effort, never raises, no-op without a
-        running loop (sync unit-test callers)."""
+        running loop (sync unit-test callers).
+
+        LOW-033: the pending emission is strongly referenced (see
+        ``_audit_tasks``) so the collector can never drop it mid-flight;
+        ``stop()`` gives outstanding emissions a bounded chance to land.
+        """
         try:
-            asyncio.ensure_future(self._audit.emit(**event))
+            task: asyncio.Task[None] = asyncio.ensure_future(self._audit.emit(**event))
         except RuntimeError:
-            pass  # no running loop: skip (the operation itself succeeded)
+            return  # no running loop: skip (the operation itself succeeded)
+        self._audit_tasks.add(task)
+        task.add_done_callback(self._audit_tasks.discard)
 
     def wake(self, account_id: int) -> None:
         worker = self._workers.get(account_id)

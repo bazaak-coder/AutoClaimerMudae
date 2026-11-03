@@ -275,3 +275,36 @@ async def test_cli_audit_command(tmp_path: Path) -> None:
         assert f"account={ACCOUNT}" in joined
     finally:
         await controller.shutdown()
+
+
+# --- LOW-033: control-plane audit emissions must be strongly referenced
+# (no GC mid-flight) and drained on stop ---
+
+
+async def test_controlplane_audit_tasks_are_referenced_and_drained(
+    tmp_path: Path,
+) -> None:
+    """LOW-033: ``_audit_emit`` is fire-and-forget — the event loop only
+    keeps WEAK references to tasks, so an unreferenced emission can be
+    garbage-collected mid-flight (lost event). The manager must hold a
+    strong reference while the emission is pending and give outstanding
+    emissions a bounded chance to land during stop()."""
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store, _registry = _build(tmp_path, handler=handler)
+    await store.open()
+    try:
+        await manager.start()
+        manager.pause_all()  # sync control-plane emission (fire-and-forget)
+        assert manager._audit_tasks, (  # noqa: SLF001 — the contract under test
+            "pending audit emission is not strongly referenced (GC can drop it)"
+        )
+        await manager.stop()
+        await asyncio.sleep(0)  # settle
+        assert not manager._audit_tasks  # drained, references released
+        rows = await store.audit_events(limit=10)
+        assert any(r[1] == "runtime" and r[2] == "paused" for r in rows), rows
+    finally:
+        await store.close()
