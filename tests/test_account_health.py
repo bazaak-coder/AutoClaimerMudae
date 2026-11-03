@@ -371,3 +371,36 @@ async def test_rate_limited_health_fires_through_execution_adapter(tmp_path: Pat
         assert snap.state is AccountHealthState.RATE_LIMITED
     finally:
         await store.close()
+
+
+# --- BUG-036: the DISABLED latch must survive in-flight completions ---
+
+
+async def test_disabled_latch_survives_inflight_completions() -> None:
+    """BUG-036: an account disabled while a task was mid-flight reports
+    DISABLED — the late success/failure/rate-limited landing afterward
+    must not flip it to HEALTHY/DISCONNECTED/RATE_LIMITED (the scheduler
+    stays disabled; the report must not diverge). Only the explicit
+    revive path clears the latch."""
+    monitor = AccountHealthMonitor()
+    monitor.worker_started(ACCOUNT)
+    monitor.record_disabled(ACCOUNT)
+
+    monitor.record_success(ACCOUNT)  # in-flight success lands after disable
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.DISABLED
+    monitor.record_failure(ACCOUNT, "late failure")  # nonfatal
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.DISABLED
+    monitor.record_rate_limited(ACCOUNT)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.DISABLED
+    # counters still track reality (observation, not enforcement)
+    snap = monitor.snapshot()[ACCOUNT]
+    assert snap.total_successes == 1 and snap.total_failures == 1
+
+    monitor.record_revived(ACCOUNT)  # explicit re-enable is the only exit
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.CONNECTING
+
+    # An explicit account-fatal signal still latches AUTH_FAILED (more
+    # specific than DISABLED — the credential is dead regardless).
+    monitor.record_disabled(ACCOUNT)
+    monitor.record_failure(ACCOUNT, "token revoked", fatal=True)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.AUTH_FAILED

@@ -130,9 +130,11 @@ class AccountHealthMonitor:
         """A task (or its platform operations) succeeded: healthy; any
         failure streak is broken. An ``AUTH_FAILED`` latch is NOT cleared
         here — a fatal account does not execute work anyway, and only the
-        explicit revive path (re-enable) may clear it."""
+        explicit revive path (re-enable) may clear it. BUG-036: the
+        ``DISABLED`` latch equally survives a late in-flight success
+        (the scheduler stays disabled; the report must not diverge)."""
         health = self._health(account_id)
-        if health.state is not AccountHealthState.AUTH_FAILED:
+        if health.state not in (AccountHealthState.AUTH_FAILED, AccountHealthState.DISABLED):
             health.state = AccountHealthState.HEALTHY
         health.last_success_at = self._clock()
         health.consecutive_failures = 0
@@ -153,7 +155,11 @@ class AccountHealthMonitor:
         health.consecutive_failures += 1
         health.last_error = self._redactor(str(error))[:_ERROR_MAX]
         if fatal:
+            # More specific than DISABLED: the credential is dead
+            # regardless of the operator's disable.
             health.state = AccountHealthState.AUTH_FAILED
+        elif health.state is AccountHealthState.DISABLED:
+            pass  # BUG-036: a late in-flight failure keeps the latch
         elif health.consecutive_failures >= DEGRADED_THRESHOLD:
             health.state = AccountHealthState.DEGRADED
         else:
@@ -163,9 +169,10 @@ class AccountHealthMonitor:
     def record_rate_limited(self, account_id: int) -> None:
         """Transport retries were exhausted by server-directed cooldowns:
         the account is rate-limited (deferral itself stays with the
-        limiter). The next success clears it."""
+        limiter). The next success clears it. BUG-036: like success, this
+        never overwrites the ``DISABLED`` latch."""
         health = self._health(account_id)
-        if health.state is not AccountHealthState.AUTH_FAILED:
+        if health.state not in (AccountHealthState.AUTH_FAILED, AccountHealthState.DISABLED):
             health.state = AccountHealthState.RATE_LIMITED
         self._log(account_id, health.state)
 
