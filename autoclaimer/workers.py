@@ -507,6 +507,23 @@ class WorkerManager:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            # BUG-034 (review round): a cancelled stop() can interrupt the
+            # worker drain before it ran. Nudge every worker (a gated
+            # worker — globally paused, disabled, or removed — waits on
+            # its wake event with NO timeout), then cancel any worker
+            # still alive: the interrupted drain's own cancel never
+            # reached them, and a worker re-entering its gated wait after
+            # _shutdown.clear() would park forever. Instances of
+            # cancelled mid-execution workers deliberately stay running
+            # (uncertain outcome; recovered on next start) — the same
+            # semantics as the graceful-budget timeout path above.
+            for worker in self._workers.values():
+                worker.nudge()
+            stragglers = [
+                w.task for w in self._workers.values() if w.task is not None and not w.task.done()
+            ]
+            for task in stragglers:
+                task.cancel()
             # Adapters close in the finally: outer cancellation of stop()
             # must never leak live clients (N1). Adapter close() is
             # idempotent, so a retried stop() is harmless.

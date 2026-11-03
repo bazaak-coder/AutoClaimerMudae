@@ -351,10 +351,20 @@ async def test_stop_cancelled_during_audit_drain_still_tears_down(
         stop_task.cancel()
         with suppress(asyncio.CancelledError):
             await stop_task
+        assert stop_task.cancelled(), "cancellation of stop() must propagate"
 
         # The finally completed despite the cancellation...
         assert not manager._adapters, "adapters were not closed (teardown skipped)"
         assert manager._stopped is False, "manager left half-stopped (_stopped stuck)"
         assert manager._started is False, "manager left half-stopped (_started stuck)"
+        # ...and workers drained out on the shutdown flag (their loop
+        # exits at the next iteration boundary after the drain cancel —
+        # an in-flight execution first finishes its own audit emission,
+        # hence the >0.5s budget).
+        await asyncio.sleep(1.0)
+        assert all(
+            w.task is None or w.task.done()
+            for w in manager._workers.values()  # noqa: SLF001 — contract under test
+        ), "workers not cleaned up after cancelled stop"
     finally:
         await store.close()
