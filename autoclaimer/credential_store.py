@@ -694,11 +694,17 @@ class SQLiteCredentialStore:
         def _phase1() -> list[tuple[int, bytes]]:
             try:
                 text = Path(path).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
+            except UnicodeDecodeError as exc:
                 # BUG-028: invalid UTF-8 in the bundle file is a typed
-                # error, never a raw UnicodeDecodeError escape.
+                # error — type name only (no raw bytes in the message).
                 raise CredentialProviderError(
                     f"credential bundle is unreadable: {type(exc).__name__}"
+                ) from exc
+            except OSError as exc:
+                # OSError detail (path, errno) is safe and actionable —
+                # the bundle path is operator-supplied CLI input.
+                raise CredentialProviderError(
+                    f"credential bundle is unreadable: {exc}"
                 ) from exc
             try:
                 payload = _json.loads(text)

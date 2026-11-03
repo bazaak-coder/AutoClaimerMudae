@@ -1460,7 +1460,7 @@ async def test_import_invalid_account_id_metadata_is_typed(
                 }
             )
         )
-        with pytest.raises(_CPE) as excinfo:
+        with pytest.raises(_CPE, match="record 0") as excinfo:
             await target.import_ciphertext(bundle)
         message = str(excinfo.value)
         assert len(message) < 200, f"unbounded error ({len(message)} chars)"
