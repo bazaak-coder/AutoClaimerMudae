@@ -876,11 +876,18 @@ class TaskStateStore:
     async def backup_to(self, path: str | Path) -> int:
         """Consistent database backup via ``VACUUM INTO`` (roadmap 14).
 
-        Runs on the guarded connection, so it serializes with active
-        store operations (a conflicting write either completes first or
-        waits within the busy timeout — never a torn backup). The result
-        is a compacted, self-contained copy. Returns the backup size in
-        bytes. Preferred while idle; safe to run live.
+        BUG-039: runs through :meth:`_run` — the store's ASYNC lock (the
+        same transaction-level serialization every other operation uses),
+        not just the per-call connection guard. A ``transaction()``
+        block releases the guard between its individual statements while
+        the connection still holds an open transaction, and SQLite
+        rejects ``VACUUM INTO`` there ("cannot VACUUM from within a
+        transaction") — the advertised live-backup guarantee was
+        therefore unreliable. Under the lock, a concurrent transaction
+        COMMITS first and the backup sees a consistent database (never
+        torn); calling from inside one's own transaction fails loudly,
+        which is the caller's contradiction. The result is a compacted,
+        self-contained copy. Returns the backup size in bytes.
         """
         target = Path(path)
         if target.exists():
@@ -999,7 +1006,23 @@ class TaskStateStore:
                     f"Cannot abandon task instance {instance_id} from state "
                     f"'{current.status.value}'."
                 )
-        return await self.get_instance(instance_id)
+            return current  # idempotent: already failed; history already has it
+        record = await self.get_instance(instance_id)
+        # BUG-038: pre-claim terminal failures (invalid config, removed
+        # assignment, unregistered type) are part of the execution trail —
+        # same auxiliary-history contract as record_success /
+        # record_failure / requeue_instance: a history-write failure is
+        # logged and swallowed inside _append_history and never undoes
+        # the authoritative terminal transition above.
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            "abandoned",
+            message,
+        )
+        return record
 
     async def integrity_report(
         self, known_account_ids: set[int] | None = None

@@ -751,3 +751,54 @@ async def test_idempotent_rerecord_does_not_duplicate_history(
     await store.record_success(record.id, outcome)  # idempotent path
     rows = await store.task_history(record.id)
     assert len(rows) == 1, f"history duplicated for one attempt: {rows}"
+
+
+# --- BUG-038: pre-claim terminal failures are part of the history trail ---
+
+
+async def test_record_abandoned_appends_history(store: TaskStateStore) -> None:
+    """BUG-038: record_abandoned is the terminal path for pre-execution
+    failures (invalid config, removed assignment, unregistered type) —
+    it must appear in task_history like every other terminal outcome."""
+    record = await seed(store)
+    abandoned = await store.record_abandoned(record.id, "task not assigned to this account")
+    assert abandoned.status is TaskInstanceState.FAILED
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, f"pre-claim failure missing from history: {rows}"
+    attempt, status, message, _recorded_at = rows[0]
+    assert attempt == record.attempt_count
+    assert status == "abandoned"
+    assert "not assigned" in message
+
+
+async def test_record_abandoned_is_idempotent_without_duplicate_history(
+    store: TaskStateStore,
+) -> None:
+    """BUG-038 companion (LOW-034 contract): re-abandoning an already
+    failed instance is a no-op — no second history row."""
+    record = await seed(store)
+    await store.record_abandoned(record.id, "invalid task config")
+    again = await store.record_abandoned(record.id, "invalid task config")
+    assert again.status is TaskInstanceState.FAILED
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, rows
+
+
+async def test_record_abandoned_survives_history_write_failure(tmp_path: Path) -> None:
+    """BUG-038 auxiliary contract: a history-write failure must never
+    break or undo the authoritative terminal transition (the history
+    table is dropped to force the failure)."""
+    s = await make_store()
+    try:
+        record = await seed(s)
+        await s._run(  # noqa: SLF001 — forcing the auxiliary write to fail
+            s._update_sync, "DROP TABLE task_history", ()
+        )
+        abandoned = await s.record_abandoned(record.id, "invalid task config")
+        assert abandoned.status is TaskInstanceState.FAILED
+        row = await s.get_instance(record.id)
+        assert row.status is TaskInstanceState.FAILED
+        assert row.last_outcome is not None
+        assert "invalid task config" in row.last_outcome.message
+    finally:
+        await s.close()

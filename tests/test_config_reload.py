@@ -526,3 +526,42 @@ async def test_execute_on_parked_account_leaves_row_untouched(tmp_path: Path) ->
         assert not executions[1:]  # no execution while parked
     finally:
         await controller.shutdown()
+
+
+# --- BUG-038: a pre-claim retirement must land in history end to end ---
+
+
+async def test_removed_task_assignment_lands_in_history(tmp_path: Path) -> None:
+    """BUG-038 (integration): removing a task from an account's
+    assignment retires its due row through _terminal_without_claim →
+    record_abandoned — the failure must be visible in task_history, not
+    only in the instance listing."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        record = await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        assert executions, "setup: at least one execution before the reload"
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(tmp_path / "accounts.json", _accounts_doc(tasks=()))
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            record = await store.get_instance_by_ids(ACCOUNT, "probe")
+            if record.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail(f"retired row never failed: {record.status.value}")
+        rows = await store.task_history(record.id)
+        assert any(
+            status == "abandoned" and "not assigned" in message
+            for _attempt, status, message, _ts in rows
+        ), f"pre-claim retirement missing from history: {rows}"
+    finally:
+        await controller.shutdown()
