@@ -1155,7 +1155,8 @@ def _row_to_record(row: sqlite3.Row) -> TaskInstanceRecord:
         # skipped containment entirely): a typed error carrying the row
         # id so callers can quarantine instead of crashing raw.
         raise PersistenceError(
-            f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: {exc}"
+            f"corrupt task_instances row id={row['id']}: {type(exc).__name__}: "
+            f"{_clip(str(exc), 120)}"
         ) from exc
 
 

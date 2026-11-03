@@ -244,7 +244,14 @@ class SQLiteCredentialStore:
                         extra={"operation": "credential.close", "outcome": "deferred_error"},
                     )
 
-        threading.Thread(target=_deferred_close, daemon=True).start()
+        try:
+            threading.Thread(target=_deferred_close, daemon=True).start()
+        except RuntimeError:  # pragma: no cover — interpreter finalization
+            logger.warning(
+                "could not start deferred credential close (interpreter "
+                "shutting down); the connection closes at process exit",
+                extra={"operation": "credential.close", "outcome": "watcher_failed"},
+            )
 
     def _guarded(self, fn: Any, *args: Any) -> Any:
         with self._guard:

@@ -952,19 +952,18 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
         holder.join(timeout=5.0)
         assert completed.is_set(), "in-flight write was discarded"
 
-        # Eventual cleanup: the deferred watcher closed the connection
-        # after the guard was released.
+        # Eventual cleanup: the deferred watcher closed the CAPTURED
+        # connection after the guard was released — poll it directly
+        # (discriminating: deleting _deferred_close would leave it open).
         deadline = time.monotonic() + 5.0
+        closed_now = False
         while time.monotonic() < deadline:
             try:
-                probe = sqlite3.connect(tmp_path / "state.db")
-                probe.execute("SELECT 1").fetchone()
-                probe.close()
-                break
-            except sqlite3.Error:
+                captured.execute("SELECT 1")
                 await asyncio.sleep(0.05)
-        # The store's own connection is closed now.
-        with pytest.raises(autoclaimer.credentials.CredentialProviderError):
-            store.get_token(ACCOUNT)
+            except sqlite3.ProgrammingError:
+                closed_now = True
+                break
+        assert closed_now, "deferred watcher did not close the connection"
     finally:
         autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = original_timeout
