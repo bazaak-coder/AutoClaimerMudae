@@ -379,3 +379,110 @@ async def test_restart_with_disabled_task_does_not_execute(tmp_path: Path) -> No
     finally:
         if not controller.manager._stopped:  # noqa: SLF001 — stop() is restartable
             await controller.shutdown()
+
+
+# --- BUG-030: reload must apply account `enabled` changes (runtime
+# overrides preserved and reported) -----------------------------------------
+
+
+async def test_reload_account_disable_stops_execution(tmp_path: Path) -> None:
+    """BUG-030: `enabled: false` for a running account must apply on
+    reload — the runtime overlay previously won forever and the reload
+    reported success while the account kept executing."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        assert executions, "setup: at least one execution before the reload"
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(
+            tmp_path / "accounts.json",
+            {
+                "version": 1,
+                "accounts": [{"id": ACCOUNT, "enabled": False, "tasks": ["probe"]}],
+            },
+        )
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+
+        assert controller.manager.account_enabled(ACCOUNT) is False
+        await asyncio.sleep(1.2)  # several due windows pass
+        record = await store.get_instance_by_ids(ACCOUNT, "probe")
+        assert len(executions) == 1, (
+            f"disabled account executed {len(executions) - 1} more time(s); "
+            f"row={record.status.value}"
+        )
+        assert record.status is TaskInstanceState.WAITING  # parked, not retired
+    finally:
+        await controller.shutdown()
+
+
+async def test_reload_keeps_and_reports_runtime_enabled_override(tmp_path: Path) -> None:
+    """BUG-030 companion: an EXPLICIT runtime control (enable/disable
+    command, account-fatal stop) outranks the reloaded config — and the
+    reload output must say so instead of silently shadowing it."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        controller.manager.set_account_enabled(ACCOUNT, True)  # explicit runtime control
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(
+            tmp_path / "accounts.json",
+            {
+                "version": 1,
+                "accounts": [{"id": ACCOUNT, "enabled": False, "tasks": ["probe"]}],
+            },
+        )
+        lines = await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+
+        assert controller.manager.account_enabled(ACCOUNT) is True  # runtime wins
+        assert any("271485504361996288" in line and "runtime" in line for line in lines), (
+            f"override not reported: {lines}"
+        )
+    finally:
+        await controller.shutdown()
+
+
+# --- BUG-032: an account REMOVED by reload parks its worker, rows kept ---
+
+
+async def test_reload_removed_account_parks_worker_and_keeps_rows(tmp_path: Path) -> None:
+    """BUG-032: removing an account from accounts.json must park its
+    worker (no further execution) WITHOUT retiring its rows — the
+    previous behavior terminally failed every still-due row through the
+    leftover worker ("task not assigned"), an irreversible change for a
+    possibly temporary removal."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        assert executions, "setup: at least one execution before the reload"
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(tmp_path / "accounts.json", {"version": 1, "accounts": []})
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+
+        assert controller.manager.account_enabled(ACCOUNT) is False
+        await asyncio.sleep(1.2)  # the waiting row is due throughout
+        record = await store.get_instance_by_ids(ACCOUNT, "probe")
+        assert len(executions) == 1, f"removed account executed {len(executions) - 1} more time(s)"
+        assert record.status is TaskInstanceState.WAITING, (
+            f"removed account's row was retired: {record.status.value} "
+            f"({record.last_outcome.message if record.last_outcome else ''})"
+        )
+    finally:
+        await controller.shutdown()

@@ -282,7 +282,9 @@ class AutoClaimerController:
         self._manager.update_configuration(new_app, new_accounts)
         self._app_config = new_app
         self._accounts = new_accounts
-        await self._manager.reload_materialize()
+        # BUG-030: reload_materialize applies account enabled changes and
+        # returns notes for any runtime override that shadowed the config.
+        lines.extend(await self._manager.reload_materialize())
         await self._audit.emit(
             category="configuration",
             action="changed",

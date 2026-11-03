@@ -261,6 +261,11 @@ class WorkerManager:
         # Structured audit events (roadmap item 11): auxiliary — emit
         # failures never break the audited operation.
         self._audit = AuditLog(store)
+        # BUG-030: accounts whose enabled flag was changed at runtime
+        # (enable/disable command, account-fatal stop). Runtime control
+        # outranks a later reload; the reload reports the shadowing
+        # instead of silently applying (or ignoring) the config value.
+        self._runtime_enabled_overrides: set[int] = set()
         self._credentials = credentials
         self._idle_interval = idle_interval_seconds
         self._wall = wall
@@ -402,19 +407,51 @@ class WorkerManager:
         self._app_config = app
         self._accounts = accounts
 
-    async def reload_materialize(self) -> None:
+    async def reload_materialize(self) -> list[str]:
         """Post-swap materialization: create instances for newly assigned
         tasks, spawn workers for newly added accounts, nudge everyone so
-        changes take effect promptly."""
+        changes take effect promptly.
+
+        BUG-030: the reloaded ``enabled`` flag is AUTHORITATIVE for every
+        account the operator did not control at runtime — previously the
+        startup-time overlay won forever and the reload silently ignored
+        configuration changes. Accounts with a runtime override (explicit
+        enable/disable, account-fatal stop) keep their runtime value;
+        each shadowing is returned as an operator-facing note.
+
+        Returns notes (runtime overrides that shadowed the config).
+        """
+        notes: list[str] = []
+        for profile in self._accounts.accounts:
+            if profile.id in self._runtime_enabled_overrides:
+                runtime = self._enabled.get(profile.id, profile.enabled)
+                if runtime != profile.enabled:
+                    notes.append(
+                        f"account {profile.id}: runtime enabled={runtime} kept "
+                        f"(config enabled={profile.enabled} shadowed — "
+                        "use enable/disable to change it)"
+                    )
+                continue  # runtime control outranks the reload
+            self._enabled[profile.id] = profile.enabled
+        # BUG-032: an account REMOVED from the configuration parks its
+        # worker (the iteration gate stops all execution) WITHOUT
+        # retiring its rows — removal may be temporary and terminal
+        # retirement is irreversible. The parked worker is dormant (it
+        # waits on its wake event, not a poll loop); re-adding the
+        # account in a later reload resumes it.
+        configured_ids = {profile.id for profile in self._accounts.accounts}
+        for account_id in list(self._enabled):
+            if account_id not in configured_ids:
+                self._enabled[account_id] = False
         for profile in self._accounts.accounts:
             if self._enabled.get(profile.id, profile.enabled):
-                self._enabled.setdefault(profile.id, profile.enabled)
                 await self._materialize(profile.id)
                 worker = self._workers.get(profile.id)
                 if worker is None or worker.task is None or worker.task.done():
                     self._spawn_worker(profile.id)
         for worker in self._workers.values():
             worker.nudge()
+        return notes
 
     async def stop(self, *, timeout: float | None = None) -> None:
         """Graceful shutdown: drain workers, then close adapters.
@@ -1025,6 +1062,9 @@ class WorkerManager:
             )
             failed = -1
         self._enabled[account_id] = False
+        # BUG-030: a fatal stop is runtime control — a later reload must
+        # not silently resurrect the account (revive-only policy).
+        self._runtime_enabled_overrides.add(account_id)
         self._fatal_accounts.add(account_id)
         adapter = self._adapters.pop(account_id, None)
         if adapter is not None:
@@ -1130,6 +1170,9 @@ class WorkerManager:
         else:
             self._health.record_disabled(account_id)
         self._enabled[account_id] = enabled
+        # BUG-030: explicit runtime control — outranks a later reload
+        # (which reports the shadowing instead of applying the config).
+        self._runtime_enabled_overrides.add(account_id)
         self._audit_emit(
             category="account",
             action="enabled" if enabled else "disabled",
