@@ -8,6 +8,7 @@ require.
 """
 
 import asyncio
+import base64
 import json
 import sqlite3
 import threading
@@ -973,3 +974,221 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
             assert not watcher.is_alive()
     finally:
         autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = original_timeout
+
+
+# PR #8 remediation: BUG-022/023/024/025 + VERIFY-005
+
+
+async def test_import_rejects_empty_token_in_authenticated_record(tmp_path: Path) -> None:
+    """BUG-022: a correctly authenticated v2 record with an empty token
+    is rejected with a typed error and NOTHING is written. set_token()
+    refuses empty tokens; the restore path must not accept what the
+    direct path refuses."""
+    from cryptography.fernet import Fernet
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        key = Fernet(env[PRIMARY_KEY_ENV])
+        inner = json.dumps({"account_id": ACCOUNT, "token": ""})
+        envelope = base64.b64encode(key.encrypt(inner.encode("utf-8"))).decode("ascii")
+        bundle = tmp_path / "empty.json"
+        bundle.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "exported_at": "x",
+                    "accounts": [
+                        {
+                            "account_id": ACCOUNT,
+                            "encrypted_token": envelope,
+                            "key_version": 1,
+                            "created_at": "x",
+                            "updated_at": "x",
+                        }
+                    ],
+                }
+            )
+        )
+        from autoclaimer.credentials import CredentialProviderError as _CPE
+
+        with pytest.raises(_CPE, match="empty"):
+            await target.import_ciphertext(bundle)
+        assert not await target.has_token(ACCOUNT)  # nothing written
+    finally:
+        target.close()
+
+
+async def test_import_valid_token_round_trips_after_empty_rejection(
+    tmp_path: Path,
+) -> None:
+    """BUG-022 negative control: a valid non-empty token still imports."""
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    source = await _open(tmp_path / "source.db", env)
+    try:
+        await source.set_token(ACCOUNT, TOKEN_A)
+        bundle = tmp_path / "b.json"
+        await source.export_ciphertext(bundle)
+    finally:
+        source.close()
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        imported, _ = await target.import_ciphertext(bundle)
+        assert imported == 1
+        assert target.get_token(ACCOUNT) == TOKEN_A
+    finally:
+        target.close()
+
+
+async def test_import_phase1_off_event_loop(tmp_path: Path) -> None:
+    """BUG-023: JSON parsing + Fernet authentication of a large bundle
+    must not stall the event loop — a heartbeat keeps ticking through
+    the whole import (phase 1 AND phase 2)."""
+    from cryptography.fernet import Fernet
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    key = Fernet(env[PRIMARY_KEY_ENV])
+    accounts: list[dict[str, object]] = []
+    for i in range(200):
+        account_id = 900000000000000000 + i
+        inner = json.dumps({"account_id": account_id, "token": f"gho_token_{i}_value"})
+        envelope = base64.b64encode(key.encrypt(inner.encode("utf-8"))).decode("ascii")
+        accounts.append(
+            {
+                "account_id": account_id,
+                "encrypted_token": envelope,
+                "key_version": 1,
+                "created_at": "x",
+                "updated_at": "x",
+            }
+        )
+    bundle = tmp_path / "large.json"
+    bundle.write_text(json.dumps({"version": 2, "exported_at": "x", "accounts": accounts}))
+
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        heartbeats = [0]
+        stop = asyncio.Event()
+
+        async def heartbeat() -> None:
+            while not stop.is_set():
+                heartbeats[0] += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(heartbeat())
+        imported, _ = await target.import_ciphertext(bundle)
+        stop.set()
+        await hb
+        assert imported == 200
+        assert heartbeats[0] > 20, (
+            f"event loop stalled during import (only {heartbeats[0]} heartbeats)"
+        )
+    finally:
+        target.close()
+
+
+async def test_close_does_not_block_event_loop_on_held_guard(tmp_path: Path) -> None:
+    """BUG-024: close() with the guard held by a worker thread must
+    return PROMPTLY (no 6-second synchronous wait) — the heartbeat
+    continues throughout."""
+    import time
+
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    store = await _open(tmp_path / "state.db", env)
+    try:
+        await store.set_token(ACCOUNT, TOKEN_A)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_guard() -> None:
+            with store._guard:  # noqa: SLF001
+                entered.set()
+                assert release.wait(5.0)
+
+        holder = threading.Thread(target=hold_guard, daemon=True)
+        holder.start()
+        assert await asyncio.to_thread(entered.wait, 5.0)
+
+        heartbeats = [0]
+        stop = asyncio.Event()
+
+        async def heartbeat() -> None:
+            while not stop.is_set():
+                heartbeats[0] += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)  # let the heartbeat start ticking
+        before = heartbeats[0]
+        start = time.monotonic()
+        store.close()
+        elapsed = time.monotonic() - start
+        await asyncio.sleep(0.05)  # the loop must be responsive after
+        stop.set()
+        await hb
+        assert elapsed < 0.5, f"close() blocked for {elapsed:.2f}s"
+        assert heartbeats[0] > before, "event loop never resumed after close()"
+        release.set()
+        holder.join(timeout=5.0)
+        # Wait for the deferred watcher to close the connection.
+        captured: sqlite3.Connection | None = store._conn  # noqa: SLF001
+        if captured is not None:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    captured.execute("SELECT 1")
+                    await asyncio.sleep(0.05)
+                except sqlite3.ProgrammingError:
+                    break
+        watcher = store._close_watcher  # noqa: SLF001
+        if watcher is not None:
+            watcher.join(timeout=5.0)
+    finally:
+        release.set()
+        store.close()
+
+
+async def test_partial_import_is_resumable_and_converges(tmp_path: Path) -> None:
+    """VERIFY-005: phase 2 is per-record resumable — a mid-restore
+    failure leaves the committed prefix; retrying converges to the
+    full restore. Documented contract: validation is all-or-nothing;
+    storage failures may leave a committed prefix (idempotent retry)."""
+    env = {PRIMARY_KEY_ENV: generate_fernet_key()}
+    source = await _open(tmp_path / "source.db", env)
+    try:
+        await source.set_token(ACCOUNT, TOKEN_A)
+        await source.set_token(OTHER, TOKEN_B)
+        bundle = tmp_path / "b.json"
+        await source.export_ciphertext(bundle)
+    finally:
+        source.close()
+
+    target = await _open(tmp_path / "target.db", env)
+    try:
+        # Force a failure after the first record commits: the SECOND
+        # upsert raises a simulated database error (no lock needed —
+        # the error is the storage failure, whatever its cause).
+        original = target._upsert_restored_row  # noqa: SLF001
+        calls = [0]
+
+        def flaky_upsert(account_id: int, blob: bytes) -> bool:
+            calls[0] += 1
+            if calls[0] == 2:
+                raise sqlite3.OperationalError("simulated disk full")
+            return original(account_id, blob)
+
+        target._upsert_restored_row = flaky_upsert  # type: ignore[method-assign]
+        from autoclaimer.persistence import DatabaseBusyError
+
+        with pytest.raises((DatabaseBusyError, Exception)):
+            await target.import_ciphertext(bundle)
+        target._upsert_restored_row = original  # type: ignore[method-assign]
+
+        # Partial state: the first record landed.
+        assert await target.has_token(ACCOUNT)
+        # Retry converges (idempotent: first is skipped, second imports).
+        imported, _ = await target.import_ciphertext(bundle)
+        assert target.get_token(ACCOUNT) == TOKEN_A
+        assert target.get_token(OTHER) == TOKEN_B
+    finally:
+        target.close()

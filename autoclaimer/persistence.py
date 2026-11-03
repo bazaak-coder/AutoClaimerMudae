@@ -752,14 +752,15 @@ class TaskStateStore:
         def _scan_rows(conn: sqlite3.Connection, out: list[IntegrityFinding]) -> None:  # noqa: C901
             # 1. SQLite-level integrity.
             rows = conn.execute("PRAGMA integrity_check").fetchall()
-            problems = [str(r[0]) for r in rows if str(r[0]).lower() != "ok"]
+            problems = [_clip(str(r[0]), 80) for r in rows if str(r[0]).lower() != "ok"]
             if problems:
                 out.append(
                     IntegrityFinding(
                         severity="error",
                         table="database",
                         key="-",
-                        problem="; ".join(problems[:5]),
+                        problem="; ".join(problems[:5])
+                        + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else ""),
                         hint="Restore state.db from a backup (see docs/running.md: "
                         "Database diagnostics and recovery).",
                     )
@@ -884,7 +885,9 @@ class TaskStateStore:
                         severity="error",
                         table="database",
                         key="-",
-                        problem=f"scan could not complete: {type(exc).__name__}: {exc}",
+                        problem=(
+                            f"scan could not complete: {type(exc).__name__}: {_clip(str(exc), 120)}"
+                        ),
                         hint="Restore state.db from a backup (see docs/running.md: "
                         "Database diagnostics and recovery).",
                     )

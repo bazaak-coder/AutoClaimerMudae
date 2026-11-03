@@ -79,8 +79,14 @@ def _validate_account_id(account_id: object) -> int:
     true int in snowflake range — ``bool`` is a subclass of ``int`` and is
     rejected explicitly."""
     if type(account_id) is not int or not 0 < account_id <= _MAX_SNOWFLAKE:
+        # BUG-025: the raw repr of an untrusted bundle value can be
+        # arbitrarily large — report the type and a bounded form only.
+        bounded = repr(account_id)
+        if len(bounded) > 60:
+            bounded = bounded[:60] + "..."
         raise ValueError(
-            f"account id must be a positive Discord snowflake integer, got {account_id!r}"
+            f"account id must be a positive Discord snowflake integer, "
+            f"got {type(account_id).__name__}: {bounded}"
         )
     return account_id
 
@@ -215,9 +221,11 @@ class SQLiteCredentialStore:
         conn, self._conn = self._conn, None
         if conn is None:
             return
-        if self._guard.acquire(timeout=_CLOSE_GUARD_TIMEOUT_SECONDS):
-            # The guard is free (or we got it within the bound): close
-            # synchronously — the common, fast path.
+        # BUG-024: NON-BLOCKING acquisition — a synchronous 6-second wait
+        # on a held guard froze the event loop during shutdown. If the
+        # guard is free we close synchronously (the common fast path);
+        # otherwise we defer IMMEDIATELY (no wait on the loop thread).
+        if self._guard.acquire(blocking=False):
             try:
                 conn.close()
             except sqlite3.Error as exc:
@@ -667,74 +675,87 @@ class SQLiteCredentialStore:
         authoritative restore overwrites it) or waits and lands after —
         the import never discards a committed update mid-transaction.
 
+        RESTORE CONTRACT (VERIFY-005): validation is ALL-OR-NOTHHING —
+        a malformed, wrong-key, tampered, duplicate, or empty-token
+        record rejects the WHOLE bundle with zero rows written. Storage
+        failures in phase 2 are PER-RECORD RESUMABLE: a database error
+        after some rows have committed leaves the committed prefix in
+        place; retrying the same bundle converges to the full restore
+        (idempotent: already-restored rows are skipped). This is the
+        documented and tested behavior, not a bug.
+
         Returns ``(imported, skipped_current)``.
         """
         import base64
         import json as _json
 
-        try:
-            payload = _json.loads(await asyncio.to_thread(Path(path).read_text, encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
-        except RecursionError as exc:
-            # Final-review fix: a hostile deeply-nested bundle raised
-            # RecursionError straight through json.loads — killing the
-            # CLI session and the running framework.
-            raise CredentialProviderError(
-                "credential bundle is unreadable: nesting too deep"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise CredentialProviderError("credential bundle is not an object")
-        version = payload.get("version")
-        if version == 1:
-            raise CredentialProviderError(
-                "bundle format v1 is not supported: its account mapping is "
-                "unauthenticated (pre-merge format). Re-export with the "
-                "current version to produce an authenticated bundle."
-            )
-        if version != self._EXPORT_FORMAT:
-            raise CredentialProviderError(
-                "credential bundle format not recognized (expected version "
-                f"{self._EXPORT_FORMAT}; produced by 'credential export')"
-            )
-        raw_accounts = payload.get("accounts")
-        if not isinstance(raw_accounts, list):
-            raise CredentialProviderError("credential bundle has no 'accounts' list")
-
-        # Phase 1: validate every record WITHOUT writing anything.
-        staged: list[tuple[int, bytes]] = []
-        seen_ids: set[int] = set()
-        for index, record in enumerate(raw_accounts):
-            if not isinstance(record, dict):
-                raise CredentialProviderError(f"bundle record {index} is not an object")
-            account_id = _validate_account_id(record.get("account_id"))
-            if account_id in seen_ids:
-                # BUG-013: duplicates are rejected, not last-write-wins.
-                raise CredentialProviderError(
-                    f"bundle contains duplicate records for account {account_id}"
-                )
-            seen_ids.add(account_id)
-            blob_b64 = record.get("encrypted_token")
-            if not isinstance(blob_b64, str):
-                raise CredentialProviderError(
-                    f"bundle record for account {account_id} has no ciphertext"
-                )
+        # BUG-023: the ENTIRE phase-1 (file read + JSON parse + structural
+        # validation + Fernet authentication + duplicate detection +
+        # staging) runs on a WORKER THREAD — json.loads and per-record
+        # crypto on the event loop stalled it for seconds on large
+        # bundles. Only the validated staged data returns to the caller.
+        def _phase1() -> list[tuple[int, bytes]]:
             try:
-                blob = base64.b64decode(blob_b64, validate=True)
-            except (ValueError, TypeError) as exc:
+                text = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise CredentialProviderError(f"credential bundle is unreadable: {exc}") from exc
+            try:
+                payload = _json.loads(text)
+            except (ValueError, RecursionError) as exc:
+                kind = "nesting too deep" if isinstance(exc, RecursionError) else str(exc)
+                raise CredentialProviderError(f"credential bundle is unreadable: {kind}") from exc
+
+            if not isinstance(payload, dict):
+                raise CredentialProviderError("credential bundle is not an object")
+            version = payload.get("version")
+            if version == 1:
                 raise CredentialProviderError(
-                    f"bundle record for account {account_id} is malformed"
-                ) from exc
-            inner = self._decrypt_bundle_record(account_id, blob)
-            if inner["account_id"] != account_id:
-                # BUG-013: the authenticated account id disagrees with the
-                # JSON metadata — tampered or wrong bundle; reject whole.
-                raise CredentialProviderError(
-                    f"bundle record account mismatch: ciphertext authenticates "
-                    f"account {inner['account_id']}, metadata says {account_id} "
-                    "(tampered bundle?)"
+                    "bundle format v1 is not supported: its account mapping is "
+                    "unauthenticated (pre-merge format). Re-export with the "
+                    "current version to produce an authenticated bundle."
                 )
-            staged.append((account_id, blob))
+            if version != self._EXPORT_FORMAT:
+                raise CredentialProviderError(
+                    "credential bundle format not recognized (expected version "
+                    f"{self._EXPORT_FORMAT}; produced by 'credential export')"
+                )
+            raw_accounts = payload.get("accounts")
+            if not isinstance(raw_accounts, list):
+                raise CredentialProviderError("credential bundle has no 'accounts' list")
+
+            staged_local: list[tuple[int, bytes]] = []
+            seen: set[int] = set()
+            for index, record in enumerate(raw_accounts):
+                if not isinstance(record, dict):
+                    raise CredentialProviderError(f"bundle record {index} is not an object")
+                account_id = _validate_account_id(record.get("account_id"))
+                if account_id in seen:
+                    raise CredentialProviderError(
+                        f"bundle contains duplicate records for account {account_id}"
+                    )
+                seen.add(account_id)
+                blob_b64 = record.get("encrypted_token")
+                if not isinstance(blob_b64, str):
+                    raise CredentialProviderError(
+                        f"bundle record for account {account_id} has no ciphertext"
+                    )
+                try:
+                    blob = base64.b64decode(blob_b64, validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise CredentialProviderError(
+                        f"bundle record for account {account_id} is malformed"
+                    ) from exc
+                inner = self._decrypt_bundle_record(account_id, blob)
+                if inner["account_id"] != account_id:
+                    raise CredentialProviderError(
+                        f"bundle record account mismatch: ciphertext authenticates "
+                        f"account {inner['account_id']}, metadata says {account_id} "
+                        "(tampered bundle?)"
+                    )
+                staged_local.append((account_id, blob))
+            return staged_local
+
+        staged = await asyncio.to_thread(_phase1)
 
         # Phase 2: upsert on worker threads (BUG-012) — never block the loop.
         imported = 0
@@ -778,8 +799,15 @@ class SQLiteCredentialStore:
             not isinstance(inner, dict)
             or type(inner.get("account_id")) is not int
             or not isinstance(inner.get("token"), str)
+            or not inner["token"]
         ):
-            raise CredentialProviderError(f"bundle record for account {account_id} is malformed")
+            # BUG-022: empty tokens are rejected — set_token() refuses
+            # them; the restore path accepts no less. Checked BEFORE
+            # any phase-2 write (whole-bundle reject).
+            raise CredentialProviderError(
+                f"bundle record for account {account_id} is malformed "
+                "(empty tokens are never valid)"
+            )
         return inner
 
     def _upsert_restored_row(self, account_id: int, blob: bytes) -> bool:
