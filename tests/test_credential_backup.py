@@ -17,8 +17,6 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import MultiFernet
 
-import autoclaimer.credential_store
-import autoclaimer.credentials
 from autoclaimer.credential_store import (
     PRIMARY_KEY_ENV,
     CredentialDecryptError,
@@ -940,8 +938,6 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
 
     # Shortened close timeout: close returns promptly WITHOUT closing
     # the connection (bounded shutdown, no race).
-    original_timeout = autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS
-    autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = 0.2
     try:
         start = time.monotonic()
         store.close()
@@ -953,27 +949,18 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
         holder.join(timeout=5.0)
         assert completed.is_set(), "in-flight write was discarded"
 
-        # Eventual cleanup: the deferred watcher closed the CAPTURED
-        # connection after the guard was released — poll it directly
-        # (discriminating: deleting _deferred_close would leave it open).
-        deadline = time.monotonic() + 5.0
-        closed_now = False
-        while time.monotonic() < deadline:
-            try:
-                captured.execute("SELECT 1")
-                await asyncio.sleep(0.05)
-            except sqlite3.ProgrammingError:
-                closed_now = True
-                break
-        assert closed_now, "deferred watcher did not close the connection"
-        # Join the watcher: a daemon thread racing interpreter teardown
-        # segfaulted py3.12 CI — the test must not leave it running.
+        # Join the watcher FIRST (no unguarded execute racing its
+        # conn.close() — that was a C-level SIGSEGV at ~10% flake).
         watcher = store._close_watcher  # noqa: SLF001
         if watcher is not None:
             watcher.join(timeout=5.0)
             assert not watcher.is_alive()
+        # NOW the captured connection is closed — assert it directly.
+        with pytest.raises(sqlite3.ProgrammingError):
+            captured.execute("SELECT 1")
     finally:
-        autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = original_timeout
+        release.set()
+        store.close()
 
 
 # PR #8 remediation: BUG-022/023/024/025 + VERIFY-005
@@ -1049,7 +1036,7 @@ async def test_import_phase1_off_event_loop(tmp_path: Path) -> None:
     env = {PRIMARY_KEY_ENV: generate_fernet_key()}
     key = Fernet(env[PRIMARY_KEY_ENV])
     accounts: list[dict[str, object]] = []
-    for i in range(200):
+    for i in range(2000):
         account_id = 900000000000000000 + i
         inner = json.dumps({"account_id": account_id, "token": f"gho_token_{i}_value"})
         envelope = base64.b64encode(key.encrypt(inner.encode("utf-8"))).decode("ascii")
@@ -1079,8 +1066,8 @@ async def test_import_phase1_off_event_loop(tmp_path: Path) -> None:
         imported, _ = await target.import_ciphertext(bundle)
         stop.set()
         await hb
-        assert imported == 200
-        assert heartbeats[0] > 20, (
+        assert imported == 2000
+        assert heartbeats[0] > 50, (
             f"event loop stalled during import (only {heartbeats[0]} heartbeats)"
         )
     finally:
@@ -1117,6 +1104,7 @@ async def test_close_does_not_block_event_loop_on_held_guard(tmp_path: Path) -> 
                 heartbeats[0] += 1
                 await asyncio.sleep(0.005)
 
+        captured: sqlite3.Connection | None = store._conn  # noqa: SLF001
         hb = asyncio.create_task(heartbeat())
         await asyncio.sleep(0.05)  # let the heartbeat start ticking
         before = heartbeats[0]
@@ -1130,19 +1118,14 @@ async def test_close_does_not_block_event_loop_on_held_guard(tmp_path: Path) -> 
         assert heartbeats[0] > before, "event loop never resumed after close()"
         release.set()
         holder.join(timeout=5.0)
-        # Wait for the deferred watcher to close the connection.
-        captured: sqlite3.Connection | None = store._conn  # noqa: SLF001
-        if captured is not None:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                try:
-                    captured.execute("SELECT 1")
-                    await asyncio.sleep(0.05)
-                except sqlite3.ProgrammingError:
-                    break
+        # Join the watcher, then assert the captured connection is closed.
         watcher = store._close_watcher  # noqa: SLF001
         if watcher is not None:
             watcher.join(timeout=5.0)
+            assert not watcher.is_alive()
+        if captured is not None:
+            with pytest.raises(sqlite3.ProgrammingError):
+                captured.execute("SELECT 1")
     finally:
         release.set()
         store.close()
@@ -1178,16 +1161,19 @@ async def test_partial_import_is_resumable_and_converges(tmp_path: Path) -> None
             return original(account_id, blob)
 
         target._upsert_restored_row = flaky_upsert  # type: ignore[method-assign]
-        from autoclaimer.persistence import DatabaseBusyError
 
-        with pytest.raises((DatabaseBusyError, Exception)):
+        from autoclaimer.persistence import PersistenceError
+
+        with pytest.raises(PersistenceError):
             await target.import_ciphertext(bundle)
         target._upsert_restored_row = original  # type: ignore[method-assign]
 
-        # Partial state: the first record landed.
+        # Partial state: the FIRST record landed; the SECOND did not.
         assert await target.has_token(ACCOUNT)
-        # Retry converges (idempotent: first is skipped, second imports).
-        imported, _ = await target.import_ciphertext(bundle)
+        assert not await target.has_token(OTHER)  # prefix-only
+        # Retry converges: first is skipped (already current), second imports.
+        imported, skipped = await target.import_ciphertext(bundle)
+        assert (imported, skipped) == (1, 1)
         assert target.get_token(ACCOUNT) == TOKEN_A
         assert target.get_token(OTHER) == TOKEN_B
     finally:

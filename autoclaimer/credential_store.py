@@ -57,9 +57,6 @@ RETIRED_KEYS_ENV = "AUTOCLAIMER_FERNET_RETIRED_KEYS"
 
 _MAX_SNOWFLAKE = 2**63 - 1
 
-#: Bounded wait for in-flight guarded work during close() (final review).
-_CLOSE_GUARD_TIMEOUT_SECONDS = 6.0
-
 
 class CredentialKeyError(CredentialProviderError):
     """Encryption key material is missing or invalid (fail closed)."""
@@ -221,9 +218,9 @@ class SQLiteCredentialStore:
         conn, self._conn = self._conn, None
         if conn is None:
             return
-        # BUG-024: NON-BLOCKING acquisition — a synchronous 6-second wait
-        # on a held guard froze the event loop during shutdown. If the
-        # guard is free we close synchronously (the common fast path);
+        # BUG-024: NON-BLOCKING acquisition — a synchronous wait on a
+        # held guard froze the event loop during shutdown. If the guard
+        # is free we close synchronously (the common fast path);
         # otherwise we defer IMMEDIATELY (no wait on the loop thread).
         if self._guard.acquire(blocking=False):
             try:
@@ -675,7 +672,7 @@ class SQLiteCredentialStore:
         authoritative restore overwrites it) or waits and lands after —
         the import never discards a committed update mid-transaction.
 
-        RESTORE CONTRACT (VERIFY-005): validation is ALL-OR-NOTHHING —
+        RESTORE CONTRACT (VERIFY-005): validation is ALL-OR-NOTHING —
         a malformed, wrong-key, tampered, duplicate, or empty-token
         record rejects the WHOLE bundle with zero rows written. Storage
         failures in phase 2 are PER-RECORD RESUMABLE: a database error
