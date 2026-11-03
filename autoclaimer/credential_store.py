@@ -173,6 +173,7 @@ class SQLiteCredentialStore:
         self._clock = clock
         self._conn: sqlite3.Connection | None = None
         self._guard = threading.RLock()
+        self._close_watcher: threading.Thread | None = None
         self._closed = False
 
     # ----- lifecycle -----
@@ -245,7 +246,11 @@ class SQLiteCredentialStore:
                     )
 
         try:
-            threading.Thread(target=_deferred_close, daemon=True).start()
+            # Tracked (not anonymous): callers/tests can join it before
+            # interpreter teardown — an anonymous daemon thread racing
+            # py3.12's shutdown caused a SIGSEGV in CI.
+            self._close_watcher = threading.Thread(target=_deferred_close, daemon=True)
+            self._close_watcher.start()
         except RuntimeError:  # pragma: no cover — interpreter finalization
             logger.warning(
                 "could not start deferred credential close (interpreter "

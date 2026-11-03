@@ -965,5 +965,11 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
                 closed_now = True
                 break
         assert closed_now, "deferred watcher did not close the connection"
+        # Join the watcher: a daemon thread racing interpreter teardown
+        # segfaulted py3.12 CI — the test must not leave it running.
+        watcher = store._close_watcher  # noqa: SLF001
+        if watcher is not None:
+            watcher.join(timeout=5.0)
+            assert not watcher.is_alive()
     finally:
         autoclaimer.credential_store._CLOSE_GUARD_TIMEOUT_SECONDS = original_timeout
