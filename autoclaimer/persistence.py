@@ -966,7 +966,8 @@ class TaskStateStore:
                 server_directed = raw_flag
             except (ValueError, TypeError) as exc:
                 error = PersistenceError(
-                    f"corrupt scope_cooldowns row scope={_clip(scope)}: {type(exc).__name__}: {_clip(str(exc), 120)}"
+                    f"corrupt scope_cooldowns row scope={_clip(scope)}: "
+                    f"{type(exc).__name__}: {_clip(str(exc), 120)}"
                 )
                 logger.error("skipping %s", error)
                 continue

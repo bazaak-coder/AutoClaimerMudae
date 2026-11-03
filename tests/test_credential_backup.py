@@ -913,6 +913,8 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
     completed = threading.Event()
+    captured: sqlite3.Connection | None = store._conn  # noqa: SLF001 — pre-close
+    assert captured is not None
 
     def hold_guard() -> None:
         with store._guard:  # noqa: SLF001 — the condition under test
@@ -922,7 +924,7 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
             # still work (close() already nulled the store's reference —
             # that's bookkeeping, not closure): an in-flight credential
             # write completes (not discarded, not raced).
-            conn.execute(
+            captured.execute(
                 "INSERT INTO account_credentials "
                 "(account_id, encrypted_token, key_version, created_at, updated_at) "
                 "VALUES (?, ?, 1, 'x', 'x') "
@@ -934,8 +936,6 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
     holder = threading.Thread(target=hold_guard, daemon=True)
     holder.start()
     assert await asyncio.to_thread(entered.wait, 5.0)
-    conn = store._conn  # noqa: SLF001 — captured BEFORE close() nulls it
-    assert conn is not None
 
     # Shortened close timeout: close returns promptly WITHOUT closing
     # the connection (bounded shutdown, no race).
