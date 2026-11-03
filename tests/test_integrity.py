@@ -517,8 +517,7 @@ async def test_oversized_ids_and_account_values_are_clipped(tmp_path: Path) -> N
         for finding in findings:
             combined = f"{finding.key} {finding.problem}"
             assert len(combined) < 500, (
-                f"unclipped output ({len(combined)} chars) in {finding.table}: "
-                f"{combined[:100]}..."
+                f"unclipped output ({len(combined)} chars) in {finding.table}: {combined[:100]}..."
             )
         # The oversized account_id appears (clipped) — the findings are
         # still actionable, just bounded.
