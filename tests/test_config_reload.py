@@ -14,13 +14,14 @@ Contract under test (defined before implementation):
 
 import asyncio
 import json
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from autoclaimer.cli import AutoClaimerController, CliSession
-from autoclaimer.config import parse_accounts_config, parse_app_config
+from autoclaimer.config import load_config, parse_accounts_config, parse_app_config
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.persistence import TaskInstanceState, TaskStateStore
 from autoclaimer.ratelimit import RateLimiter
@@ -262,3 +263,119 @@ async def test_inflight_execution_keeps_its_snapshot(tmp_path: Path) -> None:
         assert observed == [CHANNEL_A]  # snapshot, not the reloaded value
     finally:
         await controller.shutdown()
+
+
+# --- BUG-029: `enabled: false` must gate EXECUTION, not just materialization ---
+
+
+def _recurring_controller(
+    tmp_path: Path,
+    executions: list[float],
+) -> tuple[AutoClaimerController, TaskStateStore]:
+    """A controller whose task succeeds and reschedules 0.4s out — the
+    recurring shape that always leaves a live DUE waiting row."""
+    from datetime import datetime, timedelta
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        executions.append(asyncio.get_running_loop().time())
+        return TaskOutcome(
+            TaskStatus.SUCCEEDED,
+            retry_at=datetime.now(UTC) + timedelta(seconds=0.4),
+        )
+
+    app = parse_app_config(_config_doc())
+    accounts = parse_accounts_config(_accounts_doc(), app)
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="probe",
+            description="Recurring probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+            channel_role="roll_claim",
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=store,
+        limiter=RateLimiter(store=store),
+        registry=registry,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    return controller, store
+
+
+async def test_reload_disabled_task_stops_executing(tmp_path: Path) -> None:
+    """BUG-029: disabling a task via reload must stop a recurring task
+    with a live due waiting row — the materialization gate alone let it
+    keep executing (indefinitely: every round reschedules)."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        assert executions, "setup: at least one execution before the reload"
+
+        doc = _config_doc(tasks={"probe": {"enabled": False, "parameters": {}}})
+        _write(tmp_path / "config.json", doc)
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+
+        await asyncio.sleep(1.2)  # several due windows pass while disabled
+        record = await store.get_instance_by_ids(ACCOUNT, "probe")
+        assert len(executions) == 1, (
+            f"disabled task executed {len(executions) - 1} more time(s) after reload; "
+            f"row={record.status.value}"
+        )
+        assert record.status is TaskInstanceState.WAITING  # paused, not retired
+    finally:
+        await controller.shutdown()
+
+
+async def test_restart_with_disabled_task_does_not_execute(tmp_path: Path) -> None:
+    """BUG-029 (restart leg): a full restart with `enabled: false` must
+    not resume a waiting row materialized earlier — the row survives in
+    state.db and was claimed anyway."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        assert executions, "setup: at least one execution before the stop"
+        await controller.stop()
+
+        doc = _config_doc(tasks={"probe": {"enabled": False, "parameters": {}}})
+        _write(tmp_path / "config.json", doc)
+        _write(tmp_path / "accounts.json", _accounts_doc())
+        app, accounts = load_config(str(tmp_path / "config.json"), str(tmp_path / "accounts.json"))
+        registry = controller.manager._registry  # noqa: SLF001 — same registry
+        controller2 = AutoClaimerController(
+            app_config=app,
+            accounts=accounts,
+            store=store,
+            limiter=RateLimiter(store=store),
+            registry=registry,
+            adapter_factory=lambda account_id: MockAdapter(),
+            idle_interval_seconds=0.02,
+        )
+        try:
+            await controller2.start()
+            await asyncio.sleep(1.2)  # the waiting row is due throughout
+            record = await store.get_instance_by_ids(ACCOUNT, "probe")
+            assert len(executions) == 1, (
+                f"disabled task executed {len(executions) - 1} more time(s) "
+                f"after restart; row={record.status.value}"
+            )
+            assert record.status is TaskInstanceState.WAITING
+        finally:
+            await controller2.shutdown()
+    finally:
+        if not controller.manager._stopped:  # noqa: SLF001 — stop() is restartable
+            await controller.shutdown()

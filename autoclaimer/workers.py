@@ -578,7 +578,7 @@ class WorkerManager:
             worker.wake.clear()
             await self._wait_for_wake(worker, await self._soon_delay(worker.account_id))
             return
-        await self._execute(record)
+        await self._execute(worker, record)
 
     async def _wait_for_wake(self, worker: _AccountWorker, timeout: float | None) -> None:
         if self._shutdown.is_set():
@@ -619,7 +619,7 @@ class WorkerManager:
             return self._idle_interval
         return max(0.0, min((soonest - self._wall()).total_seconds(), self._idle_interval))
 
-    async def _execute(self, record: TaskInstanceRecord) -> None:
+    async def _execute(self, worker: _AccountWorker, record: TaskInstanceRecord) -> None:
         account_id = record.account_id
         # Resolve configuration BEFORE claiming: a validation failure must
         # not strand a claimed (running) row forever (audit B1).
@@ -647,6 +647,27 @@ class WorkerManager:
             resolved = resolve_task_config(self._app_config, profile, record.task_id)
         except ConfigValidationError as exc:
             await self._terminal_without_claim(record, f"invalid task config: {exc}")
+            return
+        # BUG-029: `enabled: false` gates EXECUTION, not just
+        # materialization. A due waiting row (recurring reschedule,
+        # recoverable retry, crash recovery) outlives the config change
+        # and would otherwise keep executing — indefinitely for
+        # recurring tasks, whose every success reschedules a new round.
+        # The row is left pending/waiting (pause semantics: re-enabling
+        # resumes it); the loop paces one idle interval because the row
+        # stays due while disabled (no hot spin).
+        if not resolved.enabled:
+            logger.info(
+                "task disabled by configuration; skipping execution",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.execute",
+                    "outcome": "disabled",
+                },
+            )
+            worker.wake.clear()
+            await self._wait_for_wake(worker, self._idle_interval)
             return
         adapter = await self._adapter_for(account_id)
         # External-audit BUG-004 fix: bind the RESOLVED policy (global →
