@@ -319,3 +319,55 @@ async def test_cli_health_command_reports_without_secrets(tmp_path: Path) -> Non
         assert "gho_SecretTokenInError99" not in joined  # redacted
     finally:
         await controller.shutdown()
+
+
+# --- BUG-031: the rate-limited health callback must survive with_policy ---
+
+
+async def test_rate_limited_health_fires_through_execution_adapter(tmp_path: Path) -> None:
+    """BUG-031: handlers only ever receive the policy-bound adapter view
+    (``_execute`` hands out ``adapter.with_policy(...)``), so the
+    ``on_rate_limited`` health callback must be forwarded by
+    ``with_policy`` — a retry-exhausting cooldown storm driven through
+    the EXECUTION adapter must move the account to RATE_LIMITED."""
+    from autoclaimer.ratelimit import EffectivePolicy, RetryLimitExceededError
+
+    class _StormLimiter(RateLimiter):
+        async def run(  # type: ignore[override]
+            self, fn: Any, *, account_id: int, route: str, policy: Any = None
+        ) -> Any:
+            raise RetryLimitExceededError("server-directed cooldown storm")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 3},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "tasks": {},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": []}]}, app
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    manager = WorkerManager(
+        registry=TaskRegistry(),
+        store=store,
+        limiter=_StormLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.01,
+    )
+    await store.open()
+    try:
+        shared = await manager._adapter_for(ACCOUNT)  # noqa: SLF001
+        execution_adapter = shared.with_policy(EffectivePolicy())
+        with pytest.raises(RetryLimitExceededError):
+            await execution_adapter.send_message(111111111111111111, "x")
+        snap = manager.health().get(ACCOUNT)
+        assert snap is not None, "health never observed the account (callback dropped)"
+        assert snap.state is AccountHealthState.RATE_LIMITED
+    finally:
+        await store.close()

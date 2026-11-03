@@ -205,8 +205,19 @@ class RateLimitedAdapter:
         (account, task) — where the task id is known — and hands the
         handler this view. Shares the inner client, limiter, and account
         id; only the policy differs.
+
+        BUG-031: the per-execution view is the ONLY adapter handlers ever
+        see, so it must also carry the health ``on_rate_limited`` hook —
+        dropping it made the RATE_LIMITED state unreachable from real
+        task execution.
         """
-        return RateLimitedAdapter(self._inner, self._limiter, self._account_id, policy=policy)
+        return RateLimitedAdapter(
+            self._inner,
+            self._limiter,
+            self._account_id,
+            policy=policy,
+            on_rate_limited=self._on_rate_limited,
+        )
 
 
 class _AccountWorker:
