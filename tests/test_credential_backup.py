@@ -175,7 +175,7 @@ async def test_restore_reencrypts_under_current_primary(tmp_path: Path) -> None:
     try:
         conn = sqlite3.connect(tmp_path / "target.db")
         with conn:
-            conn.execute("ATTACH DATABASE ? AS t", (str(tmp_path / "target.db"),))
+            captured.execute("ATTACH DATABASE ? AS t", (str(tmp_path / "target.db"),))
             row = conn.execute(
                 "SELECT encrypted_token, key_version FROM t.account_credentials "
                 "WHERE account_id = ?",
@@ -396,7 +396,7 @@ async def test_export_malformed_stored_ciphertext_is_typed(tmp_path: Path) -> No
         await store.set_token(ACCOUNT, TOKEN_A)
         conn = sqlite3.connect(tmp_path / "state.db")
         with conn:
-            conn.execute(
+            captured.execute(
                 "UPDATE account_credentials SET encrypted_token = ? WHERE account_id = ?",
                 ("not-binary", ACCOUNT),
             )
@@ -426,7 +426,7 @@ async def test_import_replaces_malformed_stored_row(tmp_path: Path) -> None:
         await target.set_token(ACCOUNT, TOKEN_B)
         conn = sqlite3.connect(tmp_path / "target.db")
         with conn:
-            conn.execute(
+            captured.execute(
                 "UPDATE account_credentials SET encrypted_token = ? WHERE account_id = ?",
                 ("not-binary", ACCOUNT),
             )
@@ -624,7 +624,7 @@ async def test_export_corrupt_key_version_is_typed(tmp_path: Path) -> None:
         await store.set_token(ACCOUNT, TOKEN_A)
         conn = sqlite3.connect(tmp_path / "state.db")
         with conn:
-            conn.execute(
+            captured.execute(
                 "UPDATE account_credentials SET key_version = ? WHERE account_id = ?",
                 ("one", ACCOUNT),
             )
@@ -922,7 +922,7 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
             # still work (close() already nulled the store's reference —
             # that's bookkeeping, not closure): an in-flight credential
             # write completes (not discarded, not raced).
-            conn.execute(
+            captured.execute(
                 "INSERT INTO account_credentials "
                 "(account_id, encrypted_token, key_version, created_at, updated_at) "
                 "VALUES (?, ?, 1, 'x', 'x') "
@@ -936,6 +936,7 @@ async def test_close_defers_until_guard_released(tmp_path: Path) -> None:
     assert await asyncio.to_thread(entered.wait, 5.0)
     conn = store._conn  # noqa: SLF001 — captured BEFORE close() nulls it
     assert conn is not None
+    captured = conn  # mypy: non-optional view for the closure
 
     # Shortened close timeout: close returns promptly WITHOUT closing
     # the connection (bounded shutdown, no race).
