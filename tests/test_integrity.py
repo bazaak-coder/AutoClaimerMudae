@@ -421,7 +421,7 @@ async def test_scan_contains_injected_unexpected_exceptions(tmp_path: Path) -> N
     try:
         await store.create_instance(ACCOUNT, "probe")
 
-        def exploding(row: object) -> object:
+        def exploding(row: sqlite3.Row) -> "object":
             raise RuntimeError("injected scan-code failure")
 
         original = persistence_module._row_to_record
@@ -429,7 +429,7 @@ async def test_scan_contains_injected_unexpected_exceptions(tmp_path: Path) -> N
         try:
             findings = await store.integrity_report(known_account_ids={ACCOUNT})
         finally:
-            persistence_module._row_to_record = original  # type: ignore[assignment]
+            persistence_module._row_to_record = original
         assert any(
             f.table == "database" and f.severity == "error" and "RuntimeError" in f.problem
             for f in findings
