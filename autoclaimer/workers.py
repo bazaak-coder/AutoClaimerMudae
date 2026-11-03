@@ -475,13 +475,14 @@ class WorkerManager:
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
         self._shutdown.set()
-        # LOW-033: bounded drain of outstanding audit emissions so control
-        # events fired just before shutdown still land. Before the
-        # worker drain (a cancellation here propagates after the finally
-        # completes the teardown, preserving stop()'s contract).
-        if self._audit_tasks:
-            await asyncio.wait(set(self._audit_tasks), timeout=min(1.0, effective_timeout))
         try:
+            # LOW-033 (review F1): bounded drain of outstanding audit
+            # emissions so control events fired just before shutdown still
+            # land. INSIDE the try: a cancellation while it waits runs the
+            # finally below (adapters closed, lifecycle reset) and then
+            # re-raises — stop()'s documented contract (audit B2/B3).
+            if self._audit_tasks:
+                await asyncio.wait(set(self._audit_tasks), timeout=min(1.0, effective_timeout))
             for worker in self._workers.values():
                 worker.nudge()
             tasks = [w.task for w in self._workers.values() if w.task is not None]
@@ -679,6 +680,24 @@ class WorkerManager:
 
     async def _execute(self, worker: _AccountWorker, record: TaskInstanceRecord) -> None:
         account_id = record.account_id
+        # Review F2 (BUG-032 follow-up): re-check the account gate — an
+        # iteration already past _worker_iteration's gate when a reload
+        # removed or disabled the account must PARK (no claim, no
+        # retirement), never terminally fail the row through the missing
+        # profile. Same pacing as the disabled-task gate below.
+        if not self._enabled.get(account_id, False):
+            logger.info(
+                "account disabled/removed by configuration; skipping execution",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.execute",
+                    "outcome": "account_parked",
+                },
+            )
+            worker.wake.clear()
+            await self._wait_for_wake(worker, self._idle_interval)
+            return
         # Resolve configuration BEFORE claiming: a validation failure must
         # not strand a claimed (running) row forever (audit B1).
         profile = self._profile(account_id)

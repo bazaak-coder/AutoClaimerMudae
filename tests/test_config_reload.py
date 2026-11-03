@@ -280,7 +280,7 @@ def _recurring_controller(
         executions.append(asyncio.get_running_loop().time())
         return TaskOutcome(
             TaskStatus.SUCCEEDED,
-            retry_at=datetime.now(UTC) + timedelta(seconds=0.4),
+            retry_at=datetime.now(UTC) + timedelta(seconds=2.0),
         )
 
     app = parse_app_config(_config_doc())
@@ -327,7 +327,7 @@ async def test_reload_disabled_task_stops_executing(tmp_path: Path) -> None:
             str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
         )
 
-        await asyncio.sleep(1.2)  # several due windows pass while disabled
+        await asyncio.sleep(2.6)  # several due windows pass while disabled
         record = await store.get_instance_by_ids(ACCOUNT, "probe")
         assert len(executions) == 1, (
             f"disabled task executed {len(executions) - 1} more time(s) after reload; "
@@ -367,7 +367,7 @@ async def test_restart_with_disabled_task_does_not_execute(tmp_path: Path) -> No
         )
         try:
             await controller2.start()
-            await asyncio.sleep(1.2)  # the waiting row is due throughout
+            await asyncio.sleep(2.6)  # the waiting row is due throughout
             record = await store.get_instance_by_ids(ACCOUNT, "probe")
             assert len(executions) == 1, (
                 f"disabled task executed {len(executions) - 1} more time(s) "
@@ -410,7 +410,7 @@ async def test_reload_account_disable_stops_execution(tmp_path: Path) -> None:
         )
 
         assert controller.manager.account_enabled(ACCOUNT) is False
-        await asyncio.sleep(1.2)  # several due windows pass
+        await asyncio.sleep(2.6)  # several due windows pass
         record = await store.get_instance_by_ids(ACCOUNT, "probe")
         assert len(executions) == 1, (
             f"disabled account executed {len(executions) - 1} more time(s); "
@@ -477,12 +477,52 @@ async def test_reload_removed_account_parks_worker_and_keeps_rows(tmp_path: Path
         )
 
         assert controller.manager.account_enabled(ACCOUNT) is False
-        await asyncio.sleep(1.2)  # the waiting row is due throughout
+        await asyncio.sleep(2.6)  # the waiting row is due throughout
         record = await store.get_instance_by_ids(ACCOUNT, "probe")
         assert len(executions) == 1, f"removed account executed {len(executions) - 1} more time(s)"
         assert record.status is TaskInstanceState.WAITING, (
             f"removed account's row was retired: {record.status.value} "
             f"({record.last_outcome.message if record.last_outcome else ''})"
         )
+    finally:
+        await controller.shutdown()
+
+
+# --- review F2: a parked (removed/disabled) account must never retire rows
+# from an iteration that was already past the enabled gate ---
+
+
+async def test_execute_on_parked_account_leaves_row_untouched(tmp_path: Path) -> None:
+    """Review F2 (BUG-032 follow-up): a worker iteration that passed the
+    enabled gate BEFORE a reload removed/parked the account re-reads the
+    profile inside _execute and would terminally retire the row ("task
+    not assigned") — violating the rows-NOT-retired invariant. _execute
+    must re-check the account gate and park instead."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        # Remove the account (parks its worker) — then simulate the race:
+        # the already-running iteration calls _execute with the due row.
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(tmp_path / "accounts.json", {"version": 1, "accounts": []})
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert controller.manager.account_enabled(ACCOUNT) is False
+
+        worker = controller.manager._workers[ACCOUNT]  # noqa: SLF001
+        parked_record = await store.get_instance_by_ids(ACCOUNT, "probe")
+        await controller.manager._execute(worker, parked_record)  # noqa: SLF001
+
+        after = await store.get_instance_by_ids(ACCOUNT, "probe")
+        assert after.status is TaskInstanceState.WAITING, (
+            f"parked account's row was retired: {after.status.value} "
+            f"({after.last_outcome.message if after.last_outcome else ''})"
+        )
+        assert after.id == parked_record.id
+        assert not executions[1:]  # no execution while parked
     finally:
         await controller.shutdown()

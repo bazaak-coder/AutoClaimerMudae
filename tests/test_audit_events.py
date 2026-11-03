@@ -8,8 +8,9 @@ contains secrets (redaction at the emit boundary).
 
 import asyncio
 import sqlite3
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -306,5 +307,54 @@ async def test_controlplane_audit_tasks_are_referenced_and_drained(
         assert not manager._audit_tasks  # drained, references released
         rows = await store.audit_events(limit=10)
         assert any(r[1] == "runtime" and r[2] == "paused" for r in rows), rows
+    finally:
+        await store.close()
+
+
+# --- review F1: a cancellation during the audit drain must not break
+# stop()'s teardown contract (adapters closed, lifecycle reset) ---
+
+
+async def test_stop_cancelled_during_audit_drain_still_tears_down(
+    tmp_path: Path,
+) -> None:
+    """Review F1 (LOW-033 follow-up): stop() promises that cancelling it
+    completes the teardown and re-raises (audit B2/B3). The audit drain
+    must sit INSIDE the try whose finally closes adapters and resets the
+    lifecycle flags — a cancellation while it waits would otherwise skip
+    the finally entirely and permanently wedge the manager."""
+
+    class _SlowAudit:
+        def __init__(self) -> None:
+            self.called = asyncio.Event()
+
+        async def emit(self, **event: Any) -> None:
+            self.called.set()
+            await asyncio.sleep(0.5)
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store, _registry = _build(tmp_path, handler=handler)
+    await store.open()
+    try:
+        await manager.start()
+        slow = _SlowAudit()
+        manager._audit = cast(Any, slow)  # noqa: SLF001 — the window under test
+        await manager._adapter_for(ACCOUNT)  # noqa: SLF001 — a live adapter to close
+        assert manager._adapters, "setup: adapter registered"
+
+        manager.pause_all()  # fire-and-forget emission now pending (slow)
+        await asyncio.wait_for(slow.called.wait(), timeout=2.0)
+        stop_task = asyncio.create_task(manager.stop(timeout=30.0))
+        await asyncio.sleep(0.1)  # stopped inside the audit drain
+        stop_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stop_task
+
+        # The finally completed despite the cancellation...
+        assert not manager._adapters, "adapters were not closed (teardown skipped)"
+        assert manager._stopped is False, "manager left half-stopped (_stopped stuck)"
+        assert manager._started is False, "manager left half-stopped (_started stuck)"
     finally:
         await store.close()
