@@ -1006,9 +1006,7 @@ class WorkerManager:
             # task → override chain was computed, test-asserted, and
             # then ignored — the ratelimit-layer policy bound was used
             # instead); beyond it the instance fails permanently (audit B8).
-            resolved_limit = resolve_task_config(
-                app, profile, record.task_id
-            ).retry_limit
+            resolved_limit = resolve_task_config(app, profile, record.task_id).retry_limit
             if claimed.attempt_count >= resolved_limit + 1:
                 await self._record(
                     record.id,
