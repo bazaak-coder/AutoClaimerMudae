@@ -1267,20 +1267,23 @@ async def _one_account_manager(
     *,
     settings: dict[str, Any] | None = None,
     task_settings: dict[str, Any] | None = None,
+    task_ids: tuple[str, ...] = ("job",),
+    ratelimit: dict[str, Any] | None = None,
 ) -> tuple[WorkerManager, TaskStateStore]:
     """Standard single-account manager fixture for the shutdown tests."""
-    app = parse_app_config(
-        {
-            "version": 1,
-            "channels": {"roll_claim": 111111111111111111},
-            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2}
-            | (settings or {}),
-            "task_defaults": {"retry_limit": 0} | (task_settings or {}),
-            "tasks": {"job": {"parameters": {}}},
-        }
-    )
+    config: dict[str, Any] = {
+        "version": 1,
+        "channels": {"roll_claim": 111111111111111111},
+        "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2}
+        | (settings or {}),
+        "task_defaults": {"retry_limit": 0} | (task_settings or {}),
+        "tasks": {task_id: {"parameters": {}} for task_id in task_ids},
+    }
+    if ratelimit is not None:
+        config["ratelimit"] = ratelimit
+    app = parse_app_config(config)
     accounts = parse_accounts_config(
-        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": list(task_ids)}]}, app
     )
     registry = TaskRegistry()
     registry.register(
@@ -1396,7 +1399,7 @@ async def test_stop_bounded_with_cancellation_resistant_handler(
             stop_task = asyncio.create_task(manager.stop(timeout=0.3))
             _done, still = await asyncio.wait({stop_task}, timeout=3.0)
             assert not still, "stop() blocked indefinitely on a cancellation-resistant handler"
-            exc = stop_task.exception()  # pragma: no cover - defensive
+            exc = stop_task.exception()
             assert exc is None, f"stop() failed: {exc!r}"
 
         assert any("still running" in r.getMessage() for r in caplog.records), (
@@ -1408,7 +1411,7 @@ async def test_stop_bounded_with_cancellation_resistant_handler(
         )
     finally:
         release.set()  # the resistant handler finishes; the worker unwinds
-        stop_wait, _ = await asyncio.wait({stop_task}, timeout=3.0)
+        await asyncio.wait({stop_task}, timeout=3.0)
         if not stop_task.done():  # pragma: no cover - defensive
             stop_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -1470,4 +1473,165 @@ async def test_uncancellable_timed_out_handler_does_not_wedge_worker(
         release.set()
         await asyncio.sleep(0.05)  # the abandoned child completes
         await manager.stop()
+        await store.close()
+
+
+# Independent-review round: zombie resume, double-cancel bookkeeping,
+# duplicate-execution semantics
+
+
+async def test_abandoned_worker_does_not_resume_after_stop(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review finding (zombie resume): the unconditional _shutdown.clear()
+    let a surviving worker RESUME claiming and executing rows once its
+    resistant handler finally unwound — rebuilding adapters against a
+    stopped manager. The flag must stay set so the zombie exits at its
+    next loop check instead."""
+    release = asyncio.Event()
+    in_handler = asyncio.Event()
+    executed: list[str] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        if context.task_id == "job":
+            in_handler.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+        executed.append(context.task_id)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(tmp_path, handler, task_ids=("job", "job2"))
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            await asyncio.wait_for(in_handler.wait(), timeout=3.0)  # job mid-handler
+
+            stop_task = asyncio.create_task(manager.stop(timeout=0.3))
+            _done, still = await asyncio.wait({stop_task}, timeout=3.0)
+            assert not still, "stop() blocked indefinitely on a resistant handler"
+            assert any("still running" in r.getMessage() for r in caplog.records)
+
+        # The zombie's handler finishes NOW — it must exit at the loop
+        # check, never execute the queued sibling (job2).
+        release.set()
+        worker_task = manager._workers[ACCOUNT].task  # noqa: SLF001
+        assert worker_task is not None
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while asyncio.get_running_loop().time() < deadline and not worker_task.done():
+            await asyncio.sleep(0.02)
+        assert worker_task.done(), "zombie worker never exited after its handler unwound"
+        assert "job2" not in executed, (
+            f"abandoned worker resumed scheduling after stop(): {executed}"
+        )
+    finally:
+        release.set()
+        with suppress(Exception):
+            await manager.stop()
+        task = manager._workers[ACCOUNT].task  # noqa: SLF001 — test cleanup
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        await store.close()
+
+
+async def test_double_cancelled_worker_registers_abandoned_child(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review finding (double cancel): stop()'s finally re-cancels the
+    worker while it waits in _await_child_unwind — the CancelledError
+    raised inside that wait previously skipped the child's registration,
+    strong reference, and report. The bookkeeping must run before the
+    cancellation propagates."""
+    release = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    # task timeout 0.15s abandons the child; stop(timeout=0.15) drains
+    # faster than the child-unwind grace, so the finally's re-cancel
+    # interrupts the worker mid-unwind-wait — the reviewed interleaving.
+    manager, store = await _one_account_manager(
+        tmp_path, handler, settings={"task_timeout_seconds": 0.15}
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            await asyncio.sleep(0.05)  # the worker is inside its handler
+
+            stop_task = asyncio.create_task(manager.stop(timeout=0.15))
+            _done, still = await asyncio.wait({stop_task}, timeout=3.0)
+            assert not still, "stop() blocked indefinitely on a resistant handler"
+
+        assert manager._abandoned_handlers, (  # noqa: SLF001 — the contract under test
+            "the abandoned handler child lost its strong reference and report"
+        )
+        assert any("ignored cancellation" in r.getMessage() for r in caplog.records), (
+            "the abandoned child was never reported"
+        )
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)  # the abandoned child completes
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
+
+
+async def test_ignored_cancellation_timeout_is_permanent_not_retried(
+    tmp_path: Path,
+) -> None:
+    """Review finding (duplicate execution): a RECOVERABLE outcome for a
+    timed-out handler that ignored cancellation scheduled a retry while
+    the abandoned attempt provably still ran — overlapping executions of
+    the same row (up to retry_limit+1). The attempt must fail PERMANENT:
+    exactly one execution, terminal failed, no concurrent retry."""
+    release = asyncio.Event()
+    executions: list[str] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        executions.append(context.task_id)
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(
+        tmp_path,
+        handler,
+        settings={"task_timeout_seconds": 0.15},
+        task_settings={"retry_limit": 3},  # a real budget: a retry WOULD run
+        ratelimit={"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        row = await store.get_instance_by_ids(ACCOUNT, "job")
+        while asyncio.get_running_loop().time() < deadline:
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED, (
+            f"row never reached terminal failed: {row.status.value}"
+        )
+        await asyncio.sleep(0.3)  # any retry would have started by now
+        assert executions == ["job"], f"concurrent duplicate executions of one row: {executions}"
+        assert row.attempt_count == 1, (
+            f"attempt budget consumed by abandoned retries: {row.attempt_count}"
+        )
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)
+        with suppress(Exception):
+            await manager.stop()
         await store.close()

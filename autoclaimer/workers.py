@@ -328,6 +328,11 @@ class WorkerManager:
         self._started = True
 
     async def _start_sequence(self) -> None:
+        # A stop() that abandoned resistant workers left the shutdown
+        # flag SET (zombie-resume guard) — a restart clears it up front;
+        # any zombie still executing exits at its own loop check, and
+        # its claimed row takes the documented at-least-once path.
+        self._shutdown.clear()
         await self._store.recover_interrupted()
         await self._apply_configuration()
         # Adopt still-active persisted cooldowns BEFORE any worker can act:
@@ -511,6 +516,16 @@ class WorkerManager:
         :meth:`start`\\ ed again afterwards (restartable). Cancellation of
         ``stop()`` itself completes the teardown and re-raises, so the
         manager is never left half-stopped (audit B2/B3).
+
+        Budget: ``timeout`` bounds the graceful drain only; the audit
+        wait (≤1s), the audit-cancel grace, and each post-cancel unwind
+        (≤ _CANCEL_GRACE_SECONDS, twice in the worst case) are additional
+        bounded phases — a pathological shutdown can take roughly
+        ``timeout + 4s`` in total. A handler that suppresses
+        CancelledError cannot be force-terminated: its worker is
+        abandoned, REPORTED (``workers_abandoned``), and — so it cannot
+        resume scheduling after its handler finally unwinds — the
+        shutdown flag stays set until the next :meth:`start`.
         """
         if self._stopped:
             # RACE-006: a CONCURRENT stop() is mid-teardown — join it
@@ -630,20 +645,42 @@ class WorkerManager:
             # Workers stay registered (their done tasks report STOPPED via
             # status()); _spawn_worker replaces finished workers on restart.
             # Reset lifecycle so the manager can be started again.
-            self._shutdown.clear()
+            # Liveness is recomputed at report time: a survivor from the
+            # try-block drain may have finished during the finally's
+            # re-cancel (its handler CHILD is then the survivor, reported
+            # below via _abandoned_handlers) — both the flag decision and
+            # the report must stay factually true.
+            still_running = [t for t in abandoned_workers if not t.done()]
+            # Review finding (zombie resume): while a worker survives,
+            # the shutdown flag STAYS SET — otherwise the survivor, once
+            # its handler finally unwinds, finds a false loop condition
+            # and RESUMES claiming and executing rows (rebuilding
+            # adapters!) against a stopped manager. Keeping it set makes
+            # the zombie exit at its next loop check instead;
+            # _start_sequence() clears it on restart.
+            if not still_running:
+                self._shutdown.clear()
             self._stopped = False
             self._started = False
-            if abandoned_workers:
-                # Do not claim a clean teardown while workers are still
-                # running: Python cannot force-terminate them, so the
-                # honest contract is a bounded stop + an explicit report
-                # (status() keeps showing them as RUNNING).
+            # Do not claim a clean teardown while workers are still
+            # running: Python cannot force-terminate them, so the honest
+            # contract is a bounded stop + an explicit report (status()
+            # keeps showing them as RUNNING). Restarting while a zombie
+            # still executes its handler re-runs its claimed row
+            # (documented at-least-once duplicate window).
+            if still_running:
                 logger.warning(
                     "framework stopped with %d worker task(s) still running "
                     "(handler suppressed cancellation); they cannot be "
                     "force-terminated and were abandoned",
-                    len(abandoned_workers),
+                    len(still_running),
                     extra={"operation": "manager.stop", "outcome": "workers_abandoned"},
+                )
+            if self._abandoned_handlers:
+                logger.warning(
+                    "%d abandoned handler(s) are still registered and may still be running",
+                    len(self._abandoned_handlers),
+                    extra={"operation": "manager.stop", "outcome": "handlers_abandoned"},
                 )
             logger.info("framework stopped")
 
@@ -1203,7 +1240,10 @@ class WorkerManager:
           identity — only a still-pending task after the deadline is a
           timeout).
         - A timeout returns FAILED_RECOVERABLE with a distinct message, so
-          the single-owner retry bound and rescheduling apply unchanged.
+          the single-owner retry bound and rescheduling apply unchanged —
+          EXCEPT when the handler ignores cancellation: the attempt fails
+          PERMANENT (a provably-still-running attempt must not be retried
+          concurrently; manual requeue via the CLI once it finishes).
         - Cancellation of THIS coroutine (shutdown) cancels the child too —
           no leaked handler tasks (same bounded unwind).
         """
@@ -1237,7 +1277,18 @@ class WorkerManager:
             )
             message = f"task execution timed out after {timeout}s"
             if not unwound:
-                message += "; handler ignored cancellation and was abandoned"
+                # Review finding (duplicate execution): a recoverable
+                # outcome would schedule a retry while the abandoned
+                # attempt provably still runs — the single-owner claim
+                # invariant (no CONCURRENT executions of one row) must
+                # not be traded for the abandoned wedge. Terminal
+                # failure preserves it; the CLI `retry` path requeues
+                # manually once the stuck attempt has finished.
+                message += (
+                    "; handler ignored cancellation — attempt failed permanent "
+                    "(still running; manual requeue once it finishes)"
+                )
+                return TaskOutcome(TaskStatus.FAILED_PERMANENT, message=message)
             return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message=message)
         return task.result()  # handler exceptions keep their identity
 
@@ -1252,14 +1303,33 @@ class WorkerManager:
         mid-run), reported, and abandoned. A real handler exception that
         escaped during unwinding keeps propagating, exactly as the old
         ``await task`` did.
+
+        Interruption-safe (review finding: double cancel): stop()'s
+        finally re-cancels this WORKER while it waits here — the
+        registration below must still run before the cancellation
+        propagates, or the abandoned child loses its strong reference
+        and its report. The worker's own cancellation always re-raises.
         """
-        await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        try:
+            await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            self._register_abandoned_if_pending(task, context=context)
+            raise
         if task.done():
             if not task.cancelled():
                 task.result()  # retrieve: an escaped exception propagates as before
             return True
+        self._register_abandoned_if_pending(task, context=context)
+        return False
+
+    def _register_abandoned_if_pending(
+        self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
+    ) -> None:
+        """Strongly reference and report a still-pending cancelled child."""
+        if task.done():
+            return
         self._abandoned_handlers.add(task)
-        task.add_done_callback(self._abandoned_handlers.discard)
+        task.add_done_callback(self._abandoned_handler_finished)
         logger.warning(
             "handler ignored cancellation; abandoned (it may still be running)",
             extra={
@@ -1269,7 +1339,12 @@ class WorkerManager:
                 "outcome": "handler_uncancellable",
             },
         )
-        return False
+
+    def _abandoned_handler_finished(self, task: asyncio.Task[TaskOutcome]) -> None:
+        """Drop the strong reference and retrieve any escaped exception."""
+        self._abandoned_handlers.discard(task)
+        if not task.cancelled():
+            task.exception()  # retrieve: never an unretrieved-task warning
 
     async def _handle_account_fatal_after(
         self,
