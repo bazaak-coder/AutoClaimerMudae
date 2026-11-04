@@ -657,3 +657,81 @@ async def test_handler_persistence_error_is_retried_not_dead_lettered(
     finally:
         await manager.stop()
         await store.close()
+
+
+# ERR-003: account-fatal containment must survive an outcome-record failure
+
+
+async def test_fatal_containment_survives_record_failure(tmp_path: Path) -> None:
+    """ERR-003: a PersistenceError from the fatal-branch outcome write
+    escaped the containment — _handle_account_fatal never ran: the
+    account stayed ENABLED (owner policy: never retry, never continue),
+    the adapter stayed open, and the row stranded running."""
+    from autoclaimer.adapters import AccountFatalError
+
+    class _BusyRecordStore:
+        """Real-store delegation; record_failure always fails."""
+
+        def __init__(self, inner: TaskStateStore) -> None:
+            self._inner = inner
+
+        async def record_failure(self, instance_id: int, outcome: Any, **kw: Any) -> Any:
+            raise DatabaseBusyError("injected: outcome write locked")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    async def handler(context: Any) -> TaskOutcome:
+        raise AccountFatalError("token revoked")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    real_store = TaskStateStore(tmp_path / "state.db")
+    await real_store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=_BusyRecordStore(real_store),
+        limiter=RateLimiter(store=real_store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while asyncio.get_running_loop().time() < deadline:
+            if not manager.account_enabled(ACCOUNT):
+                break
+            await asyncio.sleep(0.02)
+        # Containment ran despite the outcome-record failure:
+        assert manager.account_enabled(ACCOUNT) is False, "account stayed enabled"
+        assert ACCOUNT in manager._fatal_accounts  # noqa: SLF001 — the contract
+        assert not manager._adapters, "fatal account's adapter was not closed"  # noqa: SLF001
+        row = await real_store.get_instance_by_ids(ACCOUNT, "job")
+        assert row.status in (
+            TaskInstanceState.RUNNING,
+            TaskInstanceState.FAILED,
+        )  # running = documented restart-recovery bucket
+    finally:
+        await manager.stop()
+        await real_store.close()

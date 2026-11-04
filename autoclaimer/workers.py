@@ -868,15 +868,15 @@ class WorkerManager:
                         "outcome": "account_fatal",
                     },
                 )
-                await self._record(
-                    record.id,
+                await self._handle_account_fatal_after(
+                    record,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
                         message=f"account-fatal: {exc}",
                     ),
-                    retry_at=None,
+                    account_id,
+                    str(exc),
                 )
-                await self._handle_account_fatal(account_id, str(exc))
                 return
             except RetryLimitExceededError as exc:
                 logger.warning(
@@ -1080,6 +1080,37 @@ class WorkerManager:
                 message=f"task execution timed out after {timeout}s",
             )
         return task.result()  # handler exceptions keep their identity
+
+    async def _handle_account_fatal_after(
+        self,
+        record: TaskInstanceRecord,
+        outcome: TaskOutcome,
+        account_id: int,
+        message: str,
+    ) -> None:
+        """Record the fatal outcome, then ALWAYS contain the account.
+
+        ERR-003: the outcome write and the containment were sequential —
+        a PersistenceError from ``_record`` escaped the except-block and
+        ``_handle_account_fatal`` never ran (account stayed enabled,
+        adapter stayed open, row stranded running). Containment is the
+        owner policy (2026-10-28: never retry, never continue) and must
+        be unconditional; a failed outcome write leaves the row in the
+        documented restart-recovery bucket.
+        """
+        try:
+            await self._record(record.id, outcome, retry_at=None)
+        except PersistenceError:
+            logger.exception(
+                "could not record the account-fatal outcome (row recovers at restart)",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.record",
+                    "outcome": "fatal_record_failed",
+                },
+            )
+        await self._handle_account_fatal(account_id, message)
 
     async def _record_recoverable(
         self,
