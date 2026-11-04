@@ -80,6 +80,24 @@ logger = logging.getLogger(__name__)
 _CANCEL_GRACE_SECONDS: Final[float] = 1.0
 
 
+class _Unwind(Enum):
+    """How a cancelled handler child ended (drives timeout classification)."""
+
+    CANCELLED = "cancelled"  # honoured the cancel — a retry is safe
+    COMPLETED = "completed"  # suppressed the cancel and FINISHED — never retry
+    ABANDONED = "abandoned"  # suppressed the cancel, still running — never retry
+
+
+class _EscapedCancelledAttempt(Exception):
+    """PR #14 review (Major): an exception raised by a handler AFTER it
+    suppressed a timeout cancellation. The attempt's cancellation was
+    not respected, so its outcome is uncertain and it must NEVER be
+    retried (duplicate-side-effect risk) — even when the escaped
+    exception is PersistenceError-family transient that would otherwise
+    classify recoverable. The original exception is preserved as
+    ``__cause__``; the worker records the attempt terminally."""
+
+
 def _safe_error_text(error: BaseException | str) -> str:
     """ERR-004: an exception whose ``__str__`` raises (plugin wrapping
     lazily-evaluated state) must not break outcome messages — fall back
@@ -1175,6 +1193,38 @@ class WorkerManager:
                 return
             except asyncio.CancelledError:
                 raise  # uncertain outcome: instance stays running
+            except _EscapedCancelledAttempt as exc:
+                # PR #14 review (Major): this exception escaped a handler
+                # AFTER it suppressed a timeout cancellation — the
+                # attempt's outcome is uncertain (side effects may have
+                # landed), so never retry it, even though the cause may
+                # be a PersistenceError-family transient.
+                cause = exc.__cause__ or exc  # __cause__ None only if raised bare
+                self._health_failure(account_id, cause)
+                logger.error(
+                    "task handler raised after suppressing cancellation; "
+                    "failing attempt permanently",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "suppressed_cancel_escape",
+                    },
+                )
+                await self._record(
+                    record.id,
+                    TaskOutcome(
+                        TaskStatus.FAILED_PERMANENT,
+                        message=(
+                            "task execution timed out; handler suppressed "
+                            f"cancellation and raised {type(cause).__name__} — "
+                            "attempt failed permanent (outcome uncertain; "
+                            "manual requeue once verified)"
+                        ),
+                    ),
+                    retry_at=None,
+                )
+                return
             except PersistenceError as exc:
                 # Audit fix: a persistence fault raised INSIDE a handler
                 # (deadline read/write) is a transient infrastructure
@@ -1329,9 +1379,13 @@ class WorkerManager:
           timeout).
         - A timeout returns FAILED_RECOVERABLE with a distinct message, so
           the single-owner retry bound and rescheduling apply unchanged —
-          EXCEPT when the handler ignores cancellation: the attempt fails
-          PERMANENT (a provably-still-running attempt must not be retried
-          concurrently; manual requeue via the CLI once it finishes).
+          EXCEPT when the handler fails to HONOUR the cancellation:
+          whether it is provably still running or finished inside the
+          grace period after suppressing the cancel (finishing is not
+          proof of respect — only ``task.cancelled()`` is), the attempt
+          fails PERMANENT: retrying an un-respected cancellation risks
+          duplicate side effects (manual requeue via the CLI once
+          verified).
         - Cancellation of THIS coroutine (shutdown) cancels the child too —
           no leaked handler tasks (same bounded unwind).
         """
@@ -1353,7 +1407,18 @@ class WorkerManager:
             raise
         if pending:
             task.cancel()
-            unwound = await self._await_child_unwind(task, context=context)
+            try:
+                unwind = await self._await_child_unwind(task, context=context)
+            except asyncio.CancelledError:
+                raise  # this worker was cancelled: propagate
+            except AccountFatalError:
+                raise  # fatal containment is already never-retry
+            except Exception as exc:
+                # PR #14 review (Major): the escapee keeps its identity
+                # (as __cause__) but is MARKED — a suppressed-cancellation
+                # attempt must never be retried, and the PersistenceError
+                # branch must not classify it recoverable.
+                raise _EscapedCancelledAttempt from exc
             logger.warning(
                 "task execution timed out",
                 extra={
@@ -1364,33 +1429,53 @@ class WorkerManager:
                 },
             )
             message = f"task execution timed out after {timeout}s"
-            if not unwound:
-                # Review finding (duplicate execution): a recoverable
-                # outcome would schedule a retry while the abandoned
-                # attempt provably still runs — the single-owner claim
-                # invariant (no CONCURRENT executions of one row) must
-                # not be traded for the abandoned wedge. Terminal
-                # failure preserves it; the CLI `retry` path requeues
-                # manually once the stuck attempt has finished.
+            if unwind is _Unwind.CANCELLED:
+                return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message=message)
+            # Review finding (duplicate execution), both branches: a
+            # recoverable outcome would schedule a retry of an attempt
+            # whose cancellation was NOT respected — whether it is
+            # provably still running (ABANDONED) or finished inside the
+            # grace period after suppressing the cancel (COMPLETED —
+            # finishing is not proof of respect; only task.cancelled()
+            # is). Either way its side effects may already have landed:
+            # the single-owner no-duplicate-execution invariant wins.
+            # Terminal failure; the CLI `retry` path requeues manually
+            # once the attempt is verified finished.
+            if unwind is _Unwind.COMPLETED:
+                message += (
+                    "; handler suppressed cancellation and completed — attempt "
+                    "failed permanent (outcome uncertain; manual requeue once "
+                    "verified)"
+                )
+            else:
                 message += (
                     "; handler ignored cancellation — attempt failed permanent "
                     "(still running; manual requeue once it finishes)"
                 )
-                return TaskOutcome(TaskStatus.FAILED_PERMANENT, message=message)
-            return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message=message)
+            return TaskOutcome(TaskStatus.FAILED_PERMANENT, message=message)
         return task.result()  # handler exceptions keep their identity
 
     async def _await_child_unwind(
         self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
-    ) -> bool:
+    ) -> _Unwind:
         """Bounded wait for a CANCELLED handler child to unwind.
 
-        Returns True when the child finished (cancelled or otherwise);
-        False when it ignored cancellation within the grace period — the
-        child is then strongly referenced (never garbage-collected
-        mid-run), reported, and abandoned. A real handler exception that
-        escaped during unwinding keeps propagating, exactly as the old
-        ``await task`` did.
+        Returns HOW the child ended, because the timeout classification
+        depends on the difference (post-merge review finding): finishing
+        within the grace period does NOT prove the cancellation was
+        respected — a handler that suppresses the cancel, performs side
+        effects, and returns normally also finishes in time.
+
+        - ``CANCELLED`` — the child honoured the cancellation
+          (``task.cancelled()``): cleanup ran, no further side effects;
+          a retry is safe.
+        - ``COMPLETED`` — the child suppressed the cancellation and
+          finished (returned a value; an escaped real exception keeps
+          propagating with its identity, exactly as the old
+          ``await task`` did): its outcome is uncertain, never retry.
+        - ``ABANDONED`` — still pending after the grace period:
+          strongly referenced (never garbage-collected mid-run),
+          reported, and abandoned.
 
         Interruption-safe (review finding: double cancel): stop()'s
         finally re-cancels this WORKER while it waits here — the
@@ -1404,11 +1489,12 @@ class WorkerManager:
             self._register_abandoned_if_pending(task, context=context)
             raise
         if task.done():
-            if not task.cancelled():
-                task.result()  # retrieve: an escaped exception propagates as before
-            return True
+            if task.cancelled():
+                return _Unwind.CANCELLED
+            task.result()  # retrieve: an escaped exception propagates as before
+            return _Unwind.COMPLETED
         self._register_abandoned_if_pending(task, context=context)
-        return False
+        return _Unwind.ABANDONED
 
     def _register_abandoned_if_pending(
         self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
