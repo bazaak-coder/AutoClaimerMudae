@@ -1152,3 +1152,74 @@ async def test_nudge_during_due_read_is_not_lost(tmp_path: Path) -> None:
     finally:
         await manager.stop()
         await real_store.close()
+
+
+# RACE-006: a concurrent second stop() must not return mid-teardown
+
+
+async def test_concurrent_second_stop_waits_for_first(tmp_path: Path) -> None:
+    """RACE-006: stop()'s re-entrancy guard was check-then-act with no
+    awaitable — a second concurrent stop() returned in ~0.1ms while the
+    first was still draining an in-flight handler (adapters still open),
+    and the caller then proceeded as if teardown were complete."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        entered.set()
+        await release.wait()
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 5},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        await asyncio.wait_for(entered.wait(), timeout=3.0)  # mid-handler
+
+        stop1 = asyncio.create_task(manager.stop(timeout=30.0))
+        await asyncio.sleep(0.1)  # stop1 is inside its worker drain
+        assert not stop1.done()
+        stop2 = asyncio.create_task(manager.stop(timeout=30.0))
+        await asyncio.sleep(0.2)
+        assert not stop2.done(), (
+            "second stop() returned while the first was still draining"
+        )
+
+        release.set()
+        await asyncio.wait_for(stop1, timeout=10.0)
+        await asyncio.wait_for(stop2, timeout=10.0)
+        assert not manager._adapters  # noqa: SLF001 — teardown completed
+        assert manager._stopped is False  # noqa: SLF001
+    finally:
+        await manager.stop()
+        await store.close()

@@ -283,6 +283,8 @@ class WorkerManager:
         # (the event loop holds only weak task references — an
         # unreferenced emission can be garbage-collected mid-flight).
         self._audit_tasks: set[asyncio.Task[None]] = set()
+        # RACE-006: the in-flight stop() task a concurrent stop() joins.
+        self._stop_task: asyncio.Task[None] | None = None
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
         self._paused: set[int] = set()
         self._fatal_accounts: set[int] = set()
@@ -501,8 +503,18 @@ class WorkerManager:
         manager is never left half-stopped (audit B2/B3).
         """
         if self._stopped:
+            # RACE-006: a CONCURRENT stop() is mid-teardown — join it
+            # instead of returning while adapters are still open (the
+            # guard was check-then-act with no awaitable; the second
+            # caller returned in ~0.1ms believing teardown complete).
+            # Shielded: cancelling the second caller does not cancel the
+            # first; a completed first stop returns instantly.
+            first = self._stop_task
+            if first is not None and not first.done():
+                await asyncio.shield(first)
             return
         self._stopped = True
+        self._stop_task = asyncio.current_task()
         effective_timeout = (
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
