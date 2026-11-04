@@ -873,6 +873,4 @@ async def test_requeue_history_uses_pre_reset_attempt(
     rows = await store.task_history(record.id)
     requeue_rows = [r for r in rows if r[1] == "requeued"]
     assert requeue_rows, f"no requeue history row: {rows}"
-    assert requeue_rows[0][0] == 1, (
-        f"requeue history references a phantom attempt: {requeue_rows}"
-    )
+    assert requeue_rows[0][0] == 1, f"requeue history references a phantom attempt: {requeue_rows}"
