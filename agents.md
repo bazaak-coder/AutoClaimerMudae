@@ -197,6 +197,34 @@ Never weaken assertions or remove tests merely to make CI pass.
 
 A skipped test is not a passed test. An unexecuted test must be reported as unverified.
 
+Testing policy (owner-adopted 2026-11-05 — the suite must test BEHAVIOR,
+not just return values). Required coverage by area:
+
+| Area | Required coverage |
+|---|---|
+| Configuration | Invalid, missing, conflicting, and reloaded configuration |
+| Credentials | Encryption, retrieval, redaction, failure paths |
+| SQLite | Transactions, recovery, concurrent access, lifecycle |
+| Workers | Cancellation, shutdown, restart, isolation |
+| Rate limiter | Scope cooldowns, retries, concurrency, fairness |
+| Discord adapter | Connection lifecycle, errors, reconnects, event handling |
+| Mudae tasks | Parsing, cooldowns, confirmation, retry semantics |
+| Audit | Persistence, failure handling, shutdown boundaries |
+
+Rules that bind every change:
+
+- A regression test must REPRODUCE the original defect on the pre-fix
+  code (fail-first); a test that cannot discriminate is a guard and is
+  disclosed as such.
+- No live Discord credentials or real accounts in CI; live tests stay
+  env-gated and skipped visibly.
+- No network-dependent tests in the required suite.
+- Time-dependent tests use controlled clocks or deterministic
+  synchronization (events, deadline-polling with generous margins) —
+  never bare sleeps against real time.
+- Never reduce coverage floors to get a green build; raise them only
+  when the suite justifies it.
+
 7. Git and GitHub CLI ("gh")
 
 Use Git for version control and GitHub CLI ("gh") for authorized GitHub operations.
