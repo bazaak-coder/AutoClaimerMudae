@@ -566,7 +566,7 @@ Known constraints
 
 Remote
 
-- Repository: "libosterelezent/AutoClaimerMudae" (private). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
+- Repository: "bazaak-coder/AutoClaimerMudae" (private; owner account moved from "libosterelezent" on 2026-11-04 — the local remote is re-pointed, do not rely on the old-name redirect). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
 
 Final principle: Correctness, security, reproducibility, traceability, and owner control take precedence over speed. A passing test suite is necessary but not sufficient: independent review must examine the implementation's logic, security boundaries, and fragile areas before a change can be merged.
 
