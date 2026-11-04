@@ -1925,3 +1925,56 @@ async def test_unprintable_account_fatal_still_contains(
         with suppress(Exception):
             await manager.stop()
         await store.close()
+
+
+async def test_timeout_suppressing_completion_is_permanent_no_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Post-merge review finding (Medium): _await_child_unwind treated
+    "finished within the grace period" as "cancellation respected" — a
+    handler that SUPPRESSES the cancel, performs an external side
+    effect, and returns normally also finishes within the grace, was
+    classified FAILED_RECOVERABLE, and the retry re-executed it:
+    duplicate side effects. Finishing is not proof of respect — only
+    task.cancelled() is. The attempt must fail PERMANENT with exactly
+    one execution and one side effect."""
+    side_effects: list[str] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        try:
+            await asyncio.Event().wait()  # park until the timeout cancels
+        except asyncio.CancelledError:
+            side_effects.append(context.task_id)  # the duplicate-risk action
+            return TaskOutcome(TaskStatus.SUCCEEDED)  # suppress + finish fast
+        raise AssertionError("unreachable")
+
+    manager, store = await _one_account_manager(
+        tmp_path,
+        handler,
+        settings={"task_timeout_seconds": 0.15},
+        task_settings={"retry_limit": 3},  # a retry WOULD run on the bug
+        ratelimit={"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        row = await store.get_instance_by_ids(ACCOUNT, "job")
+        while asyncio.get_running_loop().time() < deadline:
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED, (
+            f"row never reached terminal failed: {row.status.value}"
+        )
+        await asyncio.sleep(0.3)  # any retry would have started by now
+        assert side_effects == ["job"], (
+            f"suppression-completing handler re-executed (duplicate side effects): {side_effects}"
+        )
+        assert row.attempt_count == 1, (
+            f"attempt budget consumed by retries of a suppressed attempt: {row.attempt_count}"
+        )
+    finally:
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
