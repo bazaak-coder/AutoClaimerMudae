@@ -379,7 +379,8 @@ class WorkerManager:
                     continue
                 try:
                     self._registry.validate_config(
-                        task_id, self._execution_parameters(resolved, task_id)
+                        task_id,
+                        self._execution_parameters(self._app_config, resolved, task_id),
                     )
                 except Exception as exc:
                     logger.error(
@@ -412,11 +413,14 @@ class WorkerManager:
 
         One SYNCHRONOUS method with no yield points: worker iterations
         either see the old (app, accounts) pair or the new one — never a
-        mix. In-flight executions are unaffected: each resolved its
-        configuration snapshot when it was claimed (documented snapshot
-        semantics). After the swap, new/changed assignments apply from
-        the next iteration; call :meth:`reload_materialize` for
-        materialization and worker spawning.
+        mix. In-flight executions are generation-pinned: each captures
+        ONE (app, accounts) reference before its first await and reads
+        EVERY piece of its configuration from it — parameters, channels,
+        rate-limit policy, and retry bounds — so a swap landing between
+        the execution's awaits can never mix generations. After the
+        swap, new/changed assignments apply from the next iteration;
+        call :meth:`reload_materialize` for materialization and worker
+        spawning.
         """
         self._app_config = app
         self._accounts = accounts
@@ -603,9 +607,20 @@ class WorkerManager:
             await self._store.create_instance(account_id, task_id)
 
     def _profile(self, account_id: int) -> AccountProfile | None:
-        return next((a for a in self._accounts.accounts if a.id == account_id), None)
+        return self._profile_in(self._accounts, account_id)
 
-    def _execution_parameters(self, resolved: ResolvedTaskConfig, task_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _profile_in(
+        accounts: AccountsConfig, account_id: int
+    ) -> AccountProfile | None:
+        """Profile lookup against a SPECIFIC configuration generation
+        (reload race: an execution must read its account from the same
+        snapshot as its task configuration)."""
+        return next((a for a in accounts.accounts if a.id == account_id), None)
+
+    def _execution_parameters(
+        self, app: AppConfig, resolved: ResolvedTaskConfig, task_id: str
+    ) -> dict[str, Any]:
         """The parameter mapping a task's validator and handler see.
 
         Global-channel integration: a task declaring a ``channel_role``
@@ -614,13 +629,15 @@ class WorkerManager:
         ``config["channel"]`` and never resolve fallbacks themselves;
         users cannot set ``channel`` anywhere (config parsing rejects
         it), so per-task values cannot defeat the global configuration.
+
+        *app* pins the configuration generation (reload race): the
+        channel is read from the SAME snapshot that resolved the
+        parameters, never from a later swap.
         """
         parameters = dict(resolved.parameters)
         task_type = self._registry.get(task_id)  # membership pre-checked by callers
         if task_type.channel_role is not None:
-            parameters["channel"] = self._app_config.channels.effective().for_role(
-                task_type.channel_role
-            )
+            parameters["channel"] = app.channels.effective().for_role(task_type.channel_role)
         return parameters
 
     # ----- worker loop -----
@@ -736,7 +753,17 @@ class WorkerManager:
             return
         # Resolve configuration BEFORE claiming: a validation failure must
         # not strand a claimed (running) row forever (audit B1).
-        profile = self._profile(account_id)
+        # Generation snapshot (reload race): ONE (app, accounts) reference
+        # captured before the first await feeds EVERY configuration read
+        # of this execution — parameters, channels, policy, retry bounds.
+        # Reading self._app_config again after the awaits (wait_scopes,
+        # slot, claim) could mix generations when a reload swaps the
+        # configuration mid-execution (old parameters on the new channel,
+        # a swapped retry bound); the captured references are immutable,
+        # so this execution stays wholly on its own generation.
+        app = self._app_config
+        accounts = self._accounts
+        profile = self._profile_in(accounts, account_id)
         if profile is None or record.task_id not in profile.tasks:
             await self._terminal_without_claim(
                 record, "task not assigned to this account in current config"
@@ -757,7 +784,7 @@ class WorkerManager:
             )
             return
         try:
-            resolved = resolve_task_config(self._app_config, profile, record.task_id)
+            resolved = resolve_task_config(app, profile, record.task_id)
         except ConfigValidationError as exc:
             await self._terminal_without_claim(record, f"invalid task config: {exc}")
             return
@@ -788,7 +815,7 @@ class WorkerManager:
         # account-shared adapter is policy-less, and handlers driving it
         # previously operated under the limiter default (global-only),
         # silently ignoring every per-task/per-account ratelimit block.
-        policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
+        policy = policy_for(app, accounts, account_id, record.task_id)
         task_adapter = adapter.with_policy(policy)
         # Wait out account cooldowns BEFORE taking a global execution slot
         # so parked accounts cannot starve others (audit B6).
@@ -814,7 +841,7 @@ class WorkerManager:
             context = TaskContext(
                 account_id=account_id,
                 task_id=record.task_id,
-                config=self._execution_parameters(resolved, record.task_id),
+                config=self._execution_parameters(app, resolved, record.task_id),
                 adapter=task_adapter,
                 credentials=self._credentials,
             )
@@ -982,7 +1009,7 @@ class WorkerManager:
             # then ignored — the ratelimit-layer policy bound was used
             # instead); beyond it the instance fails permanently (audit B8).
             resolved_limit = resolve_task_config(
-                self._app_config, profile, record.task_id
+                app, profile, record.task_id
             ).retry_limit
             if claimed.attempt_count >= resolved_limit + 1:
                 await self._record(
@@ -1009,7 +1036,13 @@ class WorkerManager:
                 # values were rejected above, for every status.
                 retry_at = max(outcome.retry_at, self._wall())
             else:
-                delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
+                delay = self._retry_delay(
+                    claimed.attempt_count,
+                    account_id,
+                    record.task_id,
+                    app=app,
+                    accounts=accounts,
+                )
                 retry_at = self._wall() + timedelta(seconds=delay)
             await self._record(record.id, outcome, retry_at=retry_at)
         else:
@@ -1098,8 +1131,18 @@ class WorkerManager:
             await asyncio.sleep(0.5)
             await self._store.reschedule_success(instance_id, outcome, retry_at)
 
-    def _retry_delay(self, attempts: int, account_id: int, task_id: str) -> float:
-        policy = policy_for(self._app_config, self._accounts, account_id, task_id)
+    def _retry_delay(
+        self,
+        attempts: int,
+        account_id: int,
+        task_id: str,
+        *,
+        app: AppConfig,
+        accounts: AccountsConfig,
+    ) -> float:
+        # app/accounts: the execution's own generation (reload race) —
+        # the backoff policy must not swap mid-execution either.
+        policy = policy_for(app, accounts, account_id, task_id)
         # Clamp the exponent: 2**1024 overflows float beyond ~1025 attempts.
         exponent = min(max(0, attempts - 1), 62)
         base = policy.backoff_base_seconds * (2**exponent)

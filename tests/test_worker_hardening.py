@@ -341,7 +341,13 @@ async def test_recoverable_forever_eventually_fails_permanently(tmp_path: Path) 
 async def test_retry_delay_is_finite_at_extreme_attempts(tmp_path: Path) -> None:
     manager, store, _ = await build_manager(tmp_path)
     for attempts in (1, 100, 1025, 2000, 10**6):
-        delay = manager._retry_delay(attempts, ACCOUNT, "job")  # noqa: SLF001
+        delay = manager._retry_delay(  # noqa: SLF001
+            attempts,
+            ACCOUNT,
+            "job",
+            app=manager._app_config,  # noqa: SLF001
+            accounts=manager._accounts,  # noqa: SLF001
+        )
         assert 0.0 <= delay <= 0.02  # capped by the config's backoff cap
     await store.close()
 

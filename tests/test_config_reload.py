@@ -578,3 +578,174 @@ async def test_removed_task_assignment_lands_in_history(tmp_path: Path) -> None:
         ), f"pre-claim retirement missing from history: {rows}"
     finally:
         await controller.shutdown()
+
+
+# --- Reload generation mixing: one execution, ONE configuration snapshot ---
+
+
+class _ParkingClaimStore:
+    """Real-store delegation; claim() parks on an event the first time —
+    the deterministic window where a reload swaps the configuration while
+    an execution is between its config reads and its claim."""
+
+    def __init__(self, inner: TaskStateStore, *, park_on: int = 1) -> None:
+        self._inner = inner
+        self.parked = asyncio.Event()
+        self.release = asyncio.Event()
+        self._park_on = park_on
+        self._claims = 0
+
+    async def claim(self, instance_id: int) -> Any:
+        self._claims += 1
+        if self._claims == self._park_on:
+            self.parked.set()
+            await self.release.wait()
+        return await self._inner.claim(instance_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _generation_controller(
+    tmp_path: Path,
+    handler: Any,
+    store_wrapper: Any,
+) -> tuple[AutoClaimerController, Any]:
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": CHANNEL_A},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 3},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+            "task_defaults": {"retry_limit": 1},
+            "tasks": {"probe": {"parameters": {"marker": "A"}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="probe",
+            description="Generation probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+            channel_role="roll_claim",
+        )
+    )
+    real_store = store_wrapper._inner
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=store_wrapper,
+        limiter=RateLimiter(store=real_store),
+        registry=registry,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    return controller, real_store
+
+
+def _generation_b_docs() -> tuple[dict[str, Any], dict[str, Any]]:
+    app_doc = {
+        "version": 1,
+        "channels": {"roll_claim": CHANNEL_B},
+        "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 3},
+        "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.01},
+        "task_defaults": {"retry_limit": 5},
+        "tasks": {"probe": {"parameters": {"marker": "B"}}},
+    }
+    accounts_doc = {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe"]}]}
+    return app_doc, accounts_doc
+
+
+async def test_inflight_execution_never_mixes_channel_generation(
+    tmp_path: Path,
+) -> None:
+    """High-priority race: ``_execute`` resolved parameters from
+    generation A, then awaited (wait_scopes / slot / claim), and
+    ``_execution_parameters`` read ``self._app_config.channels`` AFTER
+    those awaits — a reload landing in the window produced ONE execution
+    with old parameters on the NEW channel. Every configuration read for
+    one execution must come from a single snapshot captured before the
+    first await."""
+    observed: dict[str, Any] = {}
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        observed["channel"] = context.config["channel"]
+        observed["marker"] = context.config["marker"]
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    real = TaskStateStore(tmp_path / "state.db")
+    await real.open()
+    wrapper = _ParkingClaimStore(real)
+    controller, store = await _generation_controller(tmp_path, handler, wrapper)
+    try:
+        await controller.start()
+        await asyncio.wait_for(wrapper.parked.wait(), timeout=3.0)  # mid-claim
+
+        app_doc, accounts_doc = _generation_b_docs()  # channel A -> B, marker A -> B
+        app_b = parse_app_config(app_doc)
+        controller.manager.update_configuration(  # noqa: SLF001 — the swap under test
+            app_b, parse_accounts_config(accounts_doc, app_b)
+        )
+        wrapper.release.set()
+
+        record = await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.SUCCEEDED)
+        assert observed["marker"] == "A"  # resolved before the first await
+        assert observed["channel"] == CHANNEL_A, (
+            f"mixed generations: parameters from A ({observed['marker']!r}) "
+            f"but channel from B ({observed['channel']}) — expected {CHANNEL_A}"
+        )
+        assert record.status is TaskInstanceState.SUCCEEDED
+    finally:
+        await controller.shutdown()
+
+
+async def test_inflight_execution_keeps_its_retry_limit_generation(
+    tmp_path: Path,
+) -> None:
+    """Same race, retry-bound leg: the recoverable-failure branch
+    re-resolved ``retry_limit`` from the CURRENT configuration after the
+    awaits — an execution started under limit 1 could be retried under a
+    swapped limit 5. The bound must come from the execution's own
+    generation."""
+    calls: list[int] = []
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        calls.append(context.account_id)
+        return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message="transient")
+
+    real = TaskStateStore(tmp_path / "state.db")
+    await real.open()
+    wrapper = _ParkingClaimStore(real, park_on=2)  # the bound-deciding attempt
+    controller, store = await _generation_controller(tmp_path, handler, wrapper)
+    try:
+        await controller.start()
+        await asyncio.wait_for(wrapper.parked.wait(), timeout=5.0)  # mid-claim #2
+
+        app_doc, accounts_doc = _generation_b_docs()  # retry_limit 1 -> 5
+        app_b = parse_app_config(app_doc)
+        controller.manager.update_configuration(  # noqa: SLF001 — the swap under test
+            app_b, parse_accounts_config(accounts_doc, app_b)
+        )
+        wrapper.release.set()
+
+        # Generation A bounds the retries: attempt 1 >= limit 1 -> terminal.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        record = await store.get_instance_by_ids(ACCOUNT, "probe")
+        while asyncio.get_running_loop().time() < deadline:
+            record = await store.get_instance_by_ids(ACCOUNT, "probe")
+            if record.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert record.status is TaskInstanceState.FAILED, (
+            f"execution escaped its own generation's retry bound "
+            f"(status={record.status.value}, attempts={record.attempt_count})"
+        )
+        assert record.last_outcome is not None
+        assert "worker retry limit (1) exhausted" in record.last_outcome.message
+        assert len(calls) == 2, calls  # limit 1 = initial attempt + one retry
+    finally:
+        await controller.shutdown()
