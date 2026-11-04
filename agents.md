@@ -481,6 +481,8 @@ Do not alter system packages, global Python installations, boot configuration, p
 
 12. Security and Account Safety
 
+- **Credential exfiltration boundary (explicit, owner-directed 2026-11-04):** no personal credential of any kind — account tokens, cookies, passwords, API keys, SSH or GitHub credentials, encryption keys — may ever be pushed, committed, uploaded, or otherwise shared from the local system, through ANY channel: repository content (including test fixtures, sample configs, log excerpts, database snapshots, and knowledgebase entries), commit messages, PR descriptions or review comments, issues, CI variables, pastes, web tools, or conversation output. If a real credential has already reached any such channel, report it immediately so it can be revoked and rotated; never attempt to "un-share" silently.
+- **Fake credentials are the only permitted test values, and they must be value-unrelated to the owner's real ones.** Synthetic tokens may mimic the real FORMAT (for example the `FAKE_TOKEN` shape in the tests: `base64(dummy_snowflake).base64(dummy).base64(random-looking)`) but must never be derived from, encode, obfuscate, rotate, or partially mask an actual secret in use — a masked real token is still a real token.
 - Never hardcode credentials or expose tokens, cookies, authorization headers, or secrets.
 - Never commit local credential databases or sensitive account data.
 - Use mocks and fixtures for automated tests.
