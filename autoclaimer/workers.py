@@ -903,13 +903,21 @@ class WorkerManager:
                     },
                     exc_info=True,
                 )
-                await self._record(
-                    record.id,
+                # CLOSURE-001: this previously passed retry_at=None,
+                # TERMINALLY failing the row on its first transient fault
+                # (a failed_recoverable outcome persisted on a terminal
+                # row) — now the same bounded retry the handler-reported
+                # recoverable outcome gets.
+                await self._record_recoverable(
+                    record,
+                    claimed,
                     TaskOutcome(
                         TaskStatus.FAILED_RECOVERABLE,
                         message=f"persistence error: {type(exc).__name__}: {exc}",
                     ),
-                    retry_at=None,
+                    resolved_limit=resolve_task_config(app, profile, record.task_id).retry_limit,
+                    app=app,
+                    accounts=accounts,
                 )
                 return
             except Exception as exc:
@@ -994,53 +1002,19 @@ class WorkerManager:
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
             self._health.record_failure(account_id, outcome.message)
-            await self._audit.emit(
-                category="task",
-                action="retried",
-                account_id=account_id,
-                task_id=record.task_id,
-                detail=outcome.message,
-            )
             # Worker-level retries are bounded by the RESOLVED TASK
             # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
             # task → override chain was computed, test-asserted, and
             # then ignored — the ratelimit-layer policy bound was used
             # instead); beyond it the instance fails permanently (audit B8).
-            resolved_limit = resolve_task_config(app, profile, record.task_id).retry_limit
-            if claimed.attempt_count >= resolved_limit + 1:
-                await self._record(
-                    record.id,
-                    TaskOutcome(
-                        TaskStatus.FAILED_PERMANENT,
-                        # Carry the LAST failure reason into the terminal
-                        # row (roadmap items 7/8): the exhaustion alone
-                        # hides whether it was timeouts, cooldowns, or
-                        # handler-reported failures.
-                        message=(
-                            f"worker retry limit ({resolved_limit}) exhausted; "
-                            f"last failure: {outcome.message}"
-                        ),
-                    ),
-                    retry_at=None,
-                )
-                return
-            if outcome.retry_at is not None:
-                # Milestone 4 (retry ownership): a LEARNED absolute UTC
-                # deadline (parsed from a Mudae reply, anchored at the
-                # domain boundary) supersedes generic transport backoff.
-                # An already-expired deadline means "due now". Naive
-                # values were rejected above, for every status.
-                retry_at = max(outcome.retry_at, self._wall())
-            else:
-                delay = self._retry_delay(
-                    claimed.attempt_count,
-                    account_id,
-                    record.task_id,
-                    app=app,
-                    accounts=accounts,
-                )
-                retry_at = self._wall() + timedelta(seconds=delay)
-            await self._record(record.id, outcome, retry_at=retry_at)
+            await self._record_recoverable(
+                record,
+                claimed,
+                outcome,
+                resolved_limit=resolve_task_config(app, profile, record.task_id).retry_limit,
+                app=app,
+                accounts=accounts,
+            )
         else:
             # Terminal failure returned by the handler (PERMANENT).
             self._health.record_failure(account_id, outcome.message)
@@ -1098,6 +1072,80 @@ class WorkerManager:
                 message=f"task execution timed out after {timeout}s",
             )
         return task.result()  # handler exceptions keep their identity
+
+    async def _record_recoverable(
+        self,
+        record: TaskInstanceRecord,
+        claimed: TaskInstanceRecord,
+        outcome: TaskOutcome,
+        *,
+        resolved_limit: int,
+        app: AppConfig,
+        accounts: AccountsConfig,
+    ) -> None:
+        """Record a FAILED_RECOVERABLE outcome under the retry bound.
+
+        CLOSURE-001: shared by handler-reported recoverable failures and
+        handler-raised PersistenceError (both recoverable; the latter was
+        previously terminal-killed via ``retry_at=None``).
+
+        CLOSURE-003: the audit event follows the LIMIT DECISION — an
+        exhausted attempt emits ``task.failed`` (with the exhaustion
+        detail), never a phantom ``task.retried`` for a retry that will
+        not happen.
+        """
+        account_id = record.account_id
+        if claimed.attempt_count >= resolved_limit + 1:
+            await self._audit.emit(
+                category="task",
+                action="failed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=(
+                    f"worker retry limit ({resolved_limit}) exhausted; "
+                    f"last failure: {outcome.message}"
+                ),
+            )
+            await self._record(
+                record.id,
+                TaskOutcome(
+                    TaskStatus.FAILED_PERMANENT,
+                    # Carry the LAST failure reason into the terminal
+                    # row (roadmap items 7/8): the exhaustion alone
+                    # hides whether it was timeouts, cooldowns, or
+                    # handler-reported failures.
+                    message=(
+                        f"worker retry limit ({resolved_limit}) exhausted; "
+                        f"last failure: {outcome.message}"
+                    ),
+                ),
+                retry_at=None,
+            )
+            return
+        if outcome.retry_at is not None:
+            # Milestone 4 (retry ownership): a LEARNED absolute UTC
+            # deadline (parsed from a Mudae reply, anchored at the
+            # domain boundary) supersedes generic transport backoff.
+            # An already-expired deadline means "due now". Naive values
+            # were rejected above, for every status.
+            retry_at = max(outcome.retry_at, self._wall())
+        else:
+            delay = self._retry_delay(
+                claimed.attempt_count,
+                account_id,
+                record.task_id,
+                app=app,
+                accounts=accounts,
+            )
+            retry_at = self._wall() + timedelta(seconds=delay)
+        await self._audit.emit(
+            category="task",
+            action="retried",
+            account_id=account_id,
+            task_id=record.task_id,
+            detail=outcome.message,
+        )
+        await self._record(record.id, outcome, retry_at=retry_at)
 
     async def _record(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None

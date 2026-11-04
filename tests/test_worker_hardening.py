@@ -576,3 +576,84 @@ async def test_cancelled_stop_awaits_worker_unwind_before_returning(
     finally:
         await manager.stop()
         await store.close()
+
+
+# CLOSURE-001: a handler-raised PersistenceError is recoverable, not terminal
+
+
+async def test_handler_persistence_error_is_retried_not_dead_lettered(
+    tmp_path: Path,
+) -> None:
+    """CLOSURE-001: a PersistenceError raised INSIDE a handler (every
+    Mudae handler is a store closure; deadline writes raise
+    DatabaseBusyError under contention) is a transient infrastructure
+    fault — the branch's own contract says "bounded recoverable retry,
+    never a terminal kill of a recurring task". The row was terminal-
+    failed on attempt 1, consuming none of its retry budget, with a
+    FAILED_RECOVERABLE outcome persisted on a terminal row."""
+    calls: list[str] = []
+    flaky = {"fail": True}
+
+    async def handler(context: Any) -> TaskOutcome:
+        calls.append(context.task_id)
+        if context.task_id == "flaky" and flaky["fail"]:
+            flaky["fail"] = False
+            raise DatabaseBusyError("injected: deadline write locked")
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 2, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "task_defaults": {"retry_limit": 2},
+            "tasks": {"flaky": {"parameters": {}}, "healthy": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["flaky", "healthy"]}]},
+        app,
+    )
+    registry = TaskRegistry()
+    for task_id in ("flaky", "healthy"):
+        registry.register(
+            TaskType(
+                id=task_id,
+                description="probe",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        flaky_record = await store.get_instance_by_ids(ACCOUNT, "flaky")
+        while asyncio.get_running_loop().time() < deadline:
+            flaky_record = await store.get_instance_by_ids(ACCOUNT, "flaky")
+            if flaky_record.status is TaskInstanceState.SUCCEEDED:
+                break
+            await asyncio.sleep(0.02)
+        assert flaky_record.status is TaskInstanceState.SUCCEEDED, (
+            f"transient persistence fault dead-lettered the row: "
+            f"{flaky_record.status.value} "
+            f"({flaky_record.last_outcome.message if flaky_record.last_outcome else ''})"
+        )
+        assert flaky_record.attempt_count == 2  # one fault + one retry
+        assert calls.count("flaky") == 2
+        healthy = await store.get_instance_by_ids(ACCOUNT, "healthy")
+        assert healthy.status is TaskInstanceState.SUCCEEDED  # worker survived
+    finally:
+        await manager.stop()
+        await store.close()
