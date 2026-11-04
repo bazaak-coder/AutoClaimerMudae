@@ -1,11 +1,14 @@
 """Batch 2 regression tests (Phase 9 worker-correctness fixes)."""
 
 import asyncio
+import logging
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from autoclaimer.audit import AuditLog
 from autoclaimer.config import parse_accounts_config, parse_app_config
 from autoclaimer.mock_adapter import MockAdapter
 from autoclaimer.persistence import (
@@ -16,7 +19,7 @@ from autoclaimer.persistence import (
 )
 from autoclaimer.ratelimit import RateLimiter
 from autoclaimer.registry import TaskOutcome, TaskRegistry, TaskStatus, TaskType
-from autoclaimer.workers import WorkerManager
+from autoclaimer.workers import WorkerManager, WorkerState
 
 ACCOUNT = 271485504361996288
 OTHER = 380028190142042112
@@ -1218,5 +1221,253 @@ async def test_concurrent_second_stop_waits_for_first(tmp_path: Path) -> None:
         assert not manager._adapters  # noqa: SLF001 — teardown completed
         assert manager._stopped is False  # noqa: SLF001
     finally:
+        await manager.stop()
+        await store.close()
+
+
+# Shutdown review round: audit emissions and cancellation-resistant handlers
+
+
+class _BlockedAuditSink:
+    """record_audit_event parks forever and HONORS cancellation."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancelled = 0
+
+    async def record_audit_event(self, **_: Any) -> None:
+        self.calls += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+
+
+class _SwallowingAuditSink:
+    """record_audit_event parks forever and suppresses cancellation."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancel_deliveries = 0
+        self.finished = asyncio.Event()
+
+    async def record_audit_event(self, **_: Any) -> None:
+        self.calls += 1
+        while not self.finished.is_set():
+            try:
+                await self.finished.wait()
+            except asyncio.CancelledError:
+                self.cancel_deliveries += 1
+
+
+async def _one_account_manager(
+    tmp_path: Path,
+    handler: Any,
+    *,
+    settings: dict[str, Any] | None = None,
+    task_settings: dict[str, Any] | None = None,
+) -> tuple[WorkerManager, TaskStateStore]:
+    """Standard single-account manager fixture for the shutdown tests."""
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2}
+            | (settings or {}),
+            "task_defaults": {"retry_limit": 0} | (task_settings or {}),
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(id="job", description="probe", validate_config=lambda c: None, handler=handler)
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    return manager, store
+
+
+async def test_stop_cancels_blocked_audit_emissions(tmp_path: Path) -> None:
+    """Shutdown finding (audit drain): stop()'s bounded audit wait
+    ignored the still-pending tasks — a blocked sink let the emission
+    outlive the shutdown boundary (adapters closed, lifecycle reset,
+    emission still running). Pending emissions must be cancelled and
+    awaited; none may outlive stop()."""
+    sink = _BlockedAuditSink()
+
+    async def handler(context: Any) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(tmp_path, handler)
+    manager._audit = AuditLog(sink)  # noqa: SLF001 — the sink under test
+    try:
+        await manager.start()
+        manager.pause_account(ACCOUNT)  # sync control plane: fire-and-forget emit
+        await asyncio.sleep(0.1)
+        assert sink.calls == 1  # the emission is parked in the sink
+
+        await asyncio.wait_for(manager.stop(), timeout=8.0)
+
+        assert sink.cancelled >= 1, (
+            "stop() returned while a blocked audit emission was still running — "
+            "the emission outlived the shutdown boundary"
+        )
+    finally:
+        await manager.stop()
+        await store.close()
+
+
+async def test_stop_reports_uncancellable_audit_sink(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Even a sink that suppresses cancellation must not wedge stop():
+    shutdown stays bounded and REPORTS the abandoned emission instead of
+    silently proceeding."""
+    sink = _SwallowingAuditSink()
+
+    async def handler(context: Any) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(tmp_path, handler)
+    manager._audit = AuditLog(sink)  # noqa: SLF001 — the sink under test
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            manager.pause_account(ACCOUNT)
+            await asyncio.sleep(0.1)
+            assert sink.calls == 1
+
+            await asyncio.wait_for(manager.stop(), timeout=8.0)
+
+        assert sink.cancel_deliveries >= 1, (
+            "stop() never even attempted to cancel the blocked emission"
+        )
+        assert any(
+            "audit emission" in r.getMessage() and "abandoned" in r.getMessage()
+            for r in caplog.records
+        ), "stop() did not report the emission that even cancellation could not unwind"
+    finally:
+        sink.finished.set()
+        await asyncio.sleep(0.05)  # let the abandoned emission finish
+        await manager.stop()
+        await store.close()
+
+
+async def test_stop_bounded_with_cancellation_resistant_handler(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Shutdown finding (resistant handler): the post-cancel
+    gather() had no second deadline — a handler suppressing
+    CancelledError blocked stop() forever. stop() must stay bounded,
+    report the surviving worker, and not claim a clean teardown."""
+    release = asyncio.Event()
+    in_handler = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        in_handler.set()
+        while not release.is_set():  # suppresses EVERY cancellation
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(tmp_path, handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            await asyncio.wait_for(in_handler.wait(), timeout=3.0)
+
+            # NOT wait_for: on the bug, stop() parks on an un-cancellable
+            # gather and wait_for's own reaping await would hang with it.
+            stop_task = asyncio.create_task(manager.stop(timeout=0.3))
+            _done, still = await asyncio.wait({stop_task}, timeout=3.0)
+            assert not still, "stop() blocked indefinitely on a cancellation-resistant handler"
+            exc = stop_task.exception()  # pragma: no cover - defensive
+            assert exc is None, f"stop() failed: {exc!r}"
+
+        assert any("still running" in r.getMessage() for r in caplog.records), (
+            "stop() claimed teardown without reporting the un-cancellable worker"
+        )
+        status = await manager.status()
+        assert status.workers[0].state is WorkerState.RUNNING, (
+            "a worker that survived shutdown must not be reported as stopped"
+        )
+    finally:
+        release.set()  # the resistant handler finishes; the worker unwinds
+        stop_wait, _ = await asyncio.wait({stop_task}, timeout=3.0)
+        if not stop_task.done():  # pragma: no cover - defensive
+            stop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stop_task
+        with suppress(Exception):
+            await manager.stop()  # cooperative now: drains the released worker
+        task = manager._workers[ACCOUNT].task  # noqa: SLF001 — test cleanup
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        await store.close()
+
+
+async def test_uncancellable_timed_out_handler_does_not_wedge_worker(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The timeout path cancelled the handler child and awaited it
+    UNBOUNDED — a handler suppressing CancelledError wedged the whole
+    account worker (row stranded running). The worker must proceed with
+    a failed outcome, keep living, and report the abandoned handler."""
+    release = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        while not release.is_set():  # suppresses EVERY cancellation
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(
+        tmp_path,
+        handler,
+        settings={"task_timeout_seconds": 0.15},
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            deadline = asyncio.get_running_loop().time() + 5.0
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            while asyncio.get_running_loop().time() < deadline:
+                row = await store.get_instance_by_ids(ACCOUNT, "job")
+                if row.status is TaskInstanceState.FAILED:
+                    break
+                await asyncio.sleep(0.02)
+            assert row.status is TaskInstanceState.FAILED, (
+                f"cancellation-resistant timed-out handler wedged the worker: {row.status.value}"
+            )
+
+        assert any("ignored cancellation" in r.getMessage() for r in caplog.records), (
+            "the abandoned handler was never reported"
+        )
+        worker_task = manager._workers[ACCOUNT].task  # noqa: SLF001
+        assert worker_task is not None and not worker_task.done(), (
+            "the account worker should be alive (abandoned handler), not wedged or dead"
+        )
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)  # the abandoned child completes
         await manager.stop()
         await store.close()

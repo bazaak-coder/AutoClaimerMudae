@@ -34,11 +34,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 from .adapters import (
     AccountFatalError,
@@ -72,6 +71,12 @@ from .ratelimit import EffectivePolicy, RateLimiter, RetryLimitExceededError, po
 from .registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+# Post-cancellation unwind budget: a handler that suppresses
+# CancelledError cannot be force-terminated in Python — cancelled
+# children/workers get this long to unwind before being reported and
+# abandoned instead of blocking their awaiter forever.
+_CANCEL_GRACE_SECONDS: Final[float] = 1.0
 
 
 def _safe_error_text(error: BaseException | str) -> str:
@@ -284,6 +289,10 @@ class WorkerManager:
         # (the event loop holds only weak task references — an
         # unreferenced emission can be garbage-collected mid-flight).
         self._audit_tasks: set[asyncio.Task[None]] = set()
+        # Shutdown finding (resistant handlers): strong references for
+        # handler children abandoned at cancellation — they are never
+        # awaited again and must not be garbage-collected mid-run.
+        self._abandoned_handlers: set[asyncio.Task[TaskOutcome]] = set()
         # RACE-006: the in-flight stop() task a concurrent stop() joins.
         self._stop_task: asyncio.Task[None] | None = None
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
@@ -520,27 +529,62 @@ class WorkerManager:
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
         self._shutdown.set()
+        # Post-cancel unwind budget for THIS shutdown: a worker whose
+        # handler suppresses CancelledError cannot be force-terminated —
+        # cancelled workers get this long to unwind, then the survivors
+        # are reported instead of stop() blocking on them forever.
+        cancel_grace = min(_CANCEL_GRACE_SECONDS, effective_timeout)
+        abandoned_workers: set[asyncio.Task[None]] = set()
         try:
             # LOW-033 (review F1): bounded drain of outstanding audit
             # emissions so control events fired just before shutdown still
             # land. INSIDE the try: a cancellation while it waits runs the
             # finally below (adapters closed, lifecycle reset) and then
             # re-raises — stop()'s documented contract (audit B2/B3).
+            #
+            # Shutdown finding (audit drain): the bounded wait previously
+            # IGNORED the still-pending emissions — a blocked sink let an
+            # emission outlive the shutdown boundary (adapters closed,
+            # lifecycle reset, emission still running). Pending emissions
+            # are now cancelled and awaited (bounded); anything even
+            # cancellation cannot unwind is reported and abandoned.
             if self._audit_tasks:
-                await asyncio.wait(set(self._audit_tasks), timeout=min(1.0, effective_timeout))
+                _done, pending_emissions = await asyncio.wait(
+                    set(self._audit_tasks), timeout=min(1.0, effective_timeout)
+                )
+                for emission in pending_emissions:
+                    emission.cancel()
+                if pending_emissions:
+                    await asyncio.wait(set(pending_emissions), timeout=cancel_grace)
+                stuck_emissions = [e for e in pending_emissions if not e.done()]
+                if stuck_emissions:
+                    logger.warning(
+                        "%d audit emission(s) ignored cancellation and are abandoned at shutdown",
+                        len(stuck_emissions),
+                        extra={
+                            "operation": "manager.stop",
+                            "outcome": "audit_emissions_abandoned",
+                        },
+                    )
             for worker in self._workers.values():
                 worker.nudge()
             tasks = [w.task for w in self._workers.values() if w.task is not None]
             if tasks:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=effective_timeout,
-                    )
-                except TimeoutError:
-                    for task in tasks:
+                # NOT wait_for(gather(...)): a worker whose handler
+                # suppresses CancelledError makes the gather un-reapable,
+                # parking stop() INSIDE wait_for before any timeout
+                # handler can run (shutdown finding: resistant handlers).
+                # asyncio.wait always returns at the deadline.
+                _done, overdue = await asyncio.wait(set(tasks), timeout=effective_timeout)
+                if overdue:
+                    for task in overdue:
                         task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # The old post-cancel gather here had no deadline —
+                    # a handler suppressing CancelledError blocked
+                    # stop() indefinitely.
+                    abandoned_workers.update(
+                        await self._drain_cancelled(list(overdue), grace=cancel_grace)
+                    )
         finally:
             # BUG-034 (review round): a cancelled stop() can interrupt the
             # worker drain before it ran. Nudge every worker (a gated
@@ -566,8 +610,14 @@ class WorkerManager:
             # claimed row (duplicate-execution race). Mid-execution
             # instances deliberately stay running (uncertain outcome;
             # recovered on next start), matching the budget-timeout path.
+            # Shutdown finding (resistant handlers): the unbounded gather
+            # is gone — the same bounded drain runs here, and a worker
+            # that even cancellation cannot unwind is REPORTED, never
+            # silently claimed as torn down.
             if stragglers:
-                await asyncio.gather(*stragglers, return_exceptions=True)
+                abandoned_workers.update(
+                    await self._drain_cancelled(stragglers, grace=cancel_grace)
+                )
             # Adapters close in the finally: outer cancellation of stop()
             # must never leak live clients (N1). Adapter close() is
             # idempotent, so a retried stop() is harmless.
@@ -583,7 +633,35 @@ class WorkerManager:
             self._shutdown.clear()
             self._stopped = False
             self._started = False
+            if abandoned_workers:
+                # Do not claim a clean teardown while workers are still
+                # running: Python cannot force-terminate them, so the
+                # honest contract is a bounded stop + an explicit report
+                # (status() keeps showing them as RUNNING).
+                logger.warning(
+                    "framework stopped with %d worker task(s) still running "
+                    "(handler suppressed cancellation); they cannot be "
+                    "force-terminated and were abandoned",
+                    len(abandoned_workers),
+                    extra={"operation": "manager.stop", "outcome": "workers_abandoned"},
+                )
             logger.info("framework stopped")
+
+    async def _drain_cancelled(
+        self, tasks: list[asyncio.Task[None]], *, grace: float
+    ) -> list[asyncio.Task[None]]:
+        """Bounded post-cancellation unwind wait; returns the survivors.
+
+        A cooperative worker finishes unwinding well inside the grace
+        period. One whose handler suppresses CancelledError cannot be
+        force-terminated — awaiting it unbounded would hang stop()
+        forever, so the survivors are handed back to the caller for
+        reporting.
+        """
+        if not tasks:
+            return []
+        await asyncio.wait(set(tasks), timeout=grace)
+        return [task for task in tasks if not task.done()]
 
     async def __aenter__(self) -> WorkerManager:
         await self.start()
@@ -1115,8 +1193,11 @@ class WorkerManager:
         """Execute the handler under the resolved timeout (roadmap item 7).
 
         Timeout semantics (defined before implementation):
-        - A timed-out handler is CANCELLED and the child task AWAITED, so
-          its cleanup runs and it cannot continue in the background.
+        - A timed-out handler is CANCELLED and the child task given a
+          BOUNDED chance to unwind, so its cleanup runs; a handler that
+          suppresses CancelledError cannot be force-terminated and is
+          reported and abandoned (strongly referenced) instead of
+          wedging this await forever.
         - A timeout is DISTINCT from a handler raising TimeoutError itself
           (``asyncio.wait`` + ``task.result()`` preserves exception
           identity — only a still-pending task after the deadline is a
@@ -1124,7 +1205,7 @@ class WorkerManager:
         - A timeout returns FAILED_RECOVERABLE with a distinct message, so
           the single-owner retry bound and rescheduling apply unchanged.
         - Cancellation of THIS coroutine (shutdown) cancels the child too —
-          no leaked handler tasks.
+          no leaked handler tasks (same bounded unwind).
         """
         timeout = resolved.timeout_seconds
         if timeout is None:
@@ -1134,14 +1215,17 @@ class WorkerManager:
         try:
             _done, pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
+            # Shutdown cancelled this coroutine: cancel the child and give
+            # it a bounded unwind — the old unbounded ``await task`` was
+            # itself an un-cancellable shutdown hang for resistant
+            # handlers. Whether or not the child unwinds, the shutdown
+            # cancellation propagates.
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            await self._await_child_unwind(task, context=context)
             raise
         if pending:
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task  # cleanup completes; nothing keeps running
+            unwound = await self._await_child_unwind(task, context=context)
             logger.warning(
                 "task execution timed out",
                 extra={
@@ -1151,11 +1235,41 @@ class WorkerManager:
                     "outcome": "task_timeout",
                 },
             )
-            return TaskOutcome(
-                TaskStatus.FAILED_RECOVERABLE,
-                message=f"task execution timed out after {timeout}s",
-            )
+            message = f"task execution timed out after {timeout}s"
+            if not unwound:
+                message += "; handler ignored cancellation and was abandoned"
+            return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message=message)
         return task.result()  # handler exceptions keep their identity
+
+    async def _await_child_unwind(
+        self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
+    ) -> bool:
+        """Bounded wait for a CANCELLED handler child to unwind.
+
+        Returns True when the child finished (cancelled or otherwise);
+        False when it ignored cancellation within the grace period — the
+        child is then strongly referenced (never garbage-collected
+        mid-run), reported, and abandoned. A real handler exception that
+        escaped during unwinding keeps propagating, exactly as the old
+        ``await task`` did.
+        """
+        await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        if task.done():
+            if not task.cancelled():
+                task.result()  # retrieve: an escaped exception propagates as before
+            return True
+        self._abandoned_handlers.add(task)
+        task.add_done_callback(self._abandoned_handlers.discard)
+        logger.warning(
+            "handler ignored cancellation; abandoned (it may still be running)",
+            extra={
+                "account_id": context.account_id,
+                "task_id": context.task_id,
+                "operation": "task.execute",
+                "outcome": "handler_uncancellable",
+            },
+        )
+        return False
 
     async def _handle_account_fatal_after(
         self,
