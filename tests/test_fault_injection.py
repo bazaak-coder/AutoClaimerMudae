@@ -297,26 +297,37 @@ async def test_db_write_failure_keeps_row_restart_recoverable(tmp_path: Path) ->
     harness = FaultHarness(tmp_path)
     harness.build(accounts=(ACCOUNT,))
     await harness.store.open()
-    original = harness.store.record_success
-    injected = [1]
+    write_attempts = [0]
 
-    async def flaky_success(instance_id: int, outcome: TaskOutcome, **kwargs: Any) -> Any:
-        if injected[0] > 0:
-            injected[0] -= 1
-            raise DatabaseBusyError("database is locked (injected)")
-        return await original(instance_id, outcome, **kwargs)
+    # Review finding: the old flaky-once injection was fully absorbed by
+    # ERR-005's bounded retry (row faked to SUCCEEDED) and the RUNNING
+    # poll exited on the first mid-handler read — both assertions passed
+    # vacuously. Fail EVERY outcome write: the row must stay honestly
+    # running after the retry window, and the restart must re-execute.
+    async def always_busy_success(instance_id: int, outcome: TaskOutcome, **kwargs: Any) -> Any:
+        write_attempts[0] += 1
+        raise DatabaseBusyError("database is locked (injected)")
 
-    harness.store.record_success = flaky_success  # type: ignore[method-assign]
+    harness.store.record_success = always_busy_success  # type: ignore[method-assign]
     baseline = _baseline_tasks()
     await harness.manager.start()
     try:
         deadline = asyncio.get_running_loop().time() + 3.0
         while asyncio.get_running_loop().time() < deadline:
-            row = await harness.store.get_instance_by_ids(ACCOUNT, "job")
-            if row.status is TaskInstanceState.RUNNING:
+            if harness.calls.get((ACCOUNT, "job"), 0) >= 1:
                 break
             await asyncio.sleep(0.02)
-        assert row.status is TaskInstanceState.RUNNING  # outcome lost, not faked
+        assert harness.calls.get((ACCOUNT, "job"), 0) >= 1, "handler never ran"
+        # Past ERR-005's single bounded retry (0.5s backoff): with the
+        # write still failing, the row must NOT have been faked terminal.
+        await asyncio.sleep(1.2)
+        row = await harness.store.get_instance_by_ids(ACCOUNT, "job")
+        assert row.status is TaskInstanceState.RUNNING, (
+            f"outcome faked under persistent write failure: {row.status.value}"
+        )
+        assert write_attempts[0] >= 2, (
+            f"bounded retry never engaged: {write_attempts[0]} write attempt(s)"
+        )
     finally:
         await harness.stop()
     await _assert_no_new_tasks(baseline)
@@ -343,6 +354,9 @@ async def test_db_write_failure_keeps_row_restart_recoverable(tmp_path: Path) ->
     await harness2.manager.start()
     try:
         await _wait_status(reopened, ACCOUNT, "job", TaskInstanceState.SUCCEEDED)
+        assert harness2.calls.get((ACCOUNT, "job"), 0) >= 1, (
+            "restart did not re-execute the recovered row"
+        )
     finally:
         await harness2.manager.stop()
         await reopened.close()

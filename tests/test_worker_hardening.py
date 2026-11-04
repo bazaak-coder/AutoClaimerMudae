@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 
+from autoclaimer.adapters import AccountFatalError
 from autoclaimer.audit import AuditLog
 from autoclaimer.config import parse_accounts_config, parse_app_config
 from autoclaimer.mock_adapter import MockAdapter
@@ -1883,6 +1884,44 @@ async def test_concurrent_stop_joins_teardown_not_caller(tmp_path: Path) -> None
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
+
+
+async def test_unprintable_account_fatal_still_contains(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review finding (ERR-004 class): the AccountFatalError containment
+    call still evaluated str(exc) directly — an exception whose __str__
+    raises escaped the except-block BEFORE _handle_account_fatal_after
+    ran: no disable, no fatal latch, adapter left open, row stranded
+    running (exactly what ERR-003/ERR-004 fixed on the neighbours)."""
+
+    class _UnprintableFatal(AccountFatalError):
+        def __str__(self) -> str:  # pragma: no cover - the raising path
+            raise RuntimeError("unprintable")
+
+    async def handler(context: Any) -> TaskOutcome:
+        raise _UnprintableFatal("credentials revoked")
+
+    manager, store = await _one_account_manager(tmp_path, handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            deadline = asyncio.get_running_loop().time() + 3.0
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            while asyncio.get_running_loop().time() < deadline:
+                row = await store.get_instance_by_ids(ACCOUNT, "job")
+                if row.status is TaskInstanceState.FAILED:
+                    break
+                await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED, (
+            f"unprintable fatal stranded the row: {row.status.value}"
+        )
+        assert manager.account_enabled(ACCOUNT) is False, "account never contained"
+        assert not manager._adapters, "adapter left open"  # noqa: SLF001
+    finally:
         with suppress(Exception):
             await manager.stop()
         await store.close()

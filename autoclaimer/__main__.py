@@ -79,6 +79,8 @@ async def async_main(config_path: str, accounts_path: str) -> int:
         credentials=credential_store,
         credential_store=credential_store,
         idle_interval_seconds=5.0,
+        config_path=config_path,
+        accounts_path=accounts_path,
     )
     logger.info("cli session starting", extra={"operation": "cli.start"})
     session = CliSession(

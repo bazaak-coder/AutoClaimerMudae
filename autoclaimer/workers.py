@@ -1149,7 +1149,12 @@ class WorkerManager:
                         message=f"account-fatal: {_safe_error_text(exc)}",
                     ),
                     account_id,
-                    str(exc),
+                    # Review finding (ERR-004 class): this was a bare
+                    # str(exc) — an AccountFatalError whose __str__
+                    # raises escaped the except-block BEFORE the
+                    # containment ran (account stayed enabled, adapter
+                    # open, row stranded running).
+                    _safe_error_text(exc),
                 )
                 return
             except RetryLimitExceededError as exc:

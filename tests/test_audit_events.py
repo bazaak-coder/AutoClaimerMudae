@@ -223,9 +223,11 @@ async def test_emit_failure_never_breaks_the_operation(tmp_path: Path) -> None:
 
         def failing_audit(sql: str, params: Any) -> int:
             if "audit_events" in str(sql):
+                injected_failures.append(str(sql))
                 raise sqlite3.OperationalError("audit unavailable (injected)")
             return original(sql, params)
 
+        injected_failures: list[str] = []
         store._update_sync = failing_audit  # type: ignore[method-assign]
         audit = AuditLog(store)
         try:
@@ -238,6 +240,10 @@ async def test_emit_failure_never_breaks_the_operation(tmp_path: Path) -> None:
         finally:
             store._update_sync = original  # type: ignore[method-assign]
         assert updated.status is TaskInstanceState.FAILED
+        # Review finding: prove the injection actually fired — otherwise
+        # the test passes vacuously if AuditLog.emit never reaches the
+        # patched helper.
+        assert injected_failures, "audit failure was never injected (vacuous test)"
     finally:
         await store.close()
 

@@ -1,6 +1,7 @@
 """Tests for the interactive CLI: parsing, controls, listings, shutdown."""
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -385,3 +386,81 @@ async def test_stdin_secret_reader_uses_getpass(monkeypatch: pytest.MonkeyPatch)
     value = await stdin_secret_reader("prompt: ")
     assert value == "hidden-token"
     assert seen == ["prompt: "]
+
+
+async def test_bare_reload_and_doctor_use_startup_paths_not_cwd(tmp_path: Path) -> None:
+    """Review finding: bare `reload` (and `doctor`) defaulted to CWD-
+    relative config.json/accounts.json — an operator who started with
+    explicit paths could silently validate and ADOPT an unrelated config
+    that happens to sit in the working directory. The STARTUP paths are
+    the defaults."""
+    account = 271485504361996288
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "tasks": {"alpha": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": account, "tasks": ["alpha"]}]}, app
+    )
+    registry = TaskRegistry()
+
+    async def alpha_handler(context: Any) -> RegistryOutcome:
+        return RegistryOutcome(TaskStatus.SUCCEEDED)
+
+    registry.register(
+        TaskType(
+            id="alpha",
+            description="probe",
+            validate_config=lambda c: None,
+            handler=alpha_handler,
+        )
+    )
+    (tmp_path / "config-a.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "channels": {"roll_claim": 111111111111111111},
+                "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+                "tasks": {"alpha": {"parameters": {}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "accounts-a.json").write_text(
+        json.dumps({"version": 1, "accounts": [{"id": account, "tasks": ["alpha"]}]}),
+        encoding="utf-8",
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=store,
+        limiter=RateLimiter(store=store),
+        registry=registry,
+        adapter_factory=lambda account_id: MockAdapter(),
+        config_path=str(tmp_path / "config-a.json"),
+        accounts_path=str(tmp_path / "accounts-a.json"),
+    )
+
+    async def _read(prompt: str) -> str:
+        return ""  # never used: only _cmd_reload/_cmd_doctor are invoked
+
+    session = CliSession(controller, read_line=_read, write=lambda line: None)
+    try:
+        await controller.start()
+        lines = await session._cmd_reload([])  # bare reload: startup paths
+        assert any("configuration reloaded" in line for line in lines), (
+            f"bare reload did not use the startup paths: {lines}"
+        )
+        row = await store.get_instance_by_ids(account, "alpha")
+        assert row is not None, "reload adopted something other than the startup config"
+        report = await session._cmd_doctor([])  # bare doctor: same defaults
+        assert any("configuration" in line for line in report)
+    finally:
+        await controller.shutdown()
+        await store.close()

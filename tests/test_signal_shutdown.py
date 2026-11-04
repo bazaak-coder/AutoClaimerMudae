@@ -328,3 +328,23 @@ async def test_stop_closes_adapters_and_leaks_no_worker_tasks(tmp_path: Path) ->
     assert not leaked, [t.get_name() for t in leaked]
     for account_id, adapter in adapters.items():
         assert adapter.closed, f"adapter for {account_id} not closed"
+
+
+async def test_signal_install_survives_unsupported_event_loop() -> None:
+    """Review finding (Major): add_signal_handler raises NotImplementedError
+    on Windows event loops — the unguarded install aborted CLI STARTUP
+    before the session task even ran. Installing on an unsupported loop
+    must degrade to a warning, not crash."""
+    from autoclaimer.cli import install_termination_handlers
+
+    loop = asyncio.get_running_loop()
+
+    def _unsupported(*args: object, **kwargs: object) -> None:
+        raise NotImplementedError("IocpProactorEventLoop.add_signal_handler")
+
+    loop.add_signal_handler = _unsupported  # type: ignore[method-assign]
+    try:
+        uninstall = install_termination_handlers(lambda: None)
+    finally:
+        del loop.add_signal_handler  # restore the class method
+    uninstall()  # removal is already guarded; must not raise either

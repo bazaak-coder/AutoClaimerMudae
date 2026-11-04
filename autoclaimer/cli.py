@@ -68,9 +68,18 @@ class AutoClaimerController:
         credentials: CredentialProvider | None = None,
         credential_store: SQLiteCredentialStore | None = None,
         idle_interval_seconds: float = 30.0,
+        config_path: str = "config.json",
+        accounts_path: str = "accounts.json",
     ) -> None:
         self._app_config = app_config
         self._accounts = accounts
+        # Review finding (startup-path defaults): bare `reload`/`doctor`
+        # used to fall back to CWD-relative config.json/accounts.json —
+        # an operator who started with explicit paths could silently
+        # adopt an UNRELATED config sitting in the working directory.
+        # The STARTUP paths are the defaults for both commands.
+        self._startup_config_path = config_path
+        self._startup_accounts_path = accounts_path
         # Follow-up review finding: the last SUCCESSFULLY APPLIED logging
         # settings, tracked separately from ``_app_config.logging`` — a
         # reload whose logging reconfiguration failed must retry those
@@ -255,6 +264,16 @@ class AutoClaimerController:
             suffix = f" — {message}" if message else ""
             lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
         return lines
+
+    @property
+    def default_config_path(self) -> str:
+        """Startup config path — the default for bare `reload`/`doctor`."""
+        return self._startup_config_path
+
+    @property
+    def default_accounts_path(self) -> str:
+        """Startup accounts path — the default for bare `reload`/`doctor`."""
+        return self._startup_accounts_path
 
     async def reload_config(self, config_path: str, accounts_path: str) -> list[str]:
         """Safe runtime configuration reload (roadmap item 13).
@@ -845,8 +864,8 @@ class CliSession:
         workers — read-only, with actionable hints."""
         if len(args) not in (0, 2):
             raise ValueError("usage: doctor [config.json accounts.json]")
-        config_path = args[0] if args else "config.json"
-        accounts_path = args[1] if args else "accounts.json"
+        config_path = args[0] if args else self._controller.default_config_path
+        accounts_path = args[1] if args else self._controller.default_accounts_path
         return await self._controller.doctor_report(config_path, accounts_path)
 
     async def _cmd_backup(self, args: list[str]) -> str:
@@ -863,8 +882,8 @@ class CliSession:
         """Runtime configuration reload (validated, atomic, audited)."""
         if len(args) not in (0, 2):
             raise ValueError("usage: reload [config.json accounts.json]")
-        config_path = args[0] if args else "config.json"
-        accounts_path = args[1] if args else "accounts.json"
+        config_path = args[0] if args else self._controller.default_config_path
+        accounts_path = args[1] if args else self._controller.default_accounts_path
         return await self._controller.reload_config(config_path, accounts_path)
 
     async def _cmd_audit(self, args: list[str]) -> list[str]:
@@ -1018,5 +1037,16 @@ def install_termination_handlers(
                 pass
 
     for sig in signals:
-        loop.add_signal_handler(sig, _handle, sig)
+        try:
+            loop.add_signal_handler(sig, _handle, sig)
+        except (NotImplementedError, RuntimeError):
+            # Review finding (Major): Windows event loops do not support
+            # loop-level signal handlers — the unguarded install aborted
+            # CLI STARTUP before the session task even ran. Degrade to
+            # the platform default (Ctrl+C still interrupts the runner).
+            logger.warning(
+                "event loop does not support signal handlers (%s); using platform default handling",
+                sig.name,
+                extra={"operation": "signal", "outcome": "handler_unsupported"},
+            )
     return uninstall

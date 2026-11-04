@@ -1069,13 +1069,17 @@ async def test_import_phase1_off_event_loop(tmp_path: Path) -> None:
                 beats.append(loop.time())
                 await asyncio.sleep(0.005)
 
+        loop = asyncio.get_running_loop()
+        start = loop.time()  # covers blocking BEFORE the first beat
         hb = asyncio.create_task(heartbeat())
         imported, _ = await target.import_ciphertext(bundle)
         stop.set()
         await hb
+        end = loop.time()  # covers blocking AFTER the last beat
         assert imported == 2000
         assert len(beats) > 10, f"event loop stalled during import (only {len(beats)} heartbeats)"
-        gaps = [later - earlier for earlier, later in zip(beats, beats[1:], strict=False)]
+        markers = [start, *beats, end]
+        gaps = [later - earlier for earlier, later in zip(markers, markers[1:], strict=False)]
         worst = max(gaps, default=0.0)
         assert worst < 0.2, f"event loop stalled during import (longest heartbeat gap {worst:.3f}s)"
     finally:
