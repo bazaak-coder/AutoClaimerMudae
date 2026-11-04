@@ -1,0 +1,64 @@
+name: Security
+
+# Dependency vulnerability scanning, split from ci.yml (workflow-
+# structure recommendation 2026-11-05): PRs and pushes keep the
+# any-known-vulnerability-fails gate, and the WEEKLY schedule catches
+# advisories published against versions the lockfile already ships
+# (roadmap item 16: never silently accept known vulnerabilities).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+# Recommendation B: obsolete runs on superseded PR commits are
+# cancelled instead of consuming Actions minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: Dependency security audit
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          # Recommendation D: no authenticated Git operations here
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6.4.0
+
+      - name: Export locked requirements (production + dev/test extras)
+        # --locked fails the job when uv.lock is out of sync with
+        # pyproject.toml (roadmap item 16: keep lockfiles synchronized).
+        run: uv export --locked --all-extras --no-emit-project -o requirements.txt
+
+      - name: pip-audit (all known vulnerabilities fail the job)
+        # Policy: ANY known vulnerability in ANY scanned dependency
+        # (production and development) fails this job. Intentional
+        # exceptions are EXPLICIT and must carry a reason + expiry:
+        # append `--ignore-vuln GHSA-XXXX-XXXX-XXXX` below with a
+        # comment, and link the analysis in the PR that adds it.
+        #
+        # Review finding: pip-audit HONORS environment markers —
+        # platform/python-gated pins (tzdata on win32, colorama on
+        # win32, audioop-lts on 3.13+) were silently skipped on this
+        # Linux runner. The policy is every LOCKED version (uv 0.13 has
+        # no --all-platforms export), so strip the markers in place;
+        # name==version and --hash stay untouched.
+        run: |
+          sed -Ei 's/ ; [^\\]*\\$/ \\/' requirements.txt
+          uvx pip-audit \
+            --disable-pip \
+            --require-hashes \
+            -r requirements.txt

@@ -1,0 +1,31 @@
+# Dependabot configuration (workflow-structure recommendation
+# 2026-11-05). Dependency VERSION updates on top of the vulnerability
+# gate in security.yml.
+#
+# Note on github-actions updates: workflow actions are pinned to SHAs
+# and verified against .github/workflows/actions.lock — every Dependabot
+# action bump must be followed by `gh actions-lock` (regenerating the
+# lockfile) in the same PR, or the "Verify actions lockfile" job fails.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps(dev)"
+    labels:
+      - dependencies
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions

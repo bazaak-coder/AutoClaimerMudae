@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Static analysis of OUR source (workflow-structure recommendation,
+# third round): dependency auditing checks known vulnerable PACKAGES;
+# CodeQL looks for weakness classes in the code itself — they
+# complement each other. GitHub-native only (no third-party scanner
+# pile): the default python suite already covers the areas that matter
+# to this project — credential handling and secret exposure, unsafe
+# deserialization and file handling, SQL construction at the
+# persistence boundary, improper exception handling, and external
+# input flowing into sensitive operations. (Escalation path if ever
+# needed: the `security-extended` query suite.)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, offset from the dependency audit (06:00 Monday) so the
+    # two scans do not share a minute.
+    - cron: "2 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL analyze (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # SARIF upload requires security-events: write.
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.39.2
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4.39.2
+        # v4.39.3 deliberately NOT pinned: released hours before this
+        # workflow was written (gh actions-lock flagged it); the settled
+        # previous patch is pinned instead — let fresh releases breathe.
