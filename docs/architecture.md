@@ -112,7 +112,7 @@ actually reach the operations they configure.
 
 ## Persistence
 
-One SQLite database (`state.db`), schema **v5**, migrated step-by-step at open
+One SQLite database (`state.db`), schema **v7**, migrated step-by-step at open
 (each migration is a single transaction; post-migration shape verification
 catches tampered/foreign schemas):
 
