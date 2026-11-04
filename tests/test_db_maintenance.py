@@ -137,7 +137,13 @@ async def test_backup_waits_for_open_transaction_on_own_connection(
     rejects VACUUM INTO there ("cannot VACUUM from within a
     transaction"). The backup must therefore serialize on the store's
     async lock (like every other operation) and run AFTER the commit,
-    not race the window between the transaction's guarded calls."""
+    not race the window between the transaction's guarded calls.
+
+    Companion to test_backup_serializes_with_an_active_transaction
+    (which covers a SEPARATE connection — the busy-timeout path). This
+    one pins the same-connection lock serialization: another coroutine
+    requests the backup while transaction() holds the store lock, and
+    the backup must wait for the COMMIT and capture its effects."""
     import asyncio
 
     store = await _seeded(tmp_path)
@@ -157,6 +163,14 @@ async def test_backup_waits_for_open_transaction_on_own_connection(
         probe = sqlite3.connect(backup_path)
         try:
             assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            # Exact serialization proof: the backup ran AFTER the commit —
+            # it contains the transaction's row (a pre-commit snapshot or
+            # a raced copy could not).
+            task_ids = [
+                row[0]
+                for row in probe.execute("SELECT task_id FROM task_instances ORDER BY task_id")
+            ]
+            assert task_ids == ["probe", "txn_body_row"], task_ids
         finally:
             probe.close()
     finally:
