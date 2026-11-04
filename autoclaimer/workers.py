@@ -610,9 +610,7 @@ class WorkerManager:
         return self._profile_in(self._accounts, account_id)
 
     @staticmethod
-    def _profile_in(
-        accounts: AccountsConfig, account_id: int
-    ) -> AccountProfile | None:
+    def _profile_in(accounts: AccountsConfig, account_id: int) -> AccountProfile | None:
         """Profile lookup against a SPECIFIC configuration generation
         (reload race: an execution must read its account from the same
         snapshot as its task configuration)."""
