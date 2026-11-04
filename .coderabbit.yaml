@@ -1,0 +1,66 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+# Review standards mirror agents.md section 8 Phase C (independent review):
+# correctness/concurrency/cancellation, security/credentials, fragile
+# patterns, and test adequacy.
+
+language: en-US
+tone_instructions: >-
+  Engineering-grade, concise. Verify claims against the actual code; never
+  speculate about code you have not read. Clearly separate confirmed defects
+  from potential risks, with conditions and a recommended correction for
+  each finding.
+
+reviews:
+  profile: chill
+  poem: false
+  review_status: true
+  high_level_summary: true
+  changed_files_summary: true
+  estimate_code_review_effort: true
+  collapse_walkthrough: true
+  path_filters:
+    - "!uv.lock" # machine-generated resolution artifact; pyproject.toml is reviewed
+    - "!*.md" # prose docs are reviewed by humans; keep review on code
+  path_instructions:
+    - path: "autoclaimer/**/*.py"
+      instructions: |
+        - This is an asyncio framework: scrutinize cancellation semantics
+          (every post-cancel await must be bounded; distinguish external
+          cancellation from spontaneous CancelledError), concurrency
+          (check-then-act races across awaits, lock/ContextVar usage),
+          and resource cleanup (adapters, store handles, background tasks
+          — leaks on error paths).
+        - Persistence invariants: guarded state transitions, at-least-once
+          semantics, no concurrent duplicate execution of one row
+          (single-owner claim).
+        - Security: tokens/credentials must never be logged, persisted, or
+          echoed; redaction on every output path; validate untrusted input
+          at boundaries.
+        - Error boundaries: an exception (including one whose __str__
+          raises) must never escape a containment path and strand claimed
+          rows in 'running'.
+        - Prefer extending existing interfaces over new abstractions; flag
+          speculative generality and unneeded dependencies.
+    - path: "tests/**/*.py"
+      instructions: |
+        - Regression tests follow a fail-first discipline: check whether the
+          test would actually fail on the parent commit for the defect it
+          claims to cover; flag tests that cannot discriminate.
+        - Timing: async tests must use generous deadline margins (CI load)
+          and deterministic synchronization (events, not bare sleeps where
+          possible); flag real-time flakiness risks.
+        - Never weaken assertions to pass; flag tests that assert on
+          implementation details rather than the documented contract.
+    - path: ".github/workflows/**"
+      instructions: |
+        - Least-privilege permissions, pinned action SHAs, no secrets
+          exposed to untrusted code, no live Discord account actions in CI.
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "^main$"
+      - "^test/" # long-lived integration branches (e.g. test/quality-security)
+
+chat:
+  auto_reply: true
