@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -293,7 +294,10 @@ class WorkerManager:
         # handler children abandoned at cancellation — they are never
         # awaited again and must not be garbage-collected mid-run.
         self._abandoned_handlers: set[asyncio.Task[TaskOutcome]] = set()
-        # RACE-006: the in-flight stop() task a concurrent stop() joins.
+        # RACE-006 + CodeRabbit Major: the DEDICATED teardown task a
+        # concurrent stop() joins — never a CALLER's task (a caller that
+        # catches its cancellation and retries would await itself; a
+        # caller that outlives its stop() would hold the joiner hostage).
         self._stop_task: asyncio.Task[None] | None = None
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
         self._paused: set[int] = set()
@@ -522,9 +526,14 @@ class WorkerManager:
         ``settings.shutdown_timeout_seconds``) to finish; afterwards workers
         are cancelled and their instances deliberately stay ``running``
         (uncertain outcome; recovered on next start). The manager can be
-        :meth:`start`\\ ed again afterwards (restartable). Cancellation of
-        ``stop()`` itself completes the teardown and re-raises, so the
-        manager is never left half-stopped (audit B2/B3).
+        :meth:`start`\\ ed again afterwards (restartable). The teardown
+        runs as a DEDICATED task: cancelling a caller lets the teardown
+        complete in the background and the cancellation re-raises, so
+        the manager is never left half-stopped (audit B2/B3), and a
+        caller that retries after catching its own cancellation joins
+        the teardown instead of awaiting itself. Concurrent stop()\\ s
+        join the SAME dedicated task — the join ends when the TEARDOWN
+        ends, not when the first caller's task happens to end.
 
         Budget: ``timeout`` bounds the graceful drain only; the audit
         wait (≤1s), the audit-cancel grace, and each post-cancel unwind
@@ -537,25 +546,49 @@ class WorkerManager:
         shutdown flag stays set until the next :meth:`start`.
         """
         if self._stopped:
-            # RACE-006: a CONCURRENT stop() is mid-teardown — join it
-            # instead of returning while adapters are still open (the
-            # guard was check-then-act with no awaitable; the second
-            # caller returned in ~0.1ms believing teardown complete).
-            # Shielded: cancelling the second caller does not cancel the
-            # first; a completed first stop returns instantly.
-            first = self._stop_task
-            if first is not None and not first.done():
-                await asyncio.shield(first)
+            # RACE-006: a CONCURRENT stop() is mid-teardown — join the
+            # DEDICATED teardown task instead of returning while adapters
+            # are still open (the guard was check-then-act with no
+            # awaitable; the second caller returned in ~0.1ms believing
+            # teardown complete). Shielded: cancelling a joiner never
+            # cancels the teardown; the join is bounded by the teardown's
+            # own phase bounds.
+            in_flight = self._stop_task
+            if in_flight is not None and not in_flight.done():
+                await asyncio.shield(in_flight)
                 return
-            # Residual review finding (join window): the first stop is
-            # DONE but _stopped is still True — it was cancelled inside
-            # its finally, skipping adapter close and the lifecycle
-            # reset. _stopped is only cleared at the very END of the
-            # finally, so this state means INCOMPLETE teardown: run it
-            # (idempotent) instead of returning a half-stopped manager
-            # that no future stop() can ever fix.
+            # Residual review finding (join window): the teardown task is
+            # DONE but _stopped is still True — it ended without
+            # completing (killed by an unexpected BaseException in its
+            # finally). Run the idempotent remainder instead of returning
+            # a half-stopped manager no future stop() could ever fix.
+        loop = asyncio.get_running_loop()
         self._stopped = True
-        self._stop_task = asyncio.current_task()
+        self._stop_task = loop.create_task(
+            self._stop_teardown(timeout), name="autoclaimer-manager-stop"
+        )
+        self._stop_task.add_done_callback(self._teardown_finished)
+        try:
+            await asyncio.shield(self._stop_task)
+        except asyncio.CancelledError:
+            # The CALLER was cancelled. B2/B3 contract: the cancellation
+            # re-raises only AFTER the teardown completed — hold off the
+            # re-raise and keep awaiting the shielded DEDICATED task
+            # (bounded: every teardown phase is time-limited). A second
+            # cancellation during this wait is suppressed and the first
+            # re-raises; the teardown itself can never be cancelled.
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(self._stop_task)
+            raise
+
+    @staticmethod
+    def _teardown_finished(task: asyncio.Task[None]) -> None:
+        """Retrieve an unexpected teardown exception (never an
+        unretrieved-task warning); cancelled teardowns need nothing."""
+        if not task.cancelled():
+            task.exception()
+
+    async def _stop_teardown(self, timeout: float | None) -> None:
         effective_timeout = (
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )

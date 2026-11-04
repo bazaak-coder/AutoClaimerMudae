@@ -1739,13 +1739,15 @@ class _ParkedThenFastCloseAdapter(MockAdapter):
             await self.park.wait()
 
 
-async def test_second_stop_completes_interrupted_teardown(tmp_path: Path) -> None:
-    """Residual review finding (join window): a stop() cancelled while
-    suspended in its finally skipped adapter close and the lifecycle
-    reset (_stopped stays True, adapters open) — and every later stop()
-    returned INSTANTLY via the RACE-006 join, leaving the manager
-    permanently half-stopped. A later stop() must detect the dead
-    first stop and run the remaining teardown itself."""
+async def test_cancelled_stop_never_leaves_half_stopped_state(tmp_path: Path) -> None:
+    """Residual review finding (join window), superseded by the dedicated
+    teardown task: a stop() cancelled mid-teardown USED TO skip adapter
+    close and the lifecycle reset (_stopped latched True, adapters open)
+    with every later stop() returning instantly via the join — a
+    permanently half-stopped manager. The teardown now runs as a
+    dedicated, uncancellable task and the caller's cancellation handler
+    awaits its completion: the half-stopped state is structurally
+    impossible, and a later stop() is a clean full run."""
     adapter = _ParkedThenFastCloseAdapter()
     manager, store = await _idle_manager(tmp_path, adapter)
     try:
@@ -1753,18 +1755,18 @@ async def test_second_stop_completes_interrupted_teardown(tmp_path: Path) -> Non
         await asyncio.sleep(0.2)
 
         first = asyncio.create_task(manager.stop(timeout=5.0))
-        await asyncio.sleep(0.3)  # inside the finally, parked on close()
+        await asyncio.sleep(0.3)  # teardown parked on close()
         assert adapter.close_calls == 1
         first.cancel()
+        adapter.park.set()  # let the parked close finish
         with suppress(asyncio.CancelledError):
-            await first
-        assert manager._stopped is True  # noqa: SLF001 — interrupted mid-teardown
-        assert manager._adapters  # noqa: SLF001 — close was skipped
-
-        adapter.park.set()
-        await asyncio.wait_for(manager.stop(timeout=5.0), timeout=8.0)  # must not no-op
+            await first  # B2/B3: re-raises only AFTER teardown completed
 
         assert manager._stopped is False  # noqa: SLF001 — teardown completed
+        assert not manager._adapters  # noqa: SLF001
+
+        await asyncio.wait_for(manager.stop(timeout=5.0), timeout=8.0)  # clean rerun
+        assert manager._stopped is False  # noqa: SLF001
         assert not manager._adapters  # noqa: SLF001
     finally:
         with suppress(Exception):
@@ -1798,6 +1800,89 @@ async def test_no_audit_emissions_start_during_teardown(tmp_path: Path) -> None:
         pending = [t for t in manager._audit_tasks if not t.done()]  # noqa: SLF001
         assert not pending, f"audit emission(s) outlived the shutdown boundary: {len(pending)}"
     finally:
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
+
+
+# CodeRabbit Major (workers.py:556): the join must never await the CALLER's task
+
+
+async def test_stop_retry_in_same_task_does_not_self_join(tmp_path: Path) -> None:
+    """CodeRabbit Major, case 1 (self-join): _stop_task stored
+    asyncio.current_task() — a caller that CATCHES its cancellation and
+    retries stop() found ITSELF as the in-flight stop and awaited
+    itself: deadlock, teardown never finished."""
+    adapter = _ParkedThenFastCloseAdapter()
+    manager, store = await _idle_manager(tmp_path, adapter)
+    try:
+        await manager.start()
+        await asyncio.sleep(0.2)
+
+        async def stop_retry() -> None:
+            try:
+                await manager.stop(timeout=1.0)
+            except asyncio.CancelledError:
+                await manager.stop(timeout=5.0)  # the retry under test
+
+        retry_task = asyncio.create_task(stop_retry())
+        await asyncio.sleep(0.3)  # the first stop is parked INSIDE its finally
+        assert adapter.close_calls == 1
+        retry_task.cancel()  # caught INSIDE stop_retry; the retry re-enters
+
+        _done, still = await asyncio.wait({retry_task}, timeout=4.0)
+        assert not still, "stop() retry in the same task deadlocked on itself"
+        assert manager._stopped is False  # noqa: SLF001 — teardown completed
+    finally:
+        adapter.park.set()
+        # On the bug, retry_task is wedged awaiting ITSELF and a cleanup
+        # stop() would join it forever — cancel it out of the deadlock
+        # first (no-op when already done).
+        retry_task.cancel()
+        with suppress(asyncio.CancelledError, ValueError):
+            await retry_task
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
+
+
+async def test_concurrent_stop_joins_teardown_not_caller(tmp_path: Path) -> None:
+    """CodeRabbit Major, case 2 (over-long join): a concurrent stop()
+    awaited the FIRST CALLER'S TASK, not the teardown — a caller that
+    keeps running after its own stop() returns kept the joiner blocked
+    forever. The join must end when the TEARDOWN ends."""
+    release = asyncio.Event()
+    in_handler = asyncio.Event()
+
+    async def handler(context: Any) -> TaskOutcome:
+        in_handler.set()
+        await release.wait()  # cooperative: cancellation propagates
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _one_account_manager(tmp_path, handler)
+    try:
+        await manager.start()
+        await asyncio.wait_for(in_handler.wait(), timeout=3.0)
+
+        async def stop_then_live_forever() -> None:
+            await manager.stop(timeout=1.0)
+            await asyncio.sleep(3600)  # the caller outlives its stop()
+
+        first = asyncio.create_task(stop_then_live_forever())
+        await asyncio.sleep(0.3)  # first stop is mid-teardown
+        joiner = asyncio.create_task(manager.stop(timeout=5.0))
+
+        _done, still = await asyncio.wait({joiner}, timeout=4.0)
+        assert not still, "concurrent stop() joined the caller's task, not the teardown"
+        assert manager._stopped is False  # noqa: SLF001 — teardown completed
+        assert not manager._adapters  # noqa: SLF001
+    finally:
+        release.set()
+        for task in [first, joiner]:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         with suppress(Exception):
             await manager.stop()
         await store.close()
