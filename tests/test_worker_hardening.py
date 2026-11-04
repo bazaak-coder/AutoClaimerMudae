@@ -735,3 +735,79 @@ async def test_fatal_containment_survives_record_failure(tmp_path: Path) -> None
     finally:
         await manager.stop()
         await real_store.close()
+
+
+# CLOSURE-002: a handler-authored CancelledError must not kill the worker
+
+
+async def test_handler_authored_cancel_does_not_kill_worker(tmp_path: Path) -> None:
+    """CLOSURE-002: a handler raising CancelledError ITSELF (not manager
+    shutdown — e.g. it awaited a child task it cancelled via its own
+    timeout logic) re-raised as if it were shutdown: the account worker
+    died silently (_worker_finished ignores cancelled) and the account's
+    OTHER rows stranded pending with no executor while the manager kept
+    running. Shutdown-authored cancellation (flag set) still propagates."""
+    order: list[str] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        order.append(context.task_id)
+        if context.task_id == "victim":
+            raise asyncio.CancelledError  # handler-authored, NOT shutdown
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"victim": {"parameters": {}}, "queued": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["victim", "queued"]}]},
+        app,
+    )
+    registry = TaskRegistry()
+    for task_id in ("victim", "queued"):
+        registry.register(
+            TaskType(
+                id=task_id,
+                description="probe",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            queued = await store.get_instance_by_ids(ACCOUNT, "queued")
+            if queued.status is TaskInstanceState.SUCCEEDED:
+                break
+            await asyncio.sleep(0.02)
+        assert queued.status is TaskInstanceState.SUCCEEDED, (
+            f"account worker died on a handler-authored cancellation; "
+            f"sibling row stuck {queued.status.value}"
+        )
+        victim = await store.get_instance_by_ids(ACCOUNT, "victim")
+        assert victim.status in (
+            TaskInstanceState.RUNNING,  # uncertain outcome bucket
+            TaskInstanceState.WAITING,
+            TaskInstanceState.FAILED,
+        )
+        assert not manager._shutdown.is_set()  # this was never shutdown
+    finally:
+        await manager.stop()
+        await store.close()

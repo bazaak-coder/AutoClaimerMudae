@@ -663,7 +663,28 @@ class WorkerManager:
             try:
                 await self._worker_iteration(worker)
             except asyncio.CancelledError:
-                raise  # shutdown: propagate immediately
+                if self._shutdown.is_set():
+                    raise  # shutdown: propagate immediately
+                # CLOSURE-002: a HANDLER-authored CancelledError (a
+                # handler awaiting a child task it cancelled via its own
+                # timeout logic, a library surfacing an internal cancel)
+                # is not shutdown — re-raising silently killed the whole
+                # account worker (_worker_finished ignores cancelled)
+                # and stranded the account's other rows pending with no
+                # executor. Log loudly and keep the loop alive; the
+                # interrupted attempt's row stays running (uncertain
+                # outcome; recovered at next start). stop() always sets
+                # the shutdown flag BEFORE cancelling workers, so this
+                # branch never swallows a real shutdown.
+                logger.error(
+                    "worker saw an unexpected cancellation (not shutdown); continuing",
+                    extra={
+                        "account_id": worker.account_id,
+                        "operation": "worker.loop",
+                        "outcome": "unexpected_cancel",
+                    },
+                )
+                continue
             except Exception:
                 # A transient store/limiter failure must not silently kill
                 # the account worker; log with context and back off one
