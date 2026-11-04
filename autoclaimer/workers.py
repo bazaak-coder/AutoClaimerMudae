@@ -850,6 +850,26 @@ class WorkerManager:
         async with self._execution_slots:
             if self._shutdown.is_set():
                 return  # not claimed yet: instance stays pending
+            # RACE-002: the iteration-top gate is stale by now — an
+            # active account cooldown can park wait_scopes for minutes,
+            # and a disable/pause/config-removal landing in that window
+            # must stop the claim (row stays pending; pause semantics),
+            # exactly like shutdown above.
+            if (
+                self._globally_paused
+                or not self._enabled.get(account_id, False)
+                or account_id in self._paused
+            ):
+                logger.info(
+                    "account gated while awaiting execution; not claiming",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "gated_before_claim",
+                    },
+                )
+                return
             try:
                 claimed = await self._store.claim(record.id)
                 await self._audit.emit(

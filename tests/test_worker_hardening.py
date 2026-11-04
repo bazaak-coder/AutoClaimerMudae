@@ -811,3 +811,86 @@ async def test_handler_authored_cancel_does_not_kill_worker(tmp_path: Path) -> N
     finally:
         await manager.stop()
         await store.close()
+
+
+# RACE-002: a disable landing between the iteration gate and the claim
+
+
+class _ParkingScopesLimiter(RateLimiter):
+    """wait_scopes parks on an event once — the gate->claim window."""
+
+    def __init__(self, store: TaskStateStore) -> None:
+        super().__init__(store=store)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait_scopes(self, account_id: int) -> None:  # type: ignore[override]
+        if not self.release.is_set():
+            self.entered.set()
+            await self.release.wait()
+        await super().wait_scopes(account_id)
+
+
+async def test_disable_during_wait_scopes_stops_the_claim(tmp_path: Path) -> None:
+    """RACE-002: the account gate is checked ONCE at the iteration top;
+    a disable/pause landing while the worker is inside wait_scopes (an
+    active account cooldown can park it for minutes) was never re-checked
+    — the row was claimed and executed AFTER the operator disabled the
+    account. The in-slot re-check (previously shutdown-only) must cover
+    the full gate predicate."""
+    executions: list[int] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        executions.append(context.account_id)
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    limiter = _ParkingScopesLimiter(store)
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=limiter,
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        await asyncio.wait_for(limiter.entered.wait(), timeout=3.0)  # in wait_scopes
+
+        manager.set_account_enabled(ACCOUNT, False)  # operator disables NOW
+        limiter.release.set()
+        await asyncio.sleep(0.5)
+
+        assert executions == [], f"disabled account's row was claimed/executed: {executions}"
+        row = await store.get_instance_by_ids(ACCOUNT, "job")
+        assert row.status is TaskInstanceState.PENDING, (
+            f"row claimed despite disable: {row.status.value} "
+            f"(attempts={row.attempt_count})"
+        )
+    finally:
+        await manager.stop()
+        await store.close()
