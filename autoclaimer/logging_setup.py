@@ -111,14 +111,16 @@ def setup_logging(
     reconfiguration leaves the previous, working logging in place.
     """
     logger = logging.getLogger(logger_name)
-    logger.setLevel(settings.level.upper())
 
     formatter = StructuredRedactingFormatter(
         fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
-    # Construct FIRST: an OSError here must not have removed anything.
+    # Construct FIRST: an OSError here must not have removed anything —
+    # and the level is only applied once the new configuration is
+    # certain to take effect (a failed reload used to keep the old
+    # handlers but apply the NEW level, silently filtering records).
     log_path = Path(settings.log_file)
     if log_path.parent and not log_path.parent.exists():
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +131,7 @@ def setup_logging(
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+    logger.setLevel(settings.level.upper())
 
     for handler in list(logger.handlers):
         logger.removeHandler(handler)

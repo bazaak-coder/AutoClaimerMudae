@@ -205,9 +205,22 @@ _RATELIMIT_KEYS = {
 def _duration(value: Any, where: str, *, minimum: float = 0.0) -> float:
     # bool is a subclass of int, so explicitly reject it; accept int or
     # float — but never NaN/Infinity (JSON parsers accept both).
-    if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
-        raise ConfigValidationError(f"{where} must be a finite number >= {minimum}.")
-    return float(value)
+    # Sibling of the _optional_timeout finding: math.isfinite float-
+    # CONVERTS its input, so an oversized int escaped as OverflowError
+    # instead of ConfigValidationError — and the trailing float() would
+    # overflow the same way. Finite-check floats only (no conversion);
+    # convert inside a clean-error guard.
+    message = f"{where} must be a finite number >= {minimum}."
+    if type(value) not in (int, float):
+        raise ConfigValidationError(message)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigValidationError(message)
+    if value < minimum:
+        raise ConfigValidationError(message)
+    try:
+        return float(value)
+    except OverflowError:
+        raise ConfigValidationError(f"{where} is too large to represent.") from None
 
 
 def _jitter_pair(value: Any) -> tuple[float, float]:

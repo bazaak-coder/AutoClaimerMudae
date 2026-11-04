@@ -546,7 +546,14 @@ class WorkerManager:
             first = self._stop_task
             if first is not None and not first.done():
                 await asyncio.shield(first)
-            return
+                return
+            # Residual review finding (join window): the first stop is
+            # DONE but _stopped is still True — it was cancelled inside
+            # its finally, skipping adapter close and the lifecycle
+            # reset. _stopped is only cleared at the very END of the
+            # finally, so this state means INCOMPLETE teardown: run it
+            # (idempotent) instead of returning a half-stopped manager
+            # that no future stop() can ever fix.
         self._stopped = True
         self._stop_task = asyncio.current_task()
         effective_timeout = (
@@ -645,9 +652,25 @@ class WorkerManager:
             # Adapters close in the finally: outer cancellation of stop()
             # must never leak live clients (N1). Adapter close() is
             # idempotent, so a retried stop() is harmless.
-            for adapter in list(self._adapters.values()):
+            # Residual review finding (unbounded close): each close is
+            # bounded by the shutdown budget — a hung close() previously
+            # hung stop() (and every RACE-006 joiner with it). A timed-
+            # out close is abandoned with a report; the idempotent retry
+            # semantics above cover a later stop().
+            for account_id, adapter in list(self._adapters.items()):
                 try:
-                    await adapter.close()
+                    await asyncio.wait_for(adapter.close(), timeout=effective_timeout)
+                except TimeoutError:
+                    logger.warning(
+                        "adapter close timed out (account %s) after %ss; abandoned",
+                        account_id,
+                        effective_timeout,
+                        extra={
+                            "operation": "manager.stop",
+                            "outcome": "adapter_close_timeout",
+                            "account_id": account_id,
+                        },
+                    )
                 except Exception:
                     logger.exception("adapter close failed during shutdown")
             self._adapters.clear()
@@ -1748,7 +1771,14 @@ class WorkerManager:
         Review nit: the loop check runs BEFORE the coroutine is created —
         the old ensure_future-in-try created the coroutine first and
         abandoned it (RuntimeWarning: never awaited) on the no-loop path.
+
+        Residual review finding (LOW-033 window): an emission enqueued
+        mid-teardown runs AFTER stop()'s bounded audit drain and can
+        outlive the shutdown boundary — control events fired during
+        teardown are skipped (emission is auxiliary best-effort).
         """
+        if self._stopped:
+            return  # teardown in progress: no new background emissions
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

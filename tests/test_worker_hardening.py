@@ -1635,3 +1635,169 @@ async def test_ignored_cancellation_timeout_is_permanent_not_retried(
         with suppress(Exception):
             await manager.stop()
         await store.close()
+
+
+# Residual review follow-ups: hung adapter close, interrupted stop, teardown emissions
+
+
+class _HungCloseAdapter(MockAdapter):
+    """close() never completes — a hung adapter teardown."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        await asyncio.Event().wait()
+
+
+async def _idle_manager(
+    tmp_path: Path, adapter: MockAdapter
+) -> tuple[WorkerManager, TaskStateStore]:
+    """One-account manager with a no-op task and a custom adapter."""
+
+    async def handler(context: Any) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "task_defaults": {"retry_limit": 0},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(id="job", description="probe", validate_config=lambda c: None, handler=handler)
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: adapter,
+        idle_interval_seconds=0.05,
+    )
+    return manager, store
+
+
+async def test_stop_bounded_with_hung_adapter_close(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Residual review finding (unbounded close): a hung adapter.close()
+    hung stop() forever (the RACE-006 join inherits it). The close is
+    bounded by the shutdown budget and reported, never awaited forever."""
+    adapter = _HungCloseAdapter()
+    manager, store = await _idle_manager(tmp_path, adapter)
+    try:
+        with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
+            await manager.start()
+            await asyncio.sleep(0.2)  # adapter in use
+
+            stop_task = asyncio.create_task(manager.stop(timeout=0.3))
+            _done, still = await asyncio.wait({stop_task}, timeout=4.0)
+        assert not still, "stop() hung on an adapter close() that never returns"
+        assert any("adapter close" in r.getMessage() for r in caplog.records), (
+            "the timed-out adapter close was not reported"
+        )
+        assert manager._stopped is False  # noqa: SLF001 — teardown completed
+    finally:
+        # On the bug, stop() hangs on the adapter close AND the RACE-006
+        # join makes a second stop() hang with it — cancel the stop task
+        # directly (cancelling the close await) instead of re-stopping.
+        for task in list(asyncio.all_tasks()):
+            if task is not asyncio.current_task() and not task.done():
+                coro = task.get_coro()
+                if "stop" in repr(coro):
+                    task.cancel()
+        await asyncio.sleep(0.05)
+        await store.close()
+
+
+class _ParkedThenFastCloseAdapter(MockAdapter):
+    """close() parks once (until released), then completes; later calls
+    complete immediately — the deterministic window for interrupting a
+    stop() INSIDE its finally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.park = asyncio.Event()
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            await self.park.wait()
+
+
+async def test_second_stop_completes_interrupted_teardown(tmp_path: Path) -> None:
+    """Residual review finding (join window): a stop() cancelled while
+    suspended in its finally skipped adapter close and the lifecycle
+    reset (_stopped stays True, adapters open) — and every later stop()
+    returned INSTANTLY via the RACE-006 join, leaving the manager
+    permanently half-stopped. A later stop() must detect the dead
+    first stop and run the remaining teardown itself."""
+    adapter = _ParkedThenFastCloseAdapter()
+    manager, store = await _idle_manager(tmp_path, adapter)
+    try:
+        await manager.start()
+        await asyncio.sleep(0.2)
+
+        first = asyncio.create_task(manager.stop(timeout=5.0))
+        await asyncio.sleep(0.3)  # inside the finally, parked on close()
+        assert adapter.close_calls == 1
+        first.cancel()
+        with suppress(asyncio.CancelledError):
+            await first
+        assert manager._stopped is True  # noqa: SLF001 — interrupted mid-teardown
+        assert manager._adapters  # noqa: SLF001 — close was skipped
+
+        adapter.park.set()
+        await asyncio.wait_for(manager.stop(timeout=5.0), timeout=8.0)  # must not no-op
+
+        assert manager._stopped is False  # noqa: SLF001 — teardown completed
+        assert not manager._adapters  # noqa: SLF001
+    finally:
+        with suppress(Exception):
+            await manager.stop(timeout=5.0)
+        await store.close()
+
+
+async def test_no_audit_emissions_start_during_teardown(tmp_path: Path) -> None:
+    """Residual review finding (LOW-033 window): a sync control call
+    racing stop() enqueued an audit emission AFTER the bounded audit
+    drain — the emission outlived the shutdown boundary. Teardown-time
+    emissions are skipped (auxiliary best-effort by contract)."""
+    sink = _BlockedAuditSink()
+
+    async def handler(context: Any) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    manager, store = await _idle_manager(tmp_path, MockAdapter())
+    manager._audit = AuditLog(sink)  # noqa: SLF001 — the sink under test
+    try:
+        await manager.start()
+        # Replace the handler parking: stop is kept busy by a worker that
+        # finishes slowly so the control call lands mid-teardown.
+        await asyncio.sleep(0.1)
+        stop_task = asyncio.create_task(manager.stop(timeout=2.0))
+        await asyncio.sleep(0.05)  # stop is inside its drain phases
+        manager.pause_account(ACCOUNT)  # sync control plane, mid-teardown
+        _done, still = await asyncio.wait({stop_task}, timeout=5.0)
+        assert not still, "stop() did not complete"
+
+        pending = [t for t in manager._audit_tasks if not t.done()]  # noqa: SLF001
+        assert not pending, f"audit emission(s) outlived the shutdown boundary: {len(pending)}"
+    finally:
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()
