@@ -134,7 +134,10 @@ jobs:
           python -m venv /tmp/wheel-check
           /tmp/wheel-check/bin/pip install --quiet dist/*.whl
           /tmp/wheel-check/bin/pip check
-          /tmp/wheel-check/bin/python -c \
+          # -I (isolated mode): running from the repo root would put the
+          # CHECKOUT ahead of the installed wheel on sys.path and an
+          # incomplete wheel would pass by importing the source tree.
+          /tmp/wheel-check/bin/python -I -c \
             "import autoclaimer, autoclaimer.cli, autoclaimer.mudae_parser; print('import-ok')"
 
   verify-actions-lockfile:
