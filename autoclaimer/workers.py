@@ -663,19 +663,22 @@ class WorkerManager:
             try:
                 await self._worker_iteration(worker)
             except asyncio.CancelledError:
-                if self._shutdown.is_set():
-                    raise  # shutdown: propagate immediately
+                # An EXTERNAL cancel (stop()'s drain or budget-timeout —
+                # both set the shutdown flag first; a direct task.cancel()
+                # as in the dead-worker replacement test) is real: the
+                # delivering task's cancelling() count is nonzero.
+                if self._shutdown.is_set() or asyncio.current_task().cancelling():
+                    raise  # shutdown / external cancellation: propagate
                 # CLOSURE-002: a HANDLER-authored CancelledError (a
                 # handler awaiting a child task it cancelled via its own
                 # timeout logic, a library surfacing an internal cancel)
-                # is not shutdown — re-raising silently killed the whole
-                # account worker (_worker_finished ignores cancelled)
-                # and stranded the account's other rows pending with no
-                # executor. Log loudly and keep the loop alive; the
-                # interrupted attempt's row stays running (uncertain
-                # outcome; recovered at next start). stop() always sets
-                # the shutdown flag BEFORE cancelling workers, so this
-                # branch never swallows a real shutdown.
+                # is spontaneous — cancelling() is zero. Re-raising it
+                # silently killed the whole account worker
+                # (_worker_finished ignores cancelled) and stranded the
+                # account's other rows pending with no executor. Log
+                # loudly and keep the loop alive; the interrupted
+                # attempt's row stays running (uncertain outcome;
+                # recovered at next start).
                 logger.error(
                     "worker saw an unexpected cancellation (not shutdown); continuing",
                     extra={
