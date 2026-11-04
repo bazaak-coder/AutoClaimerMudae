@@ -749,3 +749,86 @@ async def test_inflight_execution_keeps_its_retry_limit_generation(
         assert len(calls) == 2, calls  # limit 1 = initial attempt + one retry
     finally:
         await controller.shutdown()
+
+
+# --- RACE-001: a reload racing stop() must not spawn a ghost worker ---
+
+
+class _ParkingCreateStore:
+    """Real-store delegation; create_instance parks on an event once —
+    the window where a concurrent stop() completes while the reload is
+    mid-materialize."""
+
+    def __init__(self, inner: TaskStateStore) -> None:
+        self._inner = inner
+        self.parked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_instance(self, account_id: int, task_id: str) -> Any:
+        if task_id == "later" and not self.release.is_set():
+            self.parked.set()
+            await self.release.wait()
+        return await self._inner.create_instance(account_id, task_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def test_reload_racing_stop_spawns_no_ghost_worker(tmp_path: Path) -> None:
+    """RACE-001: reload_materialize suspended at materialize while
+    stop() COMPLETED (workers drained, flags reset) resumed afterwards
+    and spawned a live worker for a stopped manager — 20 post-stop
+    executions in the audit probe. The spawn site must be guarded like
+    the enable path (not stopped AND started)."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    parking = _ParkingCreateStore(store)
+    controller._manager._store = parking  # noqa: SLF001 — the window under test
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        executions_before = len(executions)
+        assert executions_before, "setup: at least one execution"
+
+        # give the reload something to materialize, then park it
+        _write(
+            tmp_path / "config.json",
+            _config_doc(
+                tasks={"probe": {"parameters": {}}, "later": {"parameters": {}}}
+            ),
+        )
+        _write(tmp_path / "accounts.json", _accounts_doc(tasks=("probe", "later")))
+
+        async def handler(context: TaskContext) -> TaskOutcome:
+            executions.append(asyncio.get_running_loop().time())
+            return TaskOutcome(TaskStatus.SUCCEEDED)
+
+        controller.manager._registry.register(  # noqa: SLF001
+            TaskType(
+                id="later",
+                description="Later probe.",
+                validate_config=lambda config: None,
+                handler=handler,
+            )
+        )
+        reload_task = asyncio.create_task(
+            controller.reload_config(
+                str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+            )
+        )
+        await asyncio.wait_for(parking.parked.wait(), timeout=3.0)  # mid-materialize
+
+        await controller.stop()  # completes while the reload is parked
+        parking.release.set()
+        await asyncio.wait_for(reload_task, timeout=5.0)
+
+        worker = controller.manager._workers.get(ACCOUNT)  # noqa: SLF001
+        live = worker is not None and worker.task is not None and not worker.task.done()
+        assert not live, "reload spawned a live worker after stop() completed"
+        await asyncio.sleep(0.5)
+        assert len(executions) == executions_before, (
+            f"ghost worker executed {len(executions) - executions_before} time(s) after stop"
+        )
+    finally:
+        await controller.shutdown()

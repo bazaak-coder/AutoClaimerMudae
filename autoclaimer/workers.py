@@ -466,7 +466,15 @@ class WorkerManager:
                 await self._materialize(profile.id)
                 worker = self._workers.get(profile.id)
                 if worker is None or worker.task is None or worker.task.done():
-                    self._spawn_worker(profile.id)
+                    # RACE-001: a stop() can complete while this reload is
+                    # suspended at materialize — spawning then resurrects
+                    # a worker for a STOPPED manager (the audit probe
+                    # observed 20 post-stop executions). Same guard the
+                    # enable path already applies; _start_sequence's spawn
+                    # loop runs before _started flips, so the guard lives
+                    # HERE, not in _spawn_worker.
+                    if not self._stopped and self._started:
+                        self._spawn_worker(profile.id)
         for worker in self._workers.values():
             worker.nudge()
         return notes
