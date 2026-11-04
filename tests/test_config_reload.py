@@ -558,7 +558,20 @@ async def test_removed_task_assignment_lands_in_history(tmp_path: Path) -> None:
             await asyncio.sleep(0.02)
         else:
             pytest.fail(f"retired row never failed: {record.status.value}")
-        rows = await store.task_history(record.id)
+        # The terminal state lands BEFORE its history row (the auxiliary
+        # append is a separate store call — bounded-behind by contract),
+        # so AWAIT the row instead of asserting it immediately: under
+        # parallel-worker load the gap can exceed one poll interval.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        rows: tuple[tuple[int, str, str, str], ...] = ()
+        while asyncio.get_running_loop().time() < deadline:
+            rows = await store.task_history(record.id)
+            if any(
+                status == "abandoned" and "not assigned" in message
+                for _attempt, status, message, _ts in rows
+            ):
+                break
+            await asyncio.sleep(0.02)
         assert any(
             status == "abandoned" and "not assigned" in message
             for _attempt, status, message, _ts in rows
