@@ -73,6 +73,16 @@ from .registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_error_text(error: BaseException | str) -> str:
+    """ERR-004: an exception whose ``__str__`` raises (plugin wrapping
+    lazily-evaluated state) must not break outcome messages — fall back
+    to a bounded class-name marker."""
+    try:
+        return str(error)
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
+
 _T = TypeVar("_T")
 
 _ACCOUNT_QUEUE_STATES = (TaskInstanceState.PENDING, TaskInstanceState.WAITING)
@@ -898,7 +908,7 @@ class WorkerManager:
             try:
                 outcome = await self._run_handler(context, resolved)
             except AccountFatalError as exc:
-                self._health.record_failure(account_id, exc, fatal=True)
+                self._health_failure(account_id, exc, fatal=True)
                 # Credentials dead / gateway session invalidated / CAPTCHA:
                 # fail this instance, then stop the whole account (owner
                 # policy 2026-10-28) — never retry, never continue with
@@ -916,7 +926,7 @@ class WorkerManager:
                     record,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"account-fatal: {exc}",
+                        message=f"account-fatal: {_safe_error_text(exc)}",
                     ),
                     account_id,
                     str(exc),
@@ -973,7 +983,7 @@ class WorkerManager:
                 )
                 return
             except Exception as exc:
-                self._health.record_failure(account_id, exc)
+                self._health_failure(account_id, exc)
                 logger.exception(
                     "task handler crashed",
                     extra={
@@ -987,7 +997,7 @@ class WorkerManager:
                     record.id,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"{type(exc).__name__}: {exc}",
+                        message=f"{type(exc).__name__}: {_safe_error_text(exc)}",
                     ),
                     retry_at=None,
                 )
@@ -1375,6 +1385,26 @@ class WorkerManager:
             )
             self._adapters[account_id] = adapter
         return adapter
+
+    def _health_failure(
+        self, account_id: int, error: BaseException | str, *, fatal: bool = False
+    ) -> None:
+        """ERR-004: health is OBSERVATION — an update can never break
+        execution (health.py's stated contract, previously violated at
+        the two exception-object call sites: an exception with a raising
+        ``__str__`` made the update raise INSIDE the except-block,
+        escaping the error boundary and stranding the claimed row)."""
+        try:
+            self._health.record_failure(account_id, error, fatal=fatal)
+        except Exception:
+            logger.exception(
+                "health update failed (observation only)",
+                extra={
+                    "account_id": account_id,
+                    "operation": "health.record",
+                    "outcome": "health_update_failed",
+                },
+            )
 
     def health(self) -> Mapping[int, AccountHealthSnapshot]:
         """Per-account health views for this session (roadmap item 6)."""

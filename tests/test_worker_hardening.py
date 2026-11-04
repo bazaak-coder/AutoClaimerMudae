@@ -894,3 +894,75 @@ async def test_disable_during_wait_scopes_stops_the_claim(tmp_path: Path) -> Non
     finally:
         await manager.stop()
         await store.close()
+
+
+# ERR-004: health observation must never break the error boundary
+
+
+class _UnprintableError(Exception):
+    """An exception whose __str__ raises (plugin wrapping lazy state)."""
+
+    def __str__(self) -> str:  # pragma: no cover - the defect path
+        raise RuntimeError("str() is broken")
+
+
+async def test_unprintable_handler_exception_still_records_outcome(
+    tmp_path: Path,
+) -> None:
+    """ERR-004: health.record_failure(str(exc)) was called UNGUARDED on
+    the exception object inside except-blocks — an exception whose
+    __str__ raises made the health update raise INSIDE the except block,
+    escaping the error boundary and stranding the claimed row running
+    (violates health.py's own 'callers wrap defensively' contract)."""
+
+    async def handler(context: Any) -> TaskOutcome:
+        raise _UnprintableError("boom")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=store,
+        limiter=RateLimiter(store=store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while asyncio.get_running_loop().time() < deadline:
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED, (
+            f"unprintable exception escaped the error boundary: {row.status.value}"
+        )
+        assert row.last_outcome is not None
+        assert "_UnprintableError" in row.last_outcome.message  # bounded fallback
+    finally:
+        await manager.stop()
+        await store.close()
