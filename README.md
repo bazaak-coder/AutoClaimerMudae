@@ -1,4 +1,4 @@
-# AutoClaimer — Phase 1: project foundation
+# AutoClaimer
 
 > **Application documentation:** usage, architecture, configuration,
 > credentials, and running instructions live in
@@ -6,10 +6,14 @@
 > phase log and module status table.
 
 AutoClaimer is a lightweight, standalone Python framework for configuring and
-scheduling tasks across multiple Discord accounts (targeting the Mudae bot).
-This phase implements the typed configuration layer only. It intentionally
-does not connect to Discord or execute real tasks, and `discord.py-self` is
-deliberately not a dependency yet.
+scheduling tasks across multiple Discord accounts, targeting the Mudae bot:
+configurable per-account task schedules (`$wa`-style rolling with one-shot
+claim reactions, `$mu` cooldown lookups, `$rt`/`$rtu` reset-window learning),
+a central rate limiter, durable SQLite state, and Fernet-encrypted token
+storage. The single runtime dependency is `discord.py-self` (owner-selected);
+the interactive CLI (`python -m autoclaimer`) ships with a mock-adapter demo,
+and the Mudae handlers are implemented (milestone 7) — see the package table
+below and [`docs/index.md`](docs/index.md).
 
 ## Requirements
 
@@ -17,28 +21,28 @@ deliberately not a dependency yet.
 
 ## Install development dependencies
 
-The system Python is PEP 668 externally-managed (Alpine); use a virtual
-environment. In this workspace a ready venv exists at
-`/workspace/autoclaimer-venv` (the project lives on FUSE, which cannot hold
-venv symlinks, so the venv deliberately lives outside the project tree):
+Use a project-local virtual environment (on this workspace:
+`.venv/`, gitignored). `uv` is the resolver — a `uv.lock` is committed for
+reproducible installs:
 
 ```bash
-python3 -m venv /workspace/autoclaimer-venv   # first time only
-/workspace/autoclaimer-venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv                    # first time only
+.venv/bin/pip install -e ".[dev]"        # or: uv sync --locked
 ```
 
 ## Run tests and quality gates
 
 ```bash
-V=/workspace/autoclaimer-venv/bin
+V=.venv/bin
 $V/ruff check .
 $V/ruff format --check .
 $V/mypy .
 $V/pytest
 ```
 
-A `uv.lock` is provided for reproducible resolution (`uv sync --locked` from
-a uv-managed environment, or `uv pip sync`-style workflows).
+`scripts/gates.sh` runs the same local stages with venv-resolved tools and
+honest scope notes (CI additionally runs the coverage floors, the dependency
+audit, and the actions-lockfile verification).
 
 ## Validate the sample configuration
 
@@ -329,10 +333,11 @@ it contains no evasion, probing, or rotation logic.
 
 ## Phase 6: interactive CLI and logging
 
-- **CLI** (`python -m autoclaimer`, mock-adapter demo): a command loop
-  (`start/stop`, `pause/resume` globally or per account,
-  `enable/disable <account>`, `accounts`, `tasks [state]`, `queue
-  [account]`, `cooldowns`, `errors`, `status`, `help`, `quit`). The
+- **CLI** (`python -m autoclaimer`, mock-adapter demo): an interactive
+  command loop — lifecycle and account controls, queue/status/cooldown/
+  error views, dead-letter `retry` + `history`, `audit`, runtime `reload`,
+  `integrity`/`doctor` diagnostics, `dbstats`, and `backup`. The full
+  command table lives in [`docs/running.md`](docs/running.md). The
   controller owns components and delegates every action to the worker
   manager, store, and limiter — no orchestration logic in the CLI. Input
   is validated (snowflake ids, known accounts, task states, argument
@@ -518,6 +523,22 @@ dispatcher fan-out ~145k events/s (1 subscriber) / ~80k (4 subscribers);
 SQLite claim+success cycle ~505/s; limiter run overhead ~60k ops/s;
 registry execute overhead ~665k/s. Methodology notes live in the script
 docstrings; measured values in the knowledgebase.
+
+## Development workflow
+
+- `agents.md` is the binding development standard (implementation,
+  testing policy, knowledgebase changelog flow, Git/PR rules, the
+  force-push protocol, and the credential-exfiltration boundary).
+- CI (required on every PR to `main`): lint/type/test matrix on Python
+  3.11–3.14, critical-path coverage floors, wheel build + clean-install
+  inspection, dependency vulnerability audit (every PR and weekly),
+  CodeQL analysis, and actions-lockfile verification. `main` is
+  branch-protected: PRs, required checks, and conversation resolution
+  are mandatory. Security policy: [`SECURITY.md`](SECURITY.md).
+- AI review (CodeRabbit) runs on every PR; `.coderabbit.yaml` at the
+  repo root configures it, and a local CLI pass before pushing is the
+  house practice. Dependabot keeps `uv.lock` and action references
+  current (label `dependencies`).
 
 ## Next milestone (composition root / live deployment wiring, not started)
 

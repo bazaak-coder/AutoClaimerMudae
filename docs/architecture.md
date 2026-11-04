@@ -14,7 +14,7 @@ autoclaimer/
 ├── registry.py          Task types, TaskContext, validation + dispatch
 ├── workers.py           WorkerManager, per-account loops, RateLimitedAdapter
 ├── ratelimit.py         Pacing, permits, scoped cooldowns, policy layering
-├── persistence.py       SQLite task-state store + migrations (schema v5)
+├── persistence.py       SQLite task-state store + migrations (schema v7)
 ├── credential_store.py  Fernet-encrypted token store (CredentialProvider)
 ├── credentials.py       CredentialProvider protocol
 ├── discord_adapter.py   discord.py-self adapter (events + operations)
@@ -112,7 +112,7 @@ actually reach the operations they configure.
 
 ## Persistence
 
-One SQLite database (`state.db`), schema **v5**, migrated step-by-step at open
+One SQLite database (`state.db`), schema **v7**, migrated step-by-step at open
 (each migration is a single transaction; post-migration shape verification
 catches tampered/foreign schemas):
 
