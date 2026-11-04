@@ -61,6 +61,13 @@ reviews:
     base_branches:
       - "^main$"
       - "^test/" # long-lived integration branches (e.g. test/quality-security)
+  pre_merge_checks:
+    docstrings:
+      # Disabled: the repo's bar is agents.md §3.4 — docstrings are judged
+      # by MEANINGFULNESS (contract, invariants, failure behavior), not a
+      # coverage percentage; detailed histories live in the knowledgebase
+      # changelog, not docstrings.
+      mode: "off"
 
 chat:
   auto_reply: true

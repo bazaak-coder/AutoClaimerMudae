@@ -82,6 +82,14 @@ Keep configuration, account management, scheduling, execution, persistence, logg
 
 Extend existing functionality when practical instead of duplicating it. Explain significant architectural changes in the implementation plan and document migration requirements when applicable.
 
+3.4 Docstrings and comments
+
+- Every module, class, and public function/method carries a docstring. A docstring's value is MEANINGFULNESS, not length or a coverage percentage: state the contract — purpose, non-obvious arguments, invariants, failure behavior, return semantics — never a restatement of the code. One precise sentence beats a paragraph of narration; a meaningless docstring ("returns the result") is worse than none.
+- Coverage tooling may report, but the bar is this rule. Do not chase docstring-percentage targets and do not pad docstrings to satisfy them.
+- Keep inline comments MINIMAL: they exist for the non-obvious — the WHY (invariant, ordering constraint, workaround, defect pointer), never the WHAT. Code that needs line-by-line narration should be rewritten, not commented.
+- Heavily detailed information — defect histories, root-cause analyses, alternatives considered, reproduction reasoning — belongs in the knowledgebase changelog flow (section 4), NOT in code comments. A code comment referencing a defect is a SHORT pointer (e.g. "BUG-029: gated at claim time — see knowledgebase changes/…"), never the record itself.
+- No mass rewrite: this rule governs NEW code. Reduce an existing over-commented block only when its file is next substantively touched.
+
 4. Append-Only Knowledgebase
 
 Every implementation session that changes project files must add an informative entry to the append-only knowledgebase.
