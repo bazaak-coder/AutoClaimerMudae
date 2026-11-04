@@ -709,7 +709,7 @@ async def test_fatal_containment_survives_record_failure(tmp_path: Path) -> None
     await real_store.open()
     manager = WorkerManager(
         registry=registry,
-        store=_BusyRecordStore(real_store),
+        store=cast(Any, _BusyRecordStore(real_store)),
         limiter=RateLimiter(store=real_store),
         app_config=app,
         accounts=accounts,
@@ -888,8 +888,7 @@ async def test_disable_during_wait_scopes_stops_the_claim(tmp_path: Path) -> Non
         assert executions == [], f"disabled account's row was claimed/executed: {executions}"
         row = await store.get_instance_by_ids(ACCOUNT, "job")
         assert row.status is TaskInstanceState.PENDING, (
-            f"row claimed despite disable: {row.status.value} "
-            f"(attempts={row.attempt_count})"
+            f"row claimed despite disable: {row.status.value} (attempts={row.attempt_count})"
         )
     finally:
         await manager.stop()
@@ -1019,7 +1018,7 @@ async def test_outcome_record_survives_one_busy_failure(tmp_path: Path) -> None:
     await real_store.open()
     manager = WorkerManager(
         registry=registry,
-        store=_OnceBusyRecordStore(real_store),
+        store=cast(Any, _OnceBusyRecordStore(real_store)),
         limiter=RateLimiter(store=real_store),
         app_config=app,
         accounts=accounts,
@@ -1108,7 +1107,7 @@ async def test_nudge_during_due_read_is_not_lost(tmp_path: Path) -> None:
     stale = _StaleDueStore(real_store)
     manager = WorkerManager(
         registry=registry,
-        store=stale,
+        store=cast(Any, stale),
         limiter=RateLimiter(store=real_store),
         app_config=app,
         accounts=accounts,
@@ -1211,9 +1210,7 @@ async def test_concurrent_second_stop_waits_for_first(tmp_path: Path) -> None:
         assert not stop1.done()
         stop2 = asyncio.create_task(manager.stop(timeout=30.0))
         await asyncio.sleep(0.2)
-        assert not stop2.done(), (
-            "second stop() returned while the first was still draining"
-        )
+        assert not stop2.done(), "second stop() returned while the first was still draining"
 
         release.set()
         await asyncio.wait_for(stop1, timeout=10.0)

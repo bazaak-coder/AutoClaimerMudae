@@ -784,7 +784,7 @@ async def test_reload_racing_stop_spawns_no_ghost_worker(tmp_path: Path) -> None
     controller, store = _recurring_controller(tmp_path, executions)
     await store.open()
     parking = _ParkingCreateStore(store)
-    controller._manager._store = parking  # noqa: SLF001 — the window under test
+    controller._manager._store = parking  # type: ignore[assignment]  # noqa: SLF001
     try:
         await controller.start()
         await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
@@ -794,9 +794,7 @@ async def test_reload_racing_stop_spawns_no_ghost_worker(tmp_path: Path) -> None
         # give the reload something to materialize, then park it
         _write(
             tmp_path / "config.json",
-            _config_doc(
-                tasks={"probe": {"parameters": {}}, "later": {"parameters": {}}}
-            ),
+            _config_doc(tasks={"probe": {"parameters": {}}, "later": {"parameters": {}}}),
         )
         _write(tmp_path / "accounts.json", _accounts_doc(tasks=("probe", "later")))
 
@@ -813,9 +811,7 @@ async def test_reload_racing_stop_spawns_no_ghost_worker(tmp_path: Path) -> None
             )
         )
         reload_task = asyncio.create_task(
-            controller.reload_config(
-                str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
-            )
+            controller.reload_config(str(tmp_path / "config.json"), str(tmp_path / "accounts.json"))
         )
         await asyncio.wait_for(parking.parked.wait(), timeout=3.0)  # mid-materialize
 

@@ -83,6 +83,7 @@ def _safe_error_text(error: BaseException | str) -> str:
     except Exception:
         return f"<unprintable {type(error).__name__}>"
 
+
 _T = TypeVar("_T")
 
 _ACCOUNT_QUEUE_STATES = (TaskInstanceState.PENDING, TaskInstanceState.WAITING)
@@ -689,7 +690,8 @@ class WorkerManager:
                 # both set the shutdown flag first; a direct task.cancel()
                 # as in the dead-worker replacement test) is real: the
                 # delivering task's cancelling() count is nonzero.
-                if self._shutdown.is_set() or asyncio.current_task().cancelling():
+                current = asyncio.current_task()
+                if self._shutdown.is_set() or (current is not None and current.cancelling()):
                     raise  # shutdown / external cancellation: propagate
                 # CLOSURE-002: a HANDLER-authored CancelledError (a
                 # handler awaiting a child task it cancelled via its own
