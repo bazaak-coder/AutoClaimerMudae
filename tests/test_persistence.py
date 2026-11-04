@@ -887,3 +887,39 @@ async def test_database_stats_maps_sqlite_errors(store: TaskStateStore) -> None:
     store._connection = _broken_connection  # type: ignore[assignment]  # noqa: SLF001
     with pytest.raises(PersistenceError):
         await store.database_stats()
+
+
+async def test_history_messages_are_redacted_at_write(store: TaskStateStore) -> None:
+    """Review finding: _append_history persisted raw outcome messages —
+    a credential-shaped fragment inside a handler error reached the
+    task_history table (and every later `history` CLI render) unredacted.
+    Messages must be redacted at WRITE, exactly like audit events."""
+    fake = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.FgHiJkLmNoPqRsTuVwXyZ0123456789abcd"
+    record = await seed(store)
+    await store.claim(record.id)
+    await store.record_failure(
+        record.id,
+        TaskOutcome(TaskStatus.FAILED_PERMANENT, message=f"login failed: {fake}"),
+        retry_at=None,
+    )
+    rows = await store.task_history(record.id)
+    messages = [row[2] for row in rows]
+    assert messages, "no history row was written"
+    assert not any(fake in m for m in messages), (
+        "raw credential-shaped message persisted to task_history"
+    )
+    assert any("[REDACTED-TOKEN]" in m for m in messages)
+
+
+async def test_history_row_written_for_messageless_outcome(store: TaskStateStore) -> None:
+    """Latent hole found while fixing the above: TaskOutcome.message
+    defaults to None and None[:500] raised inside _append_history's
+    auxiliary try — the history row was SILENTLY dropped for every
+    message-less terminal outcome."""
+    record = await seed(store, task_id="quiet_test")
+    await store.claim(record.id)
+    await store.record_success(record.id, TaskOutcome(TaskStatus.SUCCEEDED))
+    rows = await store.task_history(record.id)
+    assert any(row[1] == "succeeded" for row in rows), (
+        f"history row silently dropped for message-less outcome: {rows}"
+    )

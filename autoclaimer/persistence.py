@@ -50,6 +50,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+from .logging_setup import redact_text
 from .registry import TaskOutcome, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -836,7 +837,13 @@ class TaskStateStore:
         AUXILIARY by contract: any failure here is logged and swallowed —
         the task_instances outcome write is the source of truth and must
         never break because history could not be recorded.
+
+        Review finding: *message* is REDACTED at write (same filter as
+        the audit channel) — handler-authored failure text can echo
+        credential-shaped fragments, and raw text here would reach the
+        database and every later ``history`` render unredacted.
         """
+        safe_message = redact_text(str(message))[:500]
         now = _format_ts(self._clock())
         try:
             await self._run(
@@ -844,7 +851,7 @@ class TaskStateStore:
                 "INSERT INTO task_history "
                 "(instance_id, account_id, task_id, attempt, status, message, recorded_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (instance_id, account_id, task_id, attempt, status, message[:500], now),
+                (instance_id, account_id, task_id, attempt, status, safe_message, now),
             )
             await self._run(
                 self._update_sync,

@@ -1009,3 +1009,107 @@ async def test_reload_retries_logging_settings_that_failed_to_apply(
         assert not any("logging" in line and "fail" in line.lower() for line in second)
     finally:
         await controller.shutdown()
+
+
+async def test_disabled_task_does_not_starve_enabled_sibling(tmp_path: Path) -> None:
+    """Review finding (head-of-line blocking): _next_due returned the
+    first candidate regardless of task-enabled state — _execute's
+    BUG-029 gate parked one idle interval and re-selected the SAME
+    disabled row forever, so a higher-priority disabled task starved
+    every enabled sibling on the account. Selection must skip disabled
+    candidates (rows stay pending) while still sending everything else,
+    including invalid-config rows, to _execute."""
+    from datetime import datetime, timedelta
+
+    executions: dict[str, int] = {}
+
+    async def handler(context: TaskContext) -> TaskOutcome:
+        executions[context.task_id] = executions.get(context.task_id, 0) + 1
+        if context.task_id == "probe":
+            return TaskOutcome(
+                TaskStatus.FAILED_RECOVERABLE,
+                retry_at=datetime.now(UTC) + timedelta(seconds=0.05),
+                message="retry fast",
+            )
+        return TaskOutcome(
+            TaskStatus.SUCCEEDED,
+            retry_at=datetime.now(UTC) + timedelta(seconds=0.4),
+        )
+
+    def config_doc(probe_enabled: bool) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "channels": {"roll_claim": CHANNEL_A},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "task_defaults": {"retry_limit": 50},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {
+                "probe": {"priority": 10, "enabled": probe_enabled, "parameters": {}},
+                "probe2": {"parameters": {}},
+            },
+        }
+
+    app = parse_app_config(config_doc(True))
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe", "probe2"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="probe",
+            description="Fast-retrying probe.",
+            validate_config=lambda config: None,
+            handler=handler,
+            channel_role="roll_claim",
+        )
+    )
+    registry.register(
+        TaskType(
+            id="probe2",
+            description="Recurring sibling.",
+            validate_config=lambda config: None,
+            handler=handler,
+            channel_role="roll_claim",
+        )
+    )
+    store = TaskStateStore(tmp_path / "state.db")
+    controller = AutoClaimerController(
+        app_config=app,
+        accounts=accounts,
+        store=store,
+        limiter=RateLimiter(store=store),
+        registry=registry,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.02,
+    )
+    await store.open()
+    try:
+        await controller.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            if executions.get("probe2", 0) >= 1:
+                break
+            await asyncio.sleep(0.02)
+        assert executions.get("probe2", 0) >= 1, "setup: sibling never executed pre-reload"
+
+        _write(tmp_path / "config.json", config_doc(False))  # probe disabled
+        _write(
+            tmp_path / "accounts.json",
+            {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe", "probe2"]}]},
+        )
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        frozen = dict(executions)
+        await asyncio.sleep(1.5)  # several sibling rounds; probe is due every 0.05s
+
+        assert executions.get("probe", 0) == frozen.get("probe", 0), (
+            "disabled task executed after the reload"
+        )
+        assert executions.get("probe2", 0) > frozen.get("probe2", 0), (
+            "enabled sibling starved behind a higher-priority disabled row "
+            f"(probe2 executions frozen at {frozen.get('probe2', 0)})"
+        )
+    finally:
+        await controller.shutdown()
+        await store.close()

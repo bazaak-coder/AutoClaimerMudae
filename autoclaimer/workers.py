@@ -957,7 +957,25 @@ class WorkerManager:
         # SQL-side account filter: no more full-table scans per account.
         records = await self._store.due_instances(account_id)
         candidates = sorted(records, key=self._order)
-        return candidates[0] if candidates else None
+        # Review finding (head-of-line blocking): returning the first
+        # candidate regardless of task-enabled state let a disabled row
+        # park _execute's BUG-029 gate and be re-selected forever — a
+        # higher-priority/earlier disabled task starved every enabled
+        # sibling on the account. Skip DISABLED candidates here (their
+        # rows stay pending/waiting; re-enabling resumes them). Anything
+        # else — unassigned rows, unregistered types, INVALID CONFIG —
+        # still goes to _execute, which owns the terminal handling.
+        profile = self._profile(account_id)
+        for record in candidates:
+            if profile is not None and record.task_id in profile.tasks:
+                try:
+                    resolved = resolve_task_config(self._app_config, profile, record.task_id)
+                except ConfigValidationError:
+                    return record  # _execute retires it terminally
+                if not resolved.enabled:
+                    continue  # disabled: leave pending, try the sibling
+            return record
+        return None
 
     async def _soon_delay(self, account_id: int) -> float:
         """Seconds until this account's soonest retry, capped at the idle interval."""
