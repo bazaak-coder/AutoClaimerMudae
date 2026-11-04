@@ -956,3 +956,56 @@ async def test_reload_survives_logging_reconfiguration_failure(tmp_path: Path) -
         assert row is not None, "valid configuration was not adopted due to the logging failure"
     finally:
         await controller.shutdown()
+
+
+async def test_reload_retries_logging_settings_that_failed_to_apply(
+    tmp_path: Path,
+) -> None:
+    """Follow-up review finding: ``logging_changed`` compared against
+    ``_app_config.logging`` — which the failed reload had ALREADY
+    adopted — so a second reload with the same (now-applicable) logging
+    settings never retried. The last SUCCESSFULLY APPLIED settings must
+    decide, so an operator who fixes the environment (creates the
+    missing directory) and reloads the same config gets logging applied."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+
+        blocker = tmp_path / "blocker"  # a FILE where a directory is needed
+        blocker.write_text("not a directory", encoding="utf-8")
+        config = {
+            **_config_doc(tasks={"probe": {"parameters": {}}}),
+            "logging": {
+                "log_file": str(blocker / "sub" / "new.log"),
+                "level": "INFO",
+                "max_bytes": 100000,
+                "backup_count": 1,
+            },
+        }
+        _write(tmp_path / "config.json", config)
+        _write(
+            tmp_path / "accounts.json",
+            {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe"]}]},
+        )
+
+        first = await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert any("logging" in line and "fail" in line.lower() for line in first)
+
+        # The operator fixes the ENVIRONMENT, not the config: the same
+        # logging settings must now be retried and apply.
+        blocker.unlink()
+        blocker.mkdir()
+        second = await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert any("logging reconfigured" in line for line in second), (
+            f"previously-failed logging settings were not retried: {second}"
+        )
+        assert not any("logging" in line and "fail" in line.lower() for line in second)
+    finally:
+        await controller.shutdown()

@@ -71,6 +71,12 @@ class AutoClaimerController:
     ) -> None:
         self._app_config = app_config
         self._accounts = accounts
+        # Follow-up review finding: the last SUCCESSFULLY APPLIED logging
+        # settings, tracked separately from ``_app_config.logging`` — a
+        # reload whose logging reconfiguration failed must retry those
+        # settings on the next reload (they were never applied), even
+        # though the config itself was adopted.
+        self._last_applied_logging = app_config.logging
         self._store = store
         self._limiter = limiter
         self._credentials = credentials
@@ -274,7 +280,10 @@ class AutoClaimerController:
             )
         if old.settings.send_jitter_seconds != new_app.settings.send_jitter_seconds:
             restart_required.append("settings.send_jitter_seconds")
-        logging_changed = old.logging != new_app.logging
+        # Compare against the last APPLIED logging, NOT _app_config.logging:
+        # the failed reload adopted the config, so identical-looking
+        # settings must still retry (they never landed).
+        logging_changed = self._last_applied_logging != new_app.logging
 
         # Atomic adoption (single synchronous swap — no partial states).
         # Review finding: this runs BEFORE the logging reconfiguration —
@@ -290,6 +299,7 @@ class AutoClaimerController:
         if logging_changed:
             try:
                 setup_logging(new_app.logging)  # idempotent: replaces handlers
+                self._last_applied_logging = new_app.logging  # only on success
                 lines.append(f"logging reconfigured (level {new_app.logging.level})")
             except OSError as exc:
                 # setup_logging is atomic (old handlers survive a failed
