@@ -852,3 +852,27 @@ def test_cancelled_close_does_not_leak_connection(tmp_path: Path) -> None:
         gc.collect()
     leaked = [w for w in caught if "unclosed database" in str(w.message)]
     assert not leaked, f"connection(s) leaked: {leaked}"
+
+
+async def test_requeue_history_uses_pre_reset_attempt(
+    store: TaskStateStore,
+) -> None:
+    """CLOSURE-004: the requeue history row carried a hard-coded attempt
+    0 — real attempts start at 1, so operators saw a phantom '#0' in the
+    history output. The row must reference the attempt count being
+    RESET (the dead-letter's last attempt)."""
+    record = await seed(store)
+    await store.claim(record.id)  # attempt 1
+    await store.record_failure(
+        record.id,
+        TaskOutcome(TaskStatus.FAILED_PERMANENT, message="dead-lettered"),
+        retry_at=None,
+    )
+    requeued = await store.requeue_instance(record.id)
+    assert requeued.attempt_count == 0  # fresh budget
+    rows = await store.task_history(record.id)
+    requeue_rows = [r for r in rows if r[1] == "requeued"]
+    assert requeue_rows, f"no requeue history row: {rows}"
+    assert requeue_rows[0][0] == 1, (
+        f"requeue history references a phantom attempt: {requeue_rows}"
+    )

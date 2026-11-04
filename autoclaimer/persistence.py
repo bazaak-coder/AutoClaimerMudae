@@ -996,6 +996,10 @@ class TaskStateStore:
         execution history. Only terminal-failed rows are requeueable —
         live/healthy rows are a configuration error, not a retry."""
         now = _format_ts(self._clock())
+        # CLOSURE-004: capture the dead-letter's LAST attempt before the
+        # budget reset — the history row referenced a hard-coded 0, and
+        # real attempts start at 1 (operators saw a phantom '#0').
+        before = await self.get_instance(instance_id)
         changed = await self._run(
             self._update_sync,
             "UPDATE task_instances SET status = 'pending', attempt_count = 0, "
@@ -1014,7 +1018,7 @@ class TaskStateStore:
             record.id,
             record.account_id,
             record.task_id,
-            0,
+            before.attempt_count,
             "requeued",
             "manual requeue from dead-letter",
         )
