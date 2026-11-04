@@ -1040,3 +1040,115 @@ async def test_outcome_record_survives_one_busy_failure(tmp_path: Path) -> None:
     finally:
         await manager.stop()
         await real_store.close()
+
+
+# RACE-005: a nudge arriving during the due-read must survive the wait
+
+
+class _StaleDueStore:
+    """due_instances parks (once, when armed) and returns the (stale)
+    empty result — the window where a nudge for a freshly-due row lands
+    mid-read."""
+
+    def __init__(self, inner: TaskStateStore) -> None:
+        self._inner = inner
+        self.arm = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def due_instances(self, account_id: int | None = None) -> Any:
+        if self.arm and not self.release.is_set():
+            stale_result = await self._inner.due_instances(account_id)  # empty
+            self.entered.set()
+            await self.release.wait()
+            return stale_result  # STALE: predates the newly-due row
+        return await self._inner.due_instances(account_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def test_nudge_during_due_read_is_not_lost(tmp_path: Path) -> None:
+    """RACE-005: wake.clear() ran AFTER the (awaited) due-read — a nudge
+    landing while the worker was inside _next_due was wiped, and
+    _soon_delay only scans WAITING rows, so a freshly requeued PENDING
+    row waited a full idle interval despite the explicit wake (the
+    CLI `retry` path requeue+wake is the production trigger). Clearing
+    BEFORE the read lets the nudge survive into the wait."""
+    executed_at: dict[str, float] = {}
+
+    async def handler(context: Any) -> TaskOutcome:
+        executed_at[context.task_id] = asyncio.get_running_loop().time()
+        return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message="dead-letter me")
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "task_defaults": {"retry_limit": 0},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    real_store = TaskStateStore(tmp_path / "state.db")
+    await real_store.open()
+    stale = _StaleDueStore(real_store)
+    manager = WorkerManager(
+        registry=registry,
+        store=stale,
+        limiter=RateLimiter(store=real_store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=1.0,  # a lost nudge costs a full second
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            row = await real_store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED  # dead-lettered
+        stale.arm = True  # arm the stale window for the NEXT due-read
+        await asyncio.wait_for(stale.entered.wait(), timeout=5.0)  # mid-read
+
+        # The production requeue path: row -> pending + explicit wake,
+        # delivered while the worker is inside the (stale) read.
+        await real_store.requeue_instance(row.id)
+        manager.wake(ACCOUNT)
+        nudge_at = asyncio.get_running_loop().time()
+        stale.release.set()  # stale read returns: nothing due
+
+        # The requeued row must be RE-CLAIMED promptly (fresh attempt),
+        # not after the full idle interval.
+        deadline = nudge_at + 0.5  # well under the 1.0s idle interval
+        reclaimed = False
+        while asyncio.get_running_loop().time() < deadline:
+            current = await real_store.get_instance_by_ids(ACCOUNT, "job")
+            if current.attempt_count >= 1 or current.status is TaskInstanceState.RUNNING:
+                reclaimed = True
+                break
+            await asyncio.sleep(0.01)
+        assert reclaimed, (
+            "nudge delivered during the due-read was lost; the requeued row waited "
+            f"the full idle interval ({asyncio.get_running_loop().time() - nudge_at:.2f}s, "
+            f"status={current.status.value}, attempts={current.attempt_count})"
+        )
+    finally:
+        await manager.stop()
+        await real_store.close()

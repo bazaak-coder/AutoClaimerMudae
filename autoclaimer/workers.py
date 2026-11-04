@@ -725,9 +725,17 @@ class WorkerManager:
             worker.wake.clear()
             await self._wait_for_wake(worker, None)
             return
+        # RACE-005: clear the wake event BEFORE the (awaited) due-read —
+        # a nudge landing while the worker is inside _next_due (the CLI
+        # retry path's requeue+wake is the production trigger) was wiped
+        # by a clear AFTER the read, and _soon_delay only scans WAITING
+        # rows, so a freshly requeued PENDING row waited a full idle
+        # interval despite the explicit wake. Clearing first lets the
+        # nudge survive into the wait (worst case: one harmless re-poll
+        # when a record IS found).
+        worker.wake.clear()
         record = await self._next_due(worker.account_id)
         if record is None:
-            worker.wake.clear()
             await self._wait_for_wake(worker, await self._soon_delay(worker.account_id))
             return
         await self._execute(worker, record)
