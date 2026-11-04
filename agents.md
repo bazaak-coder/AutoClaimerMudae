@@ -258,6 +258,15 @@ During changes
 - Never include another contributor's unfinished changes or expose secrets.
 - Never rewrite shared history or overwrite another agent's work.
 
+Force-push protocol (owner-directed 2026-11-05)
+
+- NEVER execute a forced push automatically — not `git push --force`, `--force-with-lease`, `--force-if-includes`, nor any other remote-history rewrite — on ANY branch, including the agent's own feature branches. A forced push rewrites OBSERVED history: PR review anchors, commit references, and traceability silently break, and the merged history becomes unclear and messy.
+- If a situation appears to require one, STOP and ask the owner first. The request must state, BEFORE anything is pushed:
+  1. WHY a force push is needed — and which non-forced alternatives were tried or cannot apply (fetch-and-merge, rebase onto the remote head, `git revert`, a fresh branch carrying the work forward).
+  2. WHAT caused the divergence in the first place — the ROOT CAUSE the owner can fix (stale local ref, missed fetch, an amend/rebase of already-pushed commits, a Dependabot rebase racing a manual change), so the same situation does not recur. Symptom-masking pushes are the failure mode this rule exists to prevent.
+  3. The exact scope: branch, commits before/after, and what else is affected (open PRs, review threads, references in issues and the knowledgebase).
+- Only after explicit owner approval: use the narrowest form (`--force-with-lease` at minimum), never push `main` or any protected branch, and record the event AND its root cause in the knowledgebase changelog flow (section 4) — the history that matters most is the one explaining why history was rewritten.
+
 Useful checks:
 
 git diff --check
