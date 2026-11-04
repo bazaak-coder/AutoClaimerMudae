@@ -40,6 +40,7 @@ import json
 import logging
 import sqlite3
 import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -318,6 +319,20 @@ def _silence_task_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
+def _finalize_conn_close(conn: sqlite3.Connection) -> None:
+    """ResourceWarning audit: last-resort close for an ABANDONED
+    connection (a store dropped without a completed ``close()`` — e.g. a
+    close cancelled mid-thread-hop whose shielded task was destroyed at
+    loop teardown). Such connections previously leaked open and surfaced
+    as the CI ``unclosed database`` ResourceWarnings. Detached after
+    every successful close; a no-op on an already-closed connection.
+    Best effort — nothing can be reported usefully from this context."""
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover - destructor context
+        pass
+
+
 class TaskStateStore:
     """Async, transactional SQLite store for task-instance runtime state."""
 
@@ -345,6 +360,10 @@ class TaskStateStore:
         # the await but the tracked task keeps running; the transaction
         # cleanup drains these before rolling back.
         self._in_flight: set[asyncio.Task[Any]] = set()
+        # ResourceWarning audit (unclosed-database CI warnings): safety
+        # net armed at open, detached after a successful close. See
+        # ``_finalize_conn_close``.
+        self._conn_finalizer: Any = None  # weakref.finalize (ParamSpec generics fight mypy here)
 
     # ----- lifecycle -----
 
@@ -364,6 +383,11 @@ class TaskStateStore:
         async with self._lock:
             try:
                 self._conn = await asyncio.to_thread(_connect)
+                # ResourceWarning audit: arm the close safety net BEFORE
+                # anything can fail or be cancelled below — a store
+                # dropped without a completed close() otherwise leaks the
+                # connection (unclosed-database warnings at GC/exit).
+                self._arm_conn_finalizer(self._conn)
                 # Final-review fix: migration/verification run through
                 # the GUARDED threaded call (a raw to_thread bypassed the
                 # connection guard), and ANY failure — including
@@ -382,6 +406,7 @@ class TaskStateStore:
                     # call to drain instead of closing underneath it.
                     try:
                         await self._call_threaded(self._conn.close)
+                        self._detach_conn_finalizer()  # close landed; net not needed
                     except PersistenceError:
                         logger.exception("connection close after failed open also failed")
                     self._conn = None
@@ -395,7 +420,13 @@ class TaskStateStore:
         Final-review fix (agent-3 #3): ``_conn`` is nulled in a
         ``finally`` — a cancellation of the close await previously left
         the store holding a reference to the (thread-completed) closed
-        connection, producing misleading typed errors afterwards."""
+        connection, producing misleading typed errors afterwards.
+
+        ResourceWarning audit: a CANCELLED close leaves the shielded
+        threaded close abandoned at loop teardown — the connection
+        stayed open (CI unclosed-database warnings). The finalizer
+        safety net (armed at open) guarantees the close in that case;
+        on the normal path it is detached here, unreferenced."""
         async with self._lock:
             if self._conn is not None:
                 conn = self._conn
@@ -403,8 +434,18 @@ class TaskStateStore:
                     # Guarded (repo-sweep): an abandoned in-flight call
                     # must finish before the connection closes under it.
                     await self._call_threaded(conn.close)
+                    self._detach_conn_finalizer()  # close landed; net not needed
                 finally:
                     self._conn = None
+
+    def _arm_conn_finalizer(self, conn: sqlite3.Connection) -> None:
+        self._detach_conn_finalizer()
+        self._conn_finalizer = weakref.finalize(self, _finalize_conn_close, conn)
+
+    def _detach_conn_finalizer(self) -> None:
+        if self._conn_finalizer is not None:
+            self._conn_finalizer.detach()
+            self._conn_finalizer = None
 
     @property
     def schema_version(self) -> int:

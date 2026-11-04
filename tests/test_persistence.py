@@ -802,3 +802,53 @@ async def test_record_abandoned_survives_history_write_failure(tmp_path: Path) -
         assert "invalid task config" in row.last_outcome.message
     finally:
         await s.close()
+
+
+def test_cancelled_close_does_not_leak_connection(tmp_path: Path) -> None:
+    """ResourceWarning audit (CI 'unclosed database' warnings): a store
+    dropped without close, or a close cancelled mid-thread-hop, left the
+    connection open — at loop teardown the shielded threaded close is
+    destroyed, and the leak surfaced as an unclosed-database
+    ResourceWarning (CI attributed them to unrelated later tests). A
+    finalizer safety net must guarantee the close (at latest at
+    interpreter exit). The scenarios run on their OWN loops (a worker
+    thread) so teardown actually happens; the last references drop in
+    the MAIN thread inside the warning trap."""
+    import contextlib
+    import gc
+    import threading
+    import warnings
+
+    result: dict[str, object] = {}
+
+    def scenario() -> None:
+        async def abandoned() -> None:
+            store = TaskStateStore(tmp_path / "leak1.db")
+            await store.open()
+            result["abandoned"] = store  # keep the ref past the thread
+
+        async def cancelled() -> None:
+            store = TaskStateStore(tmp_path / "leak2.db")
+            await store.open()
+            result["cancelled_conn"] = store._conn  # noqa: SLF001
+            closer = asyncio.create_task(store.close())
+            await asyncio.sleep(0)
+            closer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await closer
+            result["cleared"] = store._conn is None  # noqa: SLF001
+
+        asyncio.run(abandoned())  # teardown destroys the store, no close
+        asyncio.run(cancelled())  # teardown destroys the abandoned shielded task
+
+    thread = threading.Thread(target=scenario)
+    thread.start()
+    thread.join(timeout=10)
+    assert result.get("cleared") is True, "close() bookkeeping did not clear"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result.clear()  # drop the last references HERE, in the trap
+        gc.collect()
+    leaked = [w for w in caught if "unclosed database" in str(w.message)]
+    assert not leaked, f"connection(s) leaked: {leaked}"
