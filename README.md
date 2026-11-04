@@ -203,14 +203,6 @@ the same `state.db` as task state (schema v5 table `account_credentials`):
   without its key is unrecoverable ciphertext, and a key without the
   database is useless. Store both with equivalent secrecy.
 
-## Discord notifications
-
-Commit messages, PRs, reviews, and comments are announced on Discord via a
-native repository webhook (Settings → Webhooks) that posts GitHub's event
-payload to the Discord `/github` endpoint as `application/json`. It is
-managed entirely in GitHub's server-side settings; no workflow files, local
-hooks, or webhook URLs exist in this repository.
-
 ## Phase 2: task registry and adapter contracts
 
 - **Task types** (`registry.TaskType`) combine a stable id, description,
