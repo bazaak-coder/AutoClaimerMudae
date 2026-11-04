@@ -33,11 +33,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 from .adapters import (
     AccountFatalError,
@@ -47,8 +48,10 @@ from .adapters import (
     PlatformAdapter,
     SentMessage,
 )
+from .audit import AuditLog
 from .config import resolve_task_config
 from .credentials import CredentialProvider
+from .health import AccountHealthMonitor, AccountHealthSnapshot
 from .models import (
     AccountProfile,
     AccountsConfig,
@@ -69,6 +72,23 @@ from .ratelimit import EffectivePolicy, RateLimiter, RetryLimitExceededError, po
 from .registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+# Post-cancellation unwind budget: a handler that suppresses
+# CancelledError cannot be force-terminated in Python — cancelled
+# children/workers get this long to unwind before being reported and
+# abandoned instead of blocking their awaiter forever.
+_CANCEL_GRACE_SECONDS: Final[float] = 1.0
+
+
+def _safe_error_text(error: BaseException | str) -> str:
+    """ERR-004: an exception whose ``__str__`` raises (plugin wrapping
+    lazily-evaluated state) must not break outcome messages — fall back
+    to a bounded class-name marker."""
+    try:
+        return str(error)
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
+
 
 _T = TypeVar("_T")
 
@@ -106,11 +126,13 @@ class RateLimitedAdapter:
         limiter: RateLimiter,
         account_id: int,
         policy: EffectivePolicy | None = None,
+        on_rate_limited: Callable[[], None] | None = None,
     ) -> None:
         self._inner = inner
         self._limiter = limiter
         self._account_id = account_id
         self._policy = policy
+        self._on_rate_limited = on_rate_limited
 
     async def _run(self, op_name: str, fn: Callable[[], Awaitable[_T]]) -> _T:
         logger.debug(
@@ -120,12 +142,20 @@ class RateLimitedAdapter:
                 "operation": op_name,
             },
         )
-        return await self._limiter.run(
-            fn,
-            account_id=self._account_id,
-            route=op_name,
-            policy=self._policy,
-        )
+        try:
+            return await self._limiter.run(
+                fn,
+                account_id=self._account_id,
+                route=op_name,
+                policy=self._policy,
+            )
+        except RetryLimitExceededError:
+            # Transport retries exhausted — most often a cooldown storm:
+            # surface the account as rate-limited (observation only; the
+            # limiter keeps owning deferral).
+            if self._on_rate_limited is not None:
+                self._on_rate_limited()
+            raise
 
     async def send_message(
         self, channel_id: int, content: str, *, on_dispatch: Callable[[], None] | None = None
@@ -192,8 +222,19 @@ class RateLimitedAdapter:
         (account, task) — where the task id is known — and hands the
         handler this view. Shares the inner client, limiter, and account
         id; only the policy differs.
+
+        BUG-031: the per-execution view is the ONLY adapter handlers ever
+        see, so it must also carry the health ``on_rate_limited`` hook —
+        dropping it made the RATE_LIMITED state unreachable from real
+        task execution.
         """
-        return RateLimitedAdapter(self._inner, self._limiter, self._account_id, policy=policy)
+        return RateLimitedAdapter(
+            self._inner,
+            self._limiter,
+            self._account_id,
+            policy=policy,
+            on_rate_limited=self._on_rate_limited,
+        )
 
 
 class _AccountWorker:
@@ -223,6 +264,7 @@ class WorkerManager:
         credentials: CredentialProvider | None = None,
         idle_interval_seconds: float = 30.0,
         wall: Callable[[], datetime] = utc_now,
+        health: AccountHealthMonitor | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -230,9 +272,33 @@ class WorkerManager:
         self._app_config = app_config
         self._accounts = accounts
         self._adapter_factory = adapter_factory
+        # Account health observation (roadmap item 6): visibility only —
+        # enforcement stays with the fatal-stop / enabled / limiter paths.
+        self._health = health if health is not None else AccountHealthMonitor()
+        # Structured audit events (roadmap item 11): auxiliary — emit
+        # failures never break the audited operation.
+        self._audit = AuditLog(store)
+        # BUG-030: accounts whose enabled flag was changed at runtime
+        # (enable/disable command, account-fatal stop). Runtime control
+        # outranks a later reload; the reload reports the shadowing
+        # instead of silently applying (or ignoring) the config value.
+        self._runtime_enabled_overrides: set[int] = set()
         self._credentials = credentials
         self._idle_interval = idle_interval_seconds
         self._wall = wall
+        # LOW-033: strong references for fire-and-forget audit emissions
+        # (the event loop holds only weak task references — an
+        # unreferenced emission can be garbage-collected mid-flight).
+        self._audit_tasks: set[asyncio.Task[None]] = set()
+        # Shutdown finding (resistant handlers): strong references for
+        # handler children abandoned at cancellation — they are never
+        # awaited again and must not be garbage-collected mid-run.
+        self._abandoned_handlers: set[asyncio.Task[TaskOutcome]] = set()
+        # RACE-006 + CodeRabbit Major: the DEDICATED teardown task a
+        # concurrent stop() joins — never a CALLER's task (a caller that
+        # catches its cancellation and retries would await itself; a
+        # caller that outlives its stop() would hold the joiner hostage).
+        self._stop_task: asyncio.Task[None] | None = None
         self._enabled: dict[int, bool] = {a.id: a.enabled for a in accounts.accounts}
         self._paused: set[int] = set()
         self._fatal_accounts: set[int] = set()
@@ -266,12 +332,40 @@ class WorkerManager:
         self._started = True
 
     async def _start_sequence(self) -> None:
+        # A stop() that abandoned resistant workers left the shutdown
+        # flag SET (zombie-resume guard) — a restart clears it up front;
+        # any zombie still executing exits at its own loop check, and
+        # its claimed row takes the documented at-least-once path.
+        self._shutdown.clear()
         await self._store.recover_interrupted()
-        # Audit fix (agents.md section 17.2.1): validate resolved task
-        # parameters against the registry BEFORE spawning workers — a
-        # deterministic configuration defect is a startup/task-config
-        # failure, never a mid-run handler crash. Fail-soft per instance:
-        # the invalid instance is abandoned; unrelated work continues.
+        await self._apply_configuration()
+        # Adopt still-active persisted cooldowns BEFORE any worker can act:
+        # server-directed deadlines must survive restarts (audit F1; a
+        # no-op when the limiter has no store attached).
+        await self._limiter.load_persisted_cooldowns()
+        # BUG-033: startup is all-or-nothing. Materialize EVERY account
+        # before the first worker spawns — every await that can fail now
+        # happens while no worker exists, so a failed start (with
+        # ``_started`` False) never leaves live workers behind. A retry
+        # would otherwise run ``recover_interrupted`` against a live
+        # worker's claimed row and execute it twice (duplicate side
+        # effects). The spawn loop itself is synchronous and cannot fail
+        # partway.
+        for account_id in list(self._enabled):
+            if self._enabled[account_id]:
+                await self._materialize(account_id)
+        for account_id in list(self._enabled):
+            if self._enabled[account_id]:
+                self._spawn_worker(account_id)
+        logger.info("framework started")
+
+    async def _apply_configuration(self) -> None:
+        """Validate the CURRENT configuration and materialize instances.
+
+        Shared by startup and runtime reload (roadmap item 13): fail-soft
+        per instance — an invalid assignment is abandoned, unrelated work
+        continues.
+        """
         for account_id in list(self._enabled):
             if not self._enabled[account_id]:
                 continue
@@ -316,7 +410,8 @@ class WorkerManager:
                     continue
                 try:
                     self._registry.validate_config(
-                        task_id, self._execution_parameters(resolved, task_id)
+                        task_id,
+                        self._execution_parameters(self._app_config, resolved, task_id),
                     )
                 except Exception as exc:
                     logger.error(
@@ -343,15 +438,86 @@ class WorkerManager:
                                 "operation": "startup.validate",
                             },
                         )
-        # Adopt still-active persisted cooldowns BEFORE any worker can act:
-        # server-directed deadlines must survive restarts (audit F1; a
-        # no-op when the limiter has no store attached).
-        await self._limiter.load_persisted_cooldowns()
+
+    def update_configuration(self, app: AppConfig, accounts: AccountsConfig) -> None:
+        """Atomically adopt a newly validated configuration (roadmap 13).
+
+        One SYNCHRONOUS method with no yield points: worker iterations
+        either see the old (app, accounts) pair or the new one — never a
+        mix. In-flight executions are generation-pinned: each captures
+        ONE (app, accounts) reference before its first await and reads
+        EVERY piece of its configuration from it — parameters, channels,
+        rate-limit policy, and retry bounds — so a swap landing between
+        the execution's awaits can never mix generations. After the
+        swap, new/changed assignments apply from the next iteration;
+        call :meth:`reload_materialize` for materialization and worker
+        spawning.
+        """
+        self._app_config = app
+        self._accounts = accounts
+
+    async def reload_materialize(self) -> list[str]:
+        """Post-swap materialization: create instances for newly assigned
+        tasks, spawn workers for newly added accounts, nudge everyone so
+        changes take effect promptly.
+
+        BUG-030: the reloaded ``enabled`` flag is AUTHORITATIVE for every
+        account the operator did not control at runtime — previously the
+        startup-time overlay won forever and the reload silently ignored
+        configuration changes. Accounts with a runtime override (explicit
+        enable/disable, account-fatal stop) keep their runtime value;
+        each shadowing is returned as an operator-facing note.
+
+        Returns notes (runtime overrides that shadowed the config).
+        """
+        notes: list[str] = []
+        for profile in self._accounts.accounts:
+            if profile.id in self._runtime_enabled_overrides:
+                runtime = self._enabled.get(profile.id, profile.enabled)
+                if runtime != profile.enabled:
+                    notes.append(
+                        f"account {profile.id}: runtime enabled={runtime} kept "
+                        f"(config enabled={profile.enabled} shadowed — "
+                        "use enable/disable to change it)"
+                    )
+                continue  # runtime control outranks the reload
+            self._enabled[profile.id] = profile.enabled
+        # BUG-032: an account REMOVED from the configuration parks its
+        # worker (the iteration gate stops all execution) WITHOUT
+        # retiring its rows — removal may be temporary and terminal
+        # retirement is irreversible. The parked worker is dormant (it
+        # waits on its wake event, not a poll loop); re-adding the
+        # account in a later reload resumes it.
+        configured_ids = {profile.id for profile in self._accounts.accounts}
         for account_id in list(self._enabled):
-            if self._enabled[account_id]:
-                await self._materialize(account_id)
-                self._spawn_worker(account_id)
-        logger.info("framework started")
+            if account_id not in configured_ids:
+                self._enabled[account_id] = False
+                # Review finding: a runtime enabled-override for a
+                # REMOVED account is stale — without this discard, a
+                # later re-add inherited an override from an era in
+                # which the account did not exist, shadowing its
+                # configured enabled state. FATAL accounts keep theirs:
+                # the fatal containment's never-revive policy outranks
+                # any re-add.
+                if account_id not in self._fatal_accounts:
+                    self._runtime_enabled_overrides.discard(account_id)
+        for profile in self._accounts.accounts:
+            if self._enabled.get(profile.id, profile.enabled):
+                await self._materialize(profile.id)
+                worker = self._workers.get(profile.id)
+                if worker is None or worker.task is None or worker.task.done():
+                    # RACE-001: a stop() can complete while this reload is
+                    # suspended at materialize — spawning then resurrects
+                    # a worker for a STOPPED manager (the audit probe
+                    # observed 20 post-stop executions). Same guard the
+                    # enable path already applies; _start_sequence's spawn
+                    # loop runs before _started flips, so the guard lives
+                    # HERE, not in _spawn_worker.
+                    if not self._stopped and self._started:
+                        self._spawn_worker(profile.id)
+        for worker in self._workers.values():
+            worker.nudge()
+        return notes
 
     async def stop(self, *, timeout: float | None = None) -> None:
         """Graceful shutdown: drain workers, then close adapters.
@@ -360,48 +526,244 @@ class WorkerManager:
         ``settings.shutdown_timeout_seconds``) to finish; afterwards workers
         are cancelled and their instances deliberately stay ``running``
         (uncertain outcome; recovered on next start). The manager can be
-        :meth:`start`\\ ed again afterwards (restartable). Cancellation of
-        ``stop()`` itself completes the teardown and re-raises, so the
-        manager is never left half-stopped (audit B2/B3).
+        :meth:`start`\\ ed again afterwards (restartable). The teardown
+        runs as a DEDICATED task: cancelling a caller lets the teardown
+        complete in the background and the cancellation re-raises, so
+        the manager is never left half-stopped (audit B2/B3), and a
+        caller that retries after catching its own cancellation joins
+        the teardown instead of awaiting itself. Concurrent stop()\\ s
+        join the SAME dedicated task — the join ends when the TEARDOWN
+        ends, not when the first caller's task happens to end.
+
+        Budget: ``timeout`` bounds the graceful drain only; the audit
+        wait (≤1s), the audit-cancel grace, and each post-cancel unwind
+        (≤ _CANCEL_GRACE_SECONDS, twice in the worst case) are additional
+        bounded phases — a pathological shutdown can take roughly
+        ``timeout + 4s`` in total. A handler that suppresses
+        CancelledError cannot be force-terminated: its worker is
+        abandoned, REPORTED (``workers_abandoned``), and — so it cannot
+        resume scheduling after its handler finally unwinds — the
+        shutdown flag stays set until the next :meth:`start`.
         """
         if self._stopped:
-            return
+            # RACE-006: a CONCURRENT stop() is mid-teardown — join the
+            # DEDICATED teardown task instead of returning while adapters
+            # are still open (the guard was check-then-act with no
+            # awaitable; the second caller returned in ~0.1ms believing
+            # teardown complete). Shielded: cancelling a joiner never
+            # cancels the teardown; the join is bounded by the teardown's
+            # own phase bounds.
+            in_flight = self._stop_task
+            if in_flight is not None and not in_flight.done():
+                await asyncio.shield(in_flight)
+                return
+            # Residual review finding (join window): the teardown task is
+            # DONE but _stopped is still True — it ended without
+            # completing (killed by an unexpected BaseException in its
+            # finally). Run the idempotent remainder instead of returning
+            # a half-stopped manager no future stop() could ever fix.
+        loop = asyncio.get_running_loop()
         self._stopped = True
+        self._stop_task = loop.create_task(
+            self._stop_teardown(timeout), name="autoclaimer-manager-stop"
+        )
+        self._stop_task.add_done_callback(self._teardown_finished)
+        try:
+            await asyncio.shield(self._stop_task)
+        except asyncio.CancelledError:
+            # The CALLER was cancelled. B2/B3 contract: the cancellation
+            # re-raises only AFTER the teardown completed — hold off the
+            # re-raise and keep awaiting the shielded DEDICATED task
+            # (bounded: every teardown phase is time-limited). A second
+            # cancellation during this wait is suppressed and the first
+            # re-raises; the teardown itself can never be cancelled.
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(self._stop_task)
+            raise
+
+    @staticmethod
+    def _teardown_finished(task: asyncio.Task[None]) -> None:
+        """Retrieve an unexpected teardown exception (never an
+        unretrieved-task warning); cancelled teardowns need nothing."""
+        if not task.cancelled():
+            task.exception()
+
+    async def _stop_teardown(self, timeout: float | None) -> None:
         effective_timeout = (
             self._app_config.settings.shutdown_timeout_seconds if timeout is None else timeout
         )
         self._shutdown.set()
+        # Post-cancel unwind budget for THIS shutdown: a worker whose
+        # handler suppresses CancelledError cannot be force-terminated —
+        # cancelled workers get this long to unwind, then the survivors
+        # are reported instead of stop() blocking on them forever.
+        cancel_grace = min(_CANCEL_GRACE_SECONDS, effective_timeout)
+        abandoned_workers: set[asyncio.Task[None]] = set()
         try:
+            # LOW-033 (review F1): bounded drain of outstanding audit
+            # emissions so control events fired just before shutdown still
+            # land. INSIDE the try: a cancellation while it waits runs the
+            # finally below (adapters closed, lifecycle reset) and then
+            # re-raises — stop()'s documented contract (audit B2/B3).
+            #
+            # Shutdown finding (audit drain): the bounded wait previously
+            # IGNORED the still-pending emissions — a blocked sink let an
+            # emission outlive the shutdown boundary (adapters closed,
+            # lifecycle reset, emission still running). Pending emissions
+            # are now cancelled and awaited (bounded); anything even
+            # cancellation cannot unwind is reported and abandoned.
+            if self._audit_tasks:
+                _done, pending_emissions = await asyncio.wait(
+                    set(self._audit_tasks), timeout=min(1.0, effective_timeout)
+                )
+                for emission in pending_emissions:
+                    emission.cancel()
+                if pending_emissions:
+                    await asyncio.wait(set(pending_emissions), timeout=cancel_grace)
+                stuck_emissions = [e for e in pending_emissions if not e.done()]
+                if stuck_emissions:
+                    logger.warning(
+                        "%d audit emission(s) ignored cancellation and are abandoned at shutdown",
+                        len(stuck_emissions),
+                        extra={
+                            "operation": "manager.stop",
+                            "outcome": "audit_emissions_abandoned",
+                        },
+                    )
             for worker in self._workers.values():
                 worker.nudge()
             tasks = [w.task for w in self._workers.values() if w.task is not None]
             if tasks:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=effective_timeout,
-                    )
-                except TimeoutError:
-                    for task in tasks:
+                # NOT wait_for(gather(...)): a worker whose handler
+                # suppresses CancelledError makes the gather un-reapable,
+                # parking stop() INSIDE wait_for before any timeout
+                # handler can run (shutdown finding: resistant handlers).
+                # asyncio.wait always returns at the deadline.
+                _done, overdue = await asyncio.wait(set(tasks), timeout=effective_timeout)
+                if overdue:
+                    for task in overdue:
                         task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # The old post-cancel gather here had no deadline —
+                    # a handler suppressing CancelledError blocked
+                    # stop() indefinitely.
+                    abandoned_workers.update(
+                        await self._drain_cancelled(list(overdue), grace=cancel_grace)
+                    )
         finally:
+            # BUG-034 (review round): a cancelled stop() can interrupt the
+            # worker drain before it ran. Nudge every worker (a gated
+            # worker — globally paused, disabled, or removed — waits on
+            # its wake event with NO timeout), then cancel any worker
+            # still alive: the interrupted drain's own cancel never
+            # reached them, and a worker re-entering its gated wait after
+            # _shutdown.clear() would park forever. Instances of
+            # cancelled mid-execution workers deliberately stay running
+            # (uncertain outcome; recovered on next start) — the same
+            # semantics as the graceful-budget timeout path above.
+            for worker in self._workers.values():
+                worker.nudge()
+            stragglers = [
+                w.task for w in self._workers.values() if w.task is not None and not w.task.done()
+            ]
+            for task in stragglers:
+                task.cancel()
+            # BUG-037: AWAIT the cancelled workers before closing adapters
+            # and resetting lifecycle state — stop() must not return while
+            # a worker is still unwinding: an immediate restart would run
+            # recover_interrupted() against the still-live worker's
+            # claimed row (duplicate-execution race). Mid-execution
+            # instances deliberately stay running (uncertain outcome;
+            # recovered on next start), matching the budget-timeout path.
+            # Shutdown finding (resistant handlers): the unbounded gather
+            # is gone — the same bounded drain runs here, and a worker
+            # that even cancellation cannot unwind is REPORTED, never
+            # silently claimed as torn down.
+            if stragglers:
+                abandoned_workers.update(
+                    await self._drain_cancelled(stragglers, grace=cancel_grace)
+                )
             # Adapters close in the finally: outer cancellation of stop()
             # must never leak live clients (N1). Adapter close() is
             # idempotent, so a retried stop() is harmless.
-            for adapter in list(self._adapters.values()):
+            # Residual review finding (unbounded close): each close is
+            # bounded by the shutdown budget — a hung close() previously
+            # hung stop() (and every RACE-006 joiner with it). A timed-
+            # out close is abandoned with a report; the idempotent retry
+            # semantics above cover a later stop().
+            for account_id, adapter in list(self._adapters.items()):
                 try:
-                    await adapter.close()
+                    await asyncio.wait_for(adapter.close(), timeout=effective_timeout)
+                except TimeoutError:
+                    logger.warning(
+                        "adapter close timed out (account %s) after %ss; abandoned",
+                        account_id,
+                        effective_timeout,
+                        extra={
+                            "operation": "manager.stop",
+                            "outcome": "adapter_close_timeout",
+                            "account_id": account_id,
+                        },
+                    )
                 except Exception:
                     logger.exception("adapter close failed during shutdown")
             self._adapters.clear()
             # Workers stay registered (their done tasks report STOPPED via
             # status()); _spawn_worker replaces finished workers on restart.
             # Reset lifecycle so the manager can be started again.
-            self._shutdown.clear()
+            # Liveness is recomputed at report time: a survivor from the
+            # try-block drain may have finished during the finally's
+            # re-cancel (its handler CHILD is then the survivor, reported
+            # below via _abandoned_handlers) — both the flag decision and
+            # the report must stay factually true.
+            still_running = [t for t in abandoned_workers if not t.done()]
+            # Review finding (zombie resume): while a worker survives,
+            # the shutdown flag STAYS SET — otherwise the survivor, once
+            # its handler finally unwinds, finds a false loop condition
+            # and RESUMES claiming and executing rows (rebuilding
+            # adapters!) against a stopped manager. Keeping it set makes
+            # the zombie exit at its next loop check instead;
+            # _start_sequence() clears it on restart.
+            if not still_running:
+                self._shutdown.clear()
             self._stopped = False
             self._started = False
+            # Do not claim a clean teardown while workers are still
+            # running: Python cannot force-terminate them, so the honest
+            # contract is a bounded stop + an explicit report (status()
+            # keeps showing them as RUNNING). Restarting while a zombie
+            # still executes its handler re-runs its claimed row
+            # (documented at-least-once duplicate window).
+            if still_running:
+                logger.warning(
+                    "framework stopped with %d worker task(s) still running "
+                    "(handler suppressed cancellation); they cannot be "
+                    "force-terminated and were abandoned",
+                    len(still_running),
+                    extra={"operation": "manager.stop", "outcome": "workers_abandoned"},
+                )
+            if self._abandoned_handlers:
+                logger.warning(
+                    "%d abandoned handler(s) are still registered and may still be running",
+                    len(self._abandoned_handlers),
+                    extra={"operation": "manager.stop", "outcome": "handlers_abandoned"},
+                )
             logger.info("framework stopped")
+
+    async def _drain_cancelled(
+        self, tasks: list[asyncio.Task[None]], *, grace: float
+    ) -> list[asyncio.Task[None]]:
+        """Bounded post-cancellation unwind wait; returns the survivors.
+
+        A cooperative worker finishes unwinding well inside the grace
+        period. One whose handler suppresses CancelledError cannot be
+        force-terminated — awaiting it unbounded would hang stop()
+        forever, so the survivors are handed back to the caller for
+        reporting.
+        """
+        if not tasks:
+            return []
+        await asyncio.wait(set(tasks), timeout=grace)
+        return [task for task in tasks if not task.done()]
 
     async def __aenter__(self) -> WorkerManager:
         await self.start()
@@ -411,6 +773,7 @@ class WorkerManager:
         await self.stop()
 
     def _spawn_worker(self, account_id: int) -> None:
+        self._health.worker_started(account_id)
         worker = self._workers.get(account_id)
         if worker is not None and worker.task is not None and not worker.task.done():
             return
@@ -455,9 +818,18 @@ class WorkerManager:
             await self._store.create_instance(account_id, task_id)
 
     def _profile(self, account_id: int) -> AccountProfile | None:
-        return next((a for a in self._accounts.accounts if a.id == account_id), None)
+        return self._profile_in(self._accounts, account_id)
 
-    def _execution_parameters(self, resolved: ResolvedTaskConfig, task_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _profile_in(accounts: AccountsConfig, account_id: int) -> AccountProfile | None:
+        """Profile lookup against a SPECIFIC configuration generation
+        (reload race: an execution must read its account from the same
+        snapshot as its task configuration)."""
+        return next((a for a in accounts.accounts if a.id == account_id), None)
+
+    def _execution_parameters(
+        self, app: AppConfig, resolved: ResolvedTaskConfig, task_id: str
+    ) -> dict[str, Any]:
         """The parameter mapping a task's validator and handler see.
 
         Global-channel integration: a task declaring a ``channel_role``
@@ -466,13 +838,15 @@ class WorkerManager:
         ``config["channel"]`` and never resolve fallbacks themselves;
         users cannot set ``channel`` anywhere (config parsing rejects
         it), so per-task values cannot defeat the global configuration.
+
+        *app* pins the configuration generation (reload race): the
+        channel is read from the SAME snapshot that resolved the
+        parameters, never from a later swap.
         """
         parameters = dict(resolved.parameters)
         task_type = self._registry.get(task_id)  # membership pre-checked by callers
         if task_type.channel_role is not None:
-            parameters["channel"] = self._app_config.channels.effective().for_role(
-                task_type.channel_role
-            )
+            parameters["channel"] = app.channels.effective().for_role(task_type.channel_role)
         return parameters
 
     # ----- worker loop -----
@@ -492,7 +866,32 @@ class WorkerManager:
             try:
                 await self._worker_iteration(worker)
             except asyncio.CancelledError:
-                raise  # shutdown: propagate immediately
+                # An EXTERNAL cancel (stop()'s drain or budget-timeout —
+                # both set the shutdown flag first; a direct task.cancel()
+                # as in the dead-worker replacement test) is real: the
+                # delivering task's cancelling() count is nonzero.
+                current = asyncio.current_task()
+                if self._shutdown.is_set() or (current is not None and current.cancelling()):
+                    raise  # shutdown / external cancellation: propagate
+                # CLOSURE-002: a HANDLER-authored CancelledError (a
+                # handler awaiting a child task it cancelled via its own
+                # timeout logic, a library surfacing an internal cancel)
+                # is spontaneous — cancelling() is zero. Re-raising it
+                # silently killed the whole account worker
+                # (_worker_finished ignores cancelled) and stranded the
+                # account's other rows pending with no executor. Log
+                # loudly and keep the loop alive; the interrupted
+                # attempt's row stays running (uncertain outcome;
+                # recovered at next start).
+                logger.error(
+                    "worker saw an unexpected cancellation (not shutdown); continuing",
+                    extra={
+                        "account_id": worker.account_id,
+                        "operation": "worker.loop",
+                        "outcome": "unexpected_cancel",
+                    },
+                )
+                continue
             except Exception:
                 # A transient store/limiter failure must not silently kill
                 # the account worker; log with context and back off one
@@ -520,12 +919,20 @@ class WorkerManager:
             worker.wake.clear()
             await self._wait_for_wake(worker, None)
             return
+        # RACE-005: clear the wake event BEFORE the (awaited) due-read —
+        # a nudge landing while the worker is inside _next_due (the CLI
+        # retry path's requeue+wake is the production trigger) was wiped
+        # by a clear AFTER the read, and _soon_delay only scans WAITING
+        # rows, so a freshly requeued PENDING row waited a full idle
+        # interval despite the explicit wake. Clearing first lets the
+        # nudge survive into the wait (worst case: one harmless re-poll
+        # when a record IS found).
+        worker.wake.clear()
         record = await self._next_due(worker.account_id)
         if record is None:
-            worker.wake.clear()
             await self._wait_for_wake(worker, await self._soon_delay(worker.account_id))
             return
-        await self._execute(record)
+        await self._execute(worker, record)
 
     async def _wait_for_wake(self, worker: _AccountWorker, timeout: float | None) -> None:
         if self._shutdown.is_set():
@@ -550,7 +957,25 @@ class WorkerManager:
         # SQL-side account filter: no more full-table scans per account.
         records = await self._store.due_instances(account_id)
         candidates = sorted(records, key=self._order)
-        return candidates[0] if candidates else None
+        # Review finding (head-of-line blocking): returning the first
+        # candidate regardless of task-enabled state let a disabled row
+        # park _execute's BUG-029 gate and be re-selected forever — a
+        # higher-priority/earlier disabled task starved every enabled
+        # sibling on the account. Skip DISABLED candidates here (their
+        # rows stay pending/waiting; re-enabling resumes them). Anything
+        # else — unassigned rows, unregistered types, INVALID CONFIG —
+        # still goes to _execute, which owns the terminal handling.
+        profile = self._profile(account_id)
+        for record in candidates:
+            if profile is not None and record.task_id in profile.tasks:
+                try:
+                    resolved = resolve_task_config(self._app_config, profile, record.task_id)
+                except ConfigValidationError:
+                    return record  # _execute retires it terminally
+                if not resolved.enabled:
+                    continue  # disabled: leave pending, try the sibling
+            return record
+        return None
 
     async def _soon_delay(self, account_id: int) -> float:
         """Seconds until this account's soonest retry, capped at the idle interval."""
@@ -566,11 +991,39 @@ class WorkerManager:
             return self._idle_interval
         return max(0.0, min((soonest - self._wall()).total_seconds(), self._idle_interval))
 
-    async def _execute(self, record: TaskInstanceRecord) -> None:
+    async def _execute(self, worker: _AccountWorker, record: TaskInstanceRecord) -> None:
         account_id = record.account_id
+        # Review F2 (BUG-032 follow-up): re-check the account gate — an
+        # iteration already past _worker_iteration's gate when a reload
+        # removed or disabled the account must PARK (no claim, no
+        # retirement), never terminally fail the row through the missing
+        # profile. Same pacing as the disabled-task gate below.
+        if not self._enabled.get(account_id, False):
+            logger.info(
+                "account disabled/removed by configuration; skipping execution",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.execute",
+                    "outcome": "account_parked",
+                },
+            )
+            worker.wake.clear()
+            await self._wait_for_wake(worker, self._idle_interval)
+            return
         # Resolve configuration BEFORE claiming: a validation failure must
         # not strand a claimed (running) row forever (audit B1).
-        profile = self._profile(account_id)
+        # Generation snapshot (reload race): ONE (app, accounts) reference
+        # captured before the first await feeds EVERY configuration read
+        # of this execution — parameters, channels, policy, retry bounds.
+        # Reading self._app_config again after the awaits (wait_scopes,
+        # slot, claim) could mix generations when a reload swaps the
+        # configuration mid-execution (old parameters on the new channel,
+        # a swapped retry bound); the captured references are immutable,
+        # so this execution stays wholly on its own generation.
+        app = self._app_config
+        accounts = self._accounts
+        profile = self._profile_in(accounts, account_id)
         if profile is None or record.task_id not in profile.tasks:
             await self._terminal_without_claim(
                 record, "task not assigned to this account in current config"
@@ -591,9 +1044,30 @@ class WorkerManager:
             )
             return
         try:
-            resolved = resolve_task_config(self._app_config, profile, record.task_id)
+            resolved = resolve_task_config(app, profile, record.task_id)
         except ConfigValidationError as exc:
             await self._terminal_without_claim(record, f"invalid task config: {exc}")
+            return
+        # BUG-029: `enabled: false` gates EXECUTION, not just
+        # materialization. A due waiting row (recurring reschedule,
+        # recoverable retry, crash recovery) outlives the config change
+        # and would otherwise keep executing — indefinitely for
+        # recurring tasks, whose every success reschedules a new round.
+        # The row is left pending/waiting (pause semantics: re-enabling
+        # resumes it); the loop paces one idle interval because the row
+        # stays due while disabled (no hot spin).
+        if not resolved.enabled:
+            logger.info(
+                "task disabled by configuration; skipping execution",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.execute",
+                    "outcome": "disabled",
+                },
+            )
+            worker.wake.clear()
+            await self._wait_for_wake(worker, self._idle_interval)
             return
         adapter = await self._adapter_for(account_id)
         # External-audit BUG-004 fix: bind the RESOLVED policy (global →
@@ -601,7 +1075,7 @@ class WorkerManager:
         # account-shared adapter is policy-less, and handlers driving it
         # previously operated under the limiter default (global-only),
         # silently ignoring every per-task/per-account ratelimit block.
-        policy = policy_for(self._app_config, self._accounts, account_id, record.task_id)
+        policy = policy_for(app, accounts, account_id, record.task_id)
         task_adapter = adapter.with_policy(policy)
         # Wait out account cooldowns BEFORE taking a global execution slot
         # so parked accounts cannot starve others (audit B6).
@@ -609,8 +1083,35 @@ class WorkerManager:
         async with self._execution_slots:
             if self._shutdown.is_set():
                 return  # not claimed yet: instance stays pending
+            # RACE-002: the iteration-top gate is stale by now — an
+            # active account cooldown can park wait_scopes for minutes,
+            # and a disable/pause/config-removal landing in that window
+            # must stop the claim (row stays pending; pause semantics),
+            # exactly like shutdown above.
+            if (
+                self._globally_paused
+                or not self._enabled.get(account_id, False)
+                or account_id in self._paused
+            ):
+                logger.info(
+                    "account gated while awaiting execution; not claiming",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "gated_before_claim",
+                    },
+                )
+                return
             try:
                 claimed = await self._store.claim(record.id)
+                await self._audit.emit(
+                    category="task",
+                    action="started",
+                    account_id=account_id,
+                    task_id=record.task_id,
+                    detail=f"attempt {claimed.attempt_count}",
+                )
             except StateTransitionError:
                 return  # already claimed or terminal: never execute twice
             except PersistenceError:
@@ -620,13 +1121,14 @@ class WorkerManager:
             context = TaskContext(
                 account_id=account_id,
                 task_id=record.task_id,
-                config=self._execution_parameters(resolved, record.task_id),
+                config=self._execution_parameters(app, resolved, record.task_id),
                 adapter=task_adapter,
                 credentials=self._credentials,
             )
             try:
-                outcome = await self._registry.execute(context)
+                outcome = await self._run_handler(context, resolved)
             except AccountFatalError as exc:
+                self._health_failure(account_id, exc, fatal=True)
                 # Credentials dead / gateway session invalidated / CAPTCHA:
                 # fail this instance, then stop the whole account (owner
                 # policy 2026-10-28) — never retry, never continue with
@@ -640,15 +1142,20 @@ class WorkerManager:
                         "outcome": "account_fatal",
                     },
                 )
-                await self._record(
-                    record.id,
+                await self._handle_account_fatal_after(
+                    record,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"account-fatal: {exc}",
+                        message=f"account-fatal: {_safe_error_text(exc)}",
                     ),
-                    retry_at=None,
+                    account_id,
+                    # Review finding (ERR-004 class): this was a bare
+                    # str(exc) — an AccountFatalError whose __str__
+                    # raises escaped the except-block BEFORE the
+                    # containment ran (account stayed enabled, adapter
+                    # open, row stranded running).
+                    _safe_error_text(exc),
                 )
-                await self._handle_account_fatal(account_id, str(exc))
                 return
             except RetryLimitExceededError as exc:
                 logger.warning(
@@ -683,16 +1190,25 @@ class WorkerManager:
                     },
                     exc_info=True,
                 )
-                await self._record(
-                    record.id,
+                # CLOSURE-001: this previously passed retry_at=None,
+                # TERMINALLY failing the row on its first transient fault
+                # (a failed_recoverable outcome persisted on a terminal
+                # row) — now the same bounded retry the handler-reported
+                # recoverable outcome gets.
+                await self._record_recoverable(
+                    record,
+                    claimed,
                     TaskOutcome(
                         TaskStatus.FAILED_RECOVERABLE,
                         message=f"persistence error: {type(exc).__name__}: {exc}",
                     ),
-                    retry_at=None,
+                    resolved_limit=resolve_task_config(app, profile, record.task_id).retry_limit,
+                    app=app,
+                    accounts=accounts,
                 )
                 return
             except Exception as exc:
+                self._health_failure(account_id, exc)
                 logger.exception(
                     "task handler crashed",
                     extra={
@@ -706,7 +1222,7 @@ class WorkerManager:
                     record.id,
                     TaskOutcome(
                         TaskStatus.FAILED_PERMANENT,
-                        message=f"{type(exc).__name__}: {exc}",
+                        message=f"{type(exc).__name__}: {_safe_error_text(exc)}",
                     ),
                     retry_at=None,
                 )
@@ -747,6 +1263,14 @@ class WorkerManager:
             )
             return
         if outcome.status is TaskStatus.SUCCEEDED:
+            self._health.record_success(account_id)
+            await self._audit.emit(
+                category="task",
+                action="completed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=outcome.message,
+            )
             if outcome.retry_at is not None:
                 # Milestone 7 (recurring tasks): a successful ROUND with
                 # a learned deadline stays alive — rescheduled with a
@@ -764,39 +1288,276 @@ class WorkerManager:
                 return
             await self._record(record.id, outcome, retry_at=None)
         elif outcome.status is TaskStatus.FAILED_RECOVERABLE:
+            self._health.record_failure(account_id, outcome.message)
             # Worker-level retries are bounded by the RESOLVED TASK
             # CONFIG's retry_limit (repo-sweep fix: the task_defaults →
             # task → override chain was computed, test-asserted, and
             # then ignored — the ratelimit-layer policy bound was used
             # instead); beyond it the instance fails permanently (audit B8).
-            resolved_limit = resolve_task_config(
-                self._app_config, profile, record.task_id
-            ).retry_limit
-            if claimed.attempt_count >= resolved_limit + 1:
-                await self._record(
-                    record.id,
-                    TaskOutcome(
-                        TaskStatus.FAILED_PERMANENT,
-                        message=f"worker retry limit ({resolved_limit}) exhausted",
-                    ),
-                    retry_at=None,
-                )
-                return
-            if outcome.retry_at is not None:
-                # Milestone 4 (retry ownership): a LEARNED absolute UTC
-                # deadline (parsed from a Mudae reply, anchored at the
-                # domain boundary) supersedes generic transport backoff.
-                # An already-expired deadline means "due now". Naive
-                # values were rejected above, for every status.
-                retry_at = max(outcome.retry_at, self._wall())
-            else:
-                delay = self._retry_delay(claimed.attempt_count, account_id, record.task_id)
-                retry_at = self._wall() + timedelta(seconds=delay)
-            await self._record(record.id, outcome, retry_at=retry_at)
+            await self._record_recoverable(
+                record,
+                claimed,
+                outcome,
+                resolved_limit=resolve_task_config(app, profile, record.task_id).retry_limit,
+                app=app,
+                accounts=accounts,
+            )
         else:
+            # Terminal failure returned by the handler (PERMANENT).
+            self._health.record_failure(account_id, outcome.message)
+            await self._audit.emit(
+                category="task",
+                action="failed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=outcome.message,
+            )
             await self._record(record.id, outcome, retry_at=None)
 
+    async def _run_handler(self, context: TaskContext, resolved: ResolvedTaskConfig) -> TaskOutcome:
+        """Execute the handler under the resolved timeout (roadmap item 7).
+
+        Timeout semantics (defined before implementation):
+        - A timed-out handler is CANCELLED and the child task given a
+          BOUNDED chance to unwind, so its cleanup runs; a handler that
+          suppresses CancelledError cannot be force-terminated and is
+          reported and abandoned (strongly referenced) instead of
+          wedging this await forever.
+        - A timeout is DISTINCT from a handler raising TimeoutError itself
+          (``asyncio.wait`` + ``task.result()`` preserves exception
+          identity — only a still-pending task after the deadline is a
+          timeout).
+        - A timeout returns FAILED_RECOVERABLE with a distinct message, so
+          the single-owner retry bound and rescheduling apply unchanged —
+          EXCEPT when the handler ignores cancellation: the attempt fails
+          PERMANENT (a provably-still-running attempt must not be retried
+          concurrently; manual requeue via the CLI once it finishes).
+        - Cancellation of THIS coroutine (shutdown) cancels the child too —
+          no leaked handler tasks (same bounded unwind).
+        """
+        timeout = resolved.timeout_seconds
+        if timeout is None:
+            return await self._registry.execute(context)
+
+        task: asyncio.Task[TaskOutcome] = asyncio.create_task(self._registry.execute(context))
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            # Shutdown cancelled this coroutine: cancel the child and give
+            # it a bounded unwind — the old unbounded ``await task`` was
+            # itself an un-cancellable shutdown hang for resistant
+            # handlers. Whether or not the child unwinds, the shutdown
+            # cancellation propagates.
+            task.cancel()
+            await self._await_child_unwind(task, context=context)
+            raise
+        if pending:
+            task.cancel()
+            unwound = await self._await_child_unwind(task, context=context)
+            logger.warning(
+                "task execution timed out",
+                extra={
+                    "account_id": context.account_id,
+                    "task_id": context.task_id,
+                    "operation": "task.execute",
+                    "outcome": "task_timeout",
+                },
+            )
+            message = f"task execution timed out after {timeout}s"
+            if not unwound:
+                # Review finding (duplicate execution): a recoverable
+                # outcome would schedule a retry while the abandoned
+                # attempt provably still runs — the single-owner claim
+                # invariant (no CONCURRENT executions of one row) must
+                # not be traded for the abandoned wedge. Terminal
+                # failure preserves it; the CLI `retry` path requeues
+                # manually once the stuck attempt has finished.
+                message += (
+                    "; handler ignored cancellation — attempt failed permanent "
+                    "(still running; manual requeue once it finishes)"
+                )
+                return TaskOutcome(TaskStatus.FAILED_PERMANENT, message=message)
+            return TaskOutcome(TaskStatus.FAILED_RECOVERABLE, message=message)
+        return task.result()  # handler exceptions keep their identity
+
+    async def _await_child_unwind(
+        self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
+    ) -> bool:
+        """Bounded wait for a CANCELLED handler child to unwind.
+
+        Returns True when the child finished (cancelled or otherwise);
+        False when it ignored cancellation within the grace period — the
+        child is then strongly referenced (never garbage-collected
+        mid-run), reported, and abandoned. A real handler exception that
+        escaped during unwinding keeps propagating, exactly as the old
+        ``await task`` did.
+
+        Interruption-safe (review finding: double cancel): stop()'s
+        finally re-cancels this WORKER while it waits here — the
+        registration below must still run before the cancellation
+        propagates, or the abandoned child loses its strong reference
+        and its report. The worker's own cancellation always re-raises.
+        """
+        try:
+            await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            self._register_abandoned_if_pending(task, context=context)
+            raise
+        if task.done():
+            if not task.cancelled():
+                task.result()  # retrieve: an escaped exception propagates as before
+            return True
+        self._register_abandoned_if_pending(task, context=context)
+        return False
+
+    def _register_abandoned_if_pending(
+        self, task: asyncio.Task[TaskOutcome], *, context: TaskContext
+    ) -> None:
+        """Strongly reference and report a still-pending cancelled child."""
+        if task.done():
+            return
+        self._abandoned_handlers.add(task)
+        task.add_done_callback(self._abandoned_handler_finished)
+        logger.warning(
+            "handler ignored cancellation; abandoned (it may still be running)",
+            extra={
+                "account_id": context.account_id,
+                "task_id": context.task_id,
+                "operation": "task.execute",
+                "outcome": "handler_uncancellable",
+            },
+        )
+
+    def _abandoned_handler_finished(self, task: asyncio.Task[TaskOutcome]) -> None:
+        """Drop the strong reference and retrieve any escaped exception."""
+        self._abandoned_handlers.discard(task)
+        if not task.cancelled():
+            task.exception()  # retrieve: never an unretrieved-task warning
+
+    async def _handle_account_fatal_after(
+        self,
+        record: TaskInstanceRecord,
+        outcome: TaskOutcome,
+        account_id: int,
+        message: str,
+    ) -> None:
+        """Record the fatal outcome, then ALWAYS contain the account.
+
+        ERR-003: the outcome write and the containment were sequential —
+        a PersistenceError from ``_record`` escaped the except-block and
+        ``_handle_account_fatal`` never ran (account stayed enabled,
+        adapter stayed open, row stranded running). Containment is the
+        owner policy (2026-10-28: never retry, never continue) and must
+        be unconditional; a failed outcome write leaves the row in the
+        documented restart-recovery bucket.
+        """
+        try:
+            await self._record(record.id, outcome, retry_at=None)
+        except PersistenceError:
+            logger.exception(
+                "could not record the account-fatal outcome (row recovers at restart)",
+                extra={
+                    "account_id": account_id,
+                    "task_id": record.task_id,
+                    "operation": "task.record",
+                    "outcome": "fatal_record_failed",
+                },
+            )
+        await self._handle_account_fatal(account_id, message)
+
+    async def _record_recoverable(
+        self,
+        record: TaskInstanceRecord,
+        claimed: TaskInstanceRecord,
+        outcome: TaskOutcome,
+        *,
+        resolved_limit: int,
+        app: AppConfig,
+        accounts: AccountsConfig,
+    ) -> None:
+        """Record a FAILED_RECOVERABLE outcome under the retry bound.
+
+        CLOSURE-001: shared by handler-reported recoverable failures and
+        handler-raised PersistenceError (both recoverable; the latter was
+        previously terminal-killed via ``retry_at=None``).
+
+        CLOSURE-003: the audit event follows the LIMIT DECISION — an
+        exhausted attempt emits ``task.failed`` (with the exhaustion
+        detail), never a phantom ``task.retried`` for a retry that will
+        not happen.
+        """
+        account_id = record.account_id
+        if claimed.attempt_count >= resolved_limit + 1:
+            await self._audit.emit(
+                category="task",
+                action="failed",
+                account_id=account_id,
+                task_id=record.task_id,
+                detail=(
+                    f"worker retry limit ({resolved_limit}) exhausted; "
+                    f"last failure: {outcome.message}"
+                ),
+            )
+            await self._record(
+                record.id,
+                TaskOutcome(
+                    TaskStatus.FAILED_PERMANENT,
+                    # Carry the LAST failure reason into the terminal
+                    # row (roadmap items 7/8): the exhaustion alone
+                    # hides whether it was timeouts, cooldowns, or
+                    # handler-reported failures.
+                    message=(
+                        f"worker retry limit ({resolved_limit}) exhausted; "
+                        f"last failure: {outcome.message}"
+                    ),
+                ),
+                retry_at=None,
+            )
+            return
+        if outcome.retry_at is not None:
+            # Milestone 4 (retry ownership): a LEARNED absolute UTC
+            # deadline (parsed from a Mudae reply, anchored at the
+            # domain boundary) supersedes generic transport backoff.
+            # An already-expired deadline means "due now". Naive values
+            # were rejected above, for every status.
+            retry_at = max(outcome.retry_at, self._wall())
+        else:
+            delay = self._retry_delay(
+                claimed.attempt_count,
+                account_id,
+                record.task_id,
+                app=app,
+                accounts=accounts,
+            )
+            retry_at = self._wall() + timedelta(seconds=delay)
+        await self._audit.emit(
+            category="task",
+            action="retried",
+            account_id=account_id,
+            task_id=record.task_id,
+            detail=outcome.message,
+        )
+        await self._record(record.id, outcome, retry_at=retry_at)
+
     async def _record(
+        self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
+    ) -> None:
+        # ERR-005: one bounded DatabaseBusyError retry, mirroring
+        # _reschedule — a single transient busy on the post-claim
+        # outcome write previously propagated to the loop guard and
+        # stranded the claimed row running until restart. A second
+        # failure still propagates (documented restart-recovery bucket).
+        try:
+            await self._record_once(instance_id, outcome, retry_at=retry_at)
+        except DatabaseBusyError:
+            logger.warning(
+                "outcome record hit a busy database; retrying once",
+                extra={"operation": "task.record", "outcome": "busy_retry"},
+            )
+            await asyncio.sleep(0.5)
+            await self._record_once(instance_id, outcome, retry_at=retry_at)
+
+    async def _record_once(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
     ) -> None:
         if outcome.status is TaskStatus.SUCCEEDED:
@@ -824,8 +1585,18 @@ class WorkerManager:
             await asyncio.sleep(0.5)
             await self._store.reschedule_success(instance_id, outcome, retry_at)
 
-    def _retry_delay(self, attempts: int, account_id: int, task_id: str) -> float:
-        policy = policy_for(self._app_config, self._accounts, account_id, task_id)
+    def _retry_delay(
+        self,
+        attempts: int,
+        account_id: int,
+        task_id: str,
+        *,
+        app: AppConfig,
+        accounts: AccountsConfig,
+    ) -> float:
+        # app/accounts: the execution's own generation (reload race) —
+        # the backoff policy must not swap mid-execution either.
+        policy = policy_for(app, accounts, account_id, task_id)
         # Clamp the exponent: 2**1024 overflows float beyond ~1025 attempts.
         exponent = min(max(0, attempts - 1), 62)
         base = policy.backoff_base_seconds * (2**exponent)
@@ -853,6 +1624,9 @@ class WorkerManager:
             )
             failed = -1
         self._enabled[account_id] = False
+        # BUG-030: a fatal stop is runtime control — a later reload must
+        # not silently resurrect the account (revive-only policy).
+        self._runtime_enabled_overrides.add(account_id)
         self._fatal_accounts.add(account_id)
         adapter = self._adapters.pop(account_id, None)
         if adapter is not None:
@@ -924,9 +1698,34 @@ class WorkerManager:
                 self._adapter_factory(account_id),
                 self._limiter,
                 account_id,
+                on_rate_limited=lambda: self._health.record_rate_limited(account_id),
             )
             self._adapters[account_id] = adapter
         return adapter
+
+    def _health_failure(
+        self, account_id: int, error: BaseException | str, *, fatal: bool = False
+    ) -> None:
+        """ERR-004: health is OBSERVATION — an update can never break
+        execution (health.py's stated contract, previously violated at
+        the two exception-object call sites: an exception with a raising
+        ``__str__`` made the update raise INSIDE the except-block,
+        escaping the error boundary and stranding the claimed row)."""
+        try:
+            self._health.record_failure(account_id, error, fatal=fatal)
+        except Exception:
+            logger.exception(
+                "health update failed (observation only)",
+                extra={
+                    "account_id": account_id,
+                    "operation": "health.record",
+                    "outcome": "health_update_failed",
+                },
+            )
+
+    def health(self) -> Mapping[int, AccountHealthSnapshot]:
+        """Per-account health views for this session (roadmap item 6)."""
+        return self._health.snapshot()
 
     # ----- account controls -----
 
@@ -949,7 +1748,18 @@ class WorkerManager:
             # Explicit revive path after an account-fatal stop: the owner
             # re-enables the account once the credential problem is fixed.
             self._fatal_accounts.discard(account_id)
+            self._health.record_revived(account_id)
+        else:
+            self._health.record_disabled(account_id)
         self._enabled[account_id] = enabled
+        # BUG-030: explicit runtime control — outranks a later reload
+        # (which reports the shadowing instead of applying the config).
+        self._runtime_enabled_overrides.add(account_id)
+        self._audit_emit(
+            category="account",
+            action="enabled" if enabled else "disabled",
+            account_id=account_id,
+        )
         if enabled and self._started and not self._stopped:
             worker = self._workers.get(account_id)
             dead = worker is None or worker.task is None or worker.task.done()
@@ -986,20 +1796,52 @@ class WorkerManager:
 
     def pause_account(self, account_id: int) -> None:
         self._paused.add(account_id)
+        self._audit_emit(category="account", action="paused", account_id=account_id)
 
     def resume_account(self, account_id: int) -> None:
         self._paused.discard(account_id)
         worker = self._workers.get(account_id)
         if worker is not None:
             worker.nudge()
+        self._audit_emit(category="account", action="resumed", account_id=account_id)
 
     def pause_all(self) -> None:
         self._globally_paused = True
+        self._audit_emit(category="runtime", action="paused")
 
     def resume_all(self) -> None:
         self._globally_paused = False
         for worker in self._workers.values():
             worker.nudge()
+        self._audit_emit(category="runtime", action="resumed")
+
+    def _audit_emit(self, **event: Any) -> None:
+        """Fire-and-forget audit emission from sync control-plane methods
+        (roadmap item 11): best-effort, never raises, no-op without a
+        running loop (sync unit-test callers).
+
+        LOW-033: the pending emission is strongly referenced (see
+        ``_audit_tasks``) so the collector can never drop it mid-flight;
+        ``stop()`` gives outstanding emissions a bounded chance to land.
+
+        Review nit: the loop check runs BEFORE the coroutine is created —
+        the old ensure_future-in-try created the coroutine first and
+        abandoned it (RuntimeWarning: never awaited) on the no-loop path.
+
+        Residual review finding (LOW-033 window): an emission enqueued
+        mid-teardown runs AFTER stop()'s bounded audit drain and can
+        outlive the shutdown boundary — control events fired during
+        teardown are skipped (emission is auxiliary best-effort).
+        """
+        if self._stopped:
+            return  # teardown in progress: no new background emissions
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop: skip (the operation itself succeeded)
+        task: asyncio.Task[None] = loop.create_task(self._audit.emit(**event))
+        self._audit_tasks.add(task)
+        task.add_done_callback(self._audit_tasks.discard)
 
     def wake(self, account_id: int) -> None:
         worker = self._workers.get(account_id)

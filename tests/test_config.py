@@ -394,3 +394,21 @@ def test_legitimate_nested_parameters_still_parse() -> None:
     }
     parsed = parse_app_config(raw)
     assert parsed.tasks["claim_test"].parameters["limits"]["max"] == 10
+
+
+@pytest.mark.parametrize("bad", [10**400, -(10**400)])
+def test_oversized_integer_durations_rejected_cleanly(bad: int) -> None:
+    """Sibling of the _optional_timeout finding: _duration's
+    math.isfinite float-CONVERTS its input, so an oversized integer
+    escaped as OverflowError instead of ConfigValidationError — and the
+    trailing float() conversion would overflow the same way. A clean
+    config error must be raised."""
+    with pytest.raises(ConfigValidationError, match="send_jitter"):
+        parse_app_config(
+            {
+                "version": 1,
+                "channels": {"roll_claim": 1},
+                "settings": {"send_jitter_seconds": [0.4, bad]},
+                "tasks": {"job": {"parameters": {}}},
+            }
+        )

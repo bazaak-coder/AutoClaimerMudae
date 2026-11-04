@@ -40,6 +40,7 @@ import json
 import logging
 import sqlite3
 import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -49,13 +50,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+from .logging_setup import redact_text
 from .registry import TaskOutcome, TaskStatus
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 7
 _BUSY_TIMEOUT_MS = 5000
 
 #: v5 — Fernet-encrypted account tokens. One row per account; the
@@ -123,6 +125,37 @@ _MIGRATIONS: dict[int, str] = {
     ALTER TABLE mudae_state_v4 RENAME TO mudae_state;
     """,
     5: _CREDENTIALS_DDL,
+    6: """
+    -- Roadmap item 8: bounded per-attempt execution history. Auxiliary to
+    -- task_instances (the source of truth): a history-write failure must
+    -- never break outcome recording. Pruned per instance (latest N).
+    CREATE TABLE IF NOT EXISTS task_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL,
+        task_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS task_history_instance
+        ON task_history (instance_id, id);
+    """,
+    7: """
+    -- Roadmap item 11: structured audit events. Separate from debug
+    -- logging: queryable, restart-durable, bounded retention, and the
+    -- detail column is ALWAYS secret-free (redacted at the emit site).
+    CREATE TABLE IF NOT EXISTS audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        category TEXT NOT NULL,
+        action TEXT NOT NULL,
+        account_id INTEGER,
+        task_id TEXT,
+        detail TEXT NOT NULL DEFAULT ''
+    );
+    """,
 }
 
 
@@ -272,12 +305,33 @@ def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
 #: transaction-cancellation cleanup (VERIFY-001 fix).
 _DRAIN_TIMEOUT_SECONDS = 5.0
 
+#: Per-instance execution-history retention (roadmap item 8): bounded so
+#: history can never grow the database unboundedly.
+_HISTORY_KEEP_PER_INSTANCE = 50
+
+#: Audit-event retention (roadmap item 11): bounded, newest kept.
+_AUDIT_KEEP = 1000
+
 
 def _silence_task_exception(task: asyncio.Task[Any]) -> None:
     """Retrieve (and drop) an abandoned task's exception so Python does
     not warn about it — the cancellation path intentionally moves on."""
     if not task.cancelled():
         task.exception()
+
+
+def _finalize_conn_close(conn: sqlite3.Connection) -> None:
+    """ResourceWarning audit: last-resort close for an ABANDONED
+    connection (a store dropped without a completed ``close()`` — e.g. a
+    close cancelled mid-thread-hop whose shielded task was destroyed at
+    loop teardown). Such connections previously leaked open and surfaced
+    as the CI ``unclosed database`` ResourceWarnings. Detached after
+    every successful close; a no-op on an already-closed connection.
+    Best effort — nothing can be reported usefully from this context."""
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover - destructor context
+        pass
 
 
 class TaskStateStore:
@@ -307,6 +361,10 @@ class TaskStateStore:
         # the await but the tracked task keeps running; the transaction
         # cleanup drains these before rolling back.
         self._in_flight: set[asyncio.Task[Any]] = set()
+        # ResourceWarning audit (unclosed-database CI warnings): safety
+        # net armed at open, detached after a successful close. See
+        # ``_finalize_conn_close``.
+        self._conn_finalizer: Any = None  # weakref.finalize (ParamSpec generics fight mypy here)
 
     # ----- lifecycle -----
 
@@ -326,6 +384,11 @@ class TaskStateStore:
         async with self._lock:
             try:
                 self._conn = await asyncio.to_thread(_connect)
+                # ResourceWarning audit: arm the close safety net BEFORE
+                # anything can fail or be cancelled below — a store
+                # dropped without a completed close() otherwise leaks the
+                # connection (unclosed-database warnings at GC/exit).
+                self._arm_conn_finalizer(self._conn)
                 # Final-review fix: migration/verification run through
                 # the GUARDED threaded call (a raw to_thread bypassed the
                 # connection guard), and ANY failure — including
@@ -344,6 +407,7 @@ class TaskStateStore:
                     # call to drain instead of closing underneath it.
                     try:
                         await self._call_threaded(self._conn.close)
+                        self._detach_conn_finalizer()  # close landed; net not needed
                     except PersistenceError:
                         logger.exception("connection close after failed open also failed")
                     self._conn = None
@@ -357,7 +421,13 @@ class TaskStateStore:
         Final-review fix (agent-3 #3): ``_conn`` is nulled in a
         ``finally`` — a cancellation of the close await previously left
         the store holding a reference to the (thread-completed) closed
-        connection, producing misleading typed errors afterwards."""
+        connection, producing misleading typed errors afterwards.
+
+        ResourceWarning audit: a CANCELLED close leaves the shielded
+        threaded close abandoned at loop teardown — the connection
+        stayed open (CI unclosed-database warnings). The finalizer
+        safety net (armed at open) guarantees the close in that case;
+        on the normal path it is detached here, unreferenced."""
         async with self._lock:
             if self._conn is not None:
                 conn = self._conn
@@ -365,8 +435,18 @@ class TaskStateStore:
                     # Guarded (repo-sweep): an abandoned in-flight call
                     # must finish before the connection closes under it.
                     await self._call_threaded(conn.close)
+                    self._detach_conn_finalizer()  # close landed; net not needed
                 finally:
                     self._conn = None
+
+    def _arm_conn_finalizer(self, conn: sqlite3.Connection) -> None:
+        self._detach_conn_finalizer()
+        self._conn_finalizer = weakref.finalize(self, _finalize_conn_close, conn)
+
+    def _detach_conn_finalizer(self) -> None:
+        if self._conn_finalizer is not None:
+            self._conn_finalizer.detach()
+            self._conn_finalizer = None
 
     @property
     def schema_version(self) -> int:
@@ -425,6 +505,25 @@ class TaskStateStore:
                 "key_version",
                 "created_at",
                 "updated_at",
+            },
+            "task_history": {
+                "id",
+                "instance_id",
+                "account_id",
+                "task_id",
+                "attempt",
+                "status",
+                "message",
+                "recorded_at",
+            },
+            "audit_events": {
+                "id",
+                "timestamp",
+                "category",
+                "action",
+                "account_id",
+                "task_id",
+                "detail",
             },
         }
         for table, columns in expected.items():
@@ -686,18 +785,255 @@ class TaskStateStore:
 
     async def record_success(self, instance_id: int, outcome: TaskOutcome) -> TaskInstanceRecord:
         """running -> succeeded; idempotent when already succeeded identically."""
-        return await self._record_terminal(
+        record = await self._record_terminal(
             instance_id, "succeeded", outcome, from_states=("running",)
         )
+        if record is None:
+            # LOW-034: idempotent re-record — this attempt's history row
+            # already exists; appending again would duplicate it.
+            return await self.get_instance(instance_id)
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            "succeeded",
+            outcome.message,
+        )
+        return record
 
     async def record_failure(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
     ) -> TaskInstanceRecord:
         """running -> waiting (with retry time) or failed (when retry_at is None)."""
         target = "waiting" if retry_at is not None else "failed"
-        return await self._record_terminal(
+        record = await self._record_terminal(
             instance_id, target, outcome, from_states=("running",), retry_at=retry_at
         )
+        if record is None:
+            # LOW-034: idempotent re-record — see record_success.
+            return await self.get_instance(instance_id)
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            target,
+            outcome.message,
+        )
+        return record
+
+    async def _append_history(
+        self,
+        instance_id: int,
+        account_id: int,
+        task_id: str,
+        attempt: int,
+        status: str,
+        message: str,
+    ) -> None:
+        """Append one bounded history row (roadmap item 8).
+
+        AUXILIARY by contract: any failure here is logged and swallowed —
+        the task_instances outcome write is the source of truth and must
+        never break because history could not be recorded.
+
+        Review finding: *message* is REDACTED at write (same filter as
+        the audit channel) — handler-authored failure text can echo
+        credential-shaped fragments, and raw text here would reach the
+        database and every later ``history`` render unredacted.
+        """
+        safe_message = redact_text(str(message))[:500]
+        now = _format_ts(self._clock())
+        try:
+            await self._run(
+                self._update_sync,
+                "INSERT INTO task_history "
+                "(instance_id, account_id, task_id, attempt, status, message, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (instance_id, account_id, task_id, attempt, status, safe_message, now),
+            )
+            await self._run(
+                self._update_sync,
+                "DELETE FROM task_history WHERE instance_id = ? AND id NOT IN ("
+                " SELECT id FROM task_history WHERE instance_id = ? "
+                f" ORDER BY id DESC LIMIT {_HISTORY_KEEP_PER_INSTANCE})",
+                (instance_id, instance_id),
+            )
+        except PersistenceError:
+            logger.exception(
+                "execution history append failed (outcome unaffected)",
+                extra={"operation": "history.append", "outcome": "history_failed"},
+            )
+
+    async def task_history(
+        self, instance_id: int, *, limit: int = _HISTORY_KEEP_PER_INSTANCE
+    ) -> tuple[tuple[int, str, str, str], ...]:
+        """(attempt, status, message, recorded_at) rows, newest first."""
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT attempt, status, message, recorded_at FROM task_history "
+            "WHERE instance_id = ? ORDER BY id DESC LIMIT ?",
+            (instance_id, limit),
+        )
+        return tuple((int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
+
+    async def record_audit_event(
+        self,
+        *,
+        category: str,
+        action: str,
+        account_id: int | None = None,
+        task_id: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """Persist one structured audit event (roadmap item 11).
+
+        AUXILIARY by contract (like task history): an audit failure is
+        logged and swallowed — the audited operation must never break.
+        *detail* must already be secret-free (redacted at the emit site).
+        Retention is bounded (latest ``_AUDIT_KEEP``).
+        """
+        try:
+            await self._run(
+                self._update_sync,
+                "INSERT INTO audit_events "
+                "(timestamp, category, action, account_id, task_id, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _format_ts(self._clock()),
+                    category,
+                    action,
+                    account_id,
+                    task_id,
+                    detail[:500],
+                ),
+            )
+            await self._run(
+                self._update_sync,
+                f"DELETE FROM audit_events WHERE id NOT IN ("
+                f" SELECT id FROM audit_events ORDER BY id DESC LIMIT {_AUDIT_KEEP})",
+                (),
+            )
+        except PersistenceError:
+            logger.exception(
+                "audit event could not be recorded (operation unaffected)",
+                extra={"operation": "audit.append", "outcome": "audit_failed"},
+            )
+
+    async def backup_to(self, path: str | Path) -> int:
+        """Consistent database backup via ``VACUUM INTO`` (roadmap 14).
+
+        BUG-039: runs through :meth:`_run` — the store's ASYNC lock (the
+        same transaction-level serialization every other operation uses),
+        not just the per-call connection guard. A ``transaction()``
+        block releases the guard between its individual statements while
+        the connection still holds an open transaction, and SQLite
+        rejects ``VACUUM INTO`` there ("cannot VACUUM from within a
+        transaction") — the advertised live-backup guarantee was
+        therefore unreliable. Under the lock, a concurrent transaction
+        COMMITS first and the backup sees a consistent database (never
+        torn); calling from inside one's own transaction fails loudly,
+        which is the caller's contradiction. The result is a compacted,
+        self-contained copy. Returns the backup size in bytes.
+        """
+        target = Path(path)
+        if target.exists():
+            raise PersistenceError(f"backup target {target} already exists; refusing to overwrite")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        def _vacuum_into() -> None:
+            conn = self._connection()
+            with self._conn_guard:
+                conn.execute("VACUUM INTO ?", (str(target),))
+
+        # sqlite3.Error is mapped to a typed PersistenceError inside
+        # _call_threaded (via _run).
+        await self._run(_vacuum_into)
+        return target.stat().st_size
+
+    async def database_stats(self) -> dict[str, Any]:
+        """Growth-monitoring snapshot (roadmap item 14): file size, page
+        counts, and per-table row counts. Read-only."""
+
+        def _stats() -> dict[str, Any]:
+            conn = self._connection()
+            with self._conn_guard:
+                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+                freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                rows = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "task_instances",
+                        "scope_cooldowns",
+                        "mudae_state",
+                        "account_credentials",
+                        "task_history",
+                        "audit_events",
+                    )
+                }
+            return {
+                "path": str(self._path),
+                "size_bytes": self._path.stat().st_size if self._path.exists() else 0,
+                "page_count": int(page_count),
+                "freelist_pages": int(freelist),
+                "page_size": int(page_size),
+                "journal_mode": str(journal),
+                "rows": rows,
+            }
+
+        # Review finding: this was a raw asyncio.to_thread, bypassing
+        # _run — no store serialization and, worse, no sqlite3.Error →
+        # PersistenceError mapping (a raw driver error escaped to the
+        # CLI). Same path as every other store operation.
+        return await self._run(_stats)
+
+    async def audit_events(self, *, limit: int = 50) -> tuple[tuple[Any, ...], ...]:
+        """Recent audit events, newest first:
+        (timestamp, category, action, account_id, task_id, detail)."""
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT timestamp, category, action, account_id, task_id, detail "
+            "FROM audit_events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return tuple(tuple(row) for row in rows)
+
+    async def requeue_instance(self, instance_id: int) -> TaskInstanceRecord:
+        """Dead-letter manual retry (roadmap item 8): ``failed -> pending``
+        with a FRESH attempt budget; the requeue event is recorded in the
+        execution history. Only terminal-failed rows are requeueable —
+        live/healthy rows are a configuration error, not a retry."""
+        now = _format_ts(self._clock())
+        # CLOSURE-004: capture the dead-letter's LAST attempt before the
+        # budget reset — the history row referenced a hard-coded 0, and
+        # real attempts start at 1 (operators saw a phantom '#0').
+        before = await self.get_instance(instance_id)
+        changed = await self._run(
+            self._update_sync,
+            "UPDATE task_instances SET status = 'pending', attempt_count = 0, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'failed'",
+            (now, instance_id),
+        )
+        if changed == 0:
+            current = await self.get_instance(instance_id)
+            raise StateTransitionError(
+                "only dead-lettered (failed) tasks can be requeued — "
+                f"instance {instance_id} is '{current.status.value}'"
+            )
+        record = await self.get_instance(instance_id)
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            before.attempt_count,
+            "requeued",
+            "manual requeue from dead-letter",
+        )
+        return record
 
     async def recover_interrupted(self) -> int:
         """Startup recovery: running -> pending for rows orphaned by a shutdown."""
@@ -725,7 +1061,23 @@ class TaskStateStore:
                     f"Cannot abandon task instance {instance_id} from state "
                     f"'{current.status.value}'."
                 )
-        return await self.get_instance(instance_id)
+            return current  # idempotent: already failed; history already has it
+        record = await self.get_instance(instance_id)
+        # BUG-038: pre-claim terminal failures (invalid config, removed
+        # assignment, unregistered type) are part of the execution trail —
+        # same auxiliary-history contract as record_success /
+        # record_failure / requeue_instance: a history-write failure is
+        # logged and swallowed inside _append_history and never undoes
+        # the authoritative terminal transition above.
+        await self._append_history(
+            record.id,
+            record.account_id,
+            record.task_id,
+            record.attempt_count,
+            "abandoned",
+            message,
+        )
+        return record
 
     async def integrity_report(
         self, known_account_ids: set[int] | None = None
@@ -1102,7 +1454,10 @@ class TaskStateStore:
         *,
         from_states: Sequence[str],
         retry_at: datetime | None = None,
-    ) -> TaskInstanceRecord:
+    ) -> TaskInstanceRecord | None:
+        """``None`` when the row already held this exact outcome (the
+        idempotent re-record path) — callers use that to avoid appending
+        a duplicate history row for the same attempt (LOW-034)."""
         now = _format_ts(self._clock())
         next_attempt = _format_ts(retry_at) if retry_at is not None else None
         changed = await self._run(
@@ -1120,7 +1475,7 @@ class TaskStateStore:
                 and current.last_outcome.status == outcome.status
                 and current.last_outcome.message == outcome.message
             ):
-                return current  # idempotent re-record of the same outcome
+                return None  # idempotent re-record of the same outcome
             raise StateTransitionError(
                 f"Cannot move task instance {instance_id} from state "
                 f"'{current.status.value}' to '{target}'."

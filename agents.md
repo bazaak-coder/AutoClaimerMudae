@@ -210,7 +210,7 @@ gh repo view
 
 Verify the repository, branch, and remote before operating. If "gh" is unavailable or unauthenticated, report the limitation and use other permitted local checks where possible.
 
-Workspace git topology (this machine): git metadata lives in "/home/libosterelezent/autoclaimer.git", outside the tree (a deliberate legacy of the FUSE-era setup, kept as the working topology). The project root contains a ".git" *pointer file* ("gitdir: /home/libosterelezent/autoclaimer.git") so plain git commands work in place; git hard-ignores the pointer, and neither the pointer nor the external git directory must ever be committed or deleted. Never delete "/home/libosterelezent/autoclaimer.git" — it is the repository. The external git directory does not travel with workspace copies: if it is lost (observed twice during machine migrations), rebuild it by cloning fresh, moving the clone's ".git" into place, and setting "core.worktree" plus repo-local "core.filemode=false" again — a fresh clone writes "core.filemode=true", which overrides the global "false" and makes every tracked file appear mode-modified. Commit identity is configured globally ("Liboster" / libosterelezent@zohomail.in) and "gh auth setup-git" provides the HTTPS credential helper; if the pointer file is ever broken, run "gh" commands from outside the project directory.
+Workspace git topology (this machine): git metadata lives in "/home/libosterelezent/autoclaimer.git", outside the tree (a deliberate legacy of the FUSE-era setup, kept as the working topology). The project root contains a ".git" *pointer file* ("gitdir: /home/libosterelezent/autoclaimer.git") so plain git commands work in place; git hard-ignores the pointer, and neither the pointer nor the external git directory must ever be committed or deleted. Never delete "/home/libosterelezent/autoclaimer.git" — it is the repository. The external git directory does not travel with workspace copies: if it is lost (observed twice during machine migrations), rebuild it by cloning fresh, moving the clone's ".git" into place, and setting "core.worktree" plus repo-local "core.filemode=false" again — a fresh clone writes "core.filemode=true", which overrides the global "false" and makes every tracked file appear mode-modified. Commit identity (owner decision 2026-11-04): a repo-local override in "/home/libosterelezent/autoclaimer.git/config" sets user.name "bazaak" over the global "Liboster"; the email stays the global libosterelezent@zohomail.in by explicit owner choice — GitHub attributes commits by email, so they intentionally do not associate with the bazaak-coder account. "gh auth setup-git" provides the HTTPS credential helper; if the pointer file is ever broken, run "gh" commands from outside the project directory.
 
 During changes
 
@@ -481,6 +481,8 @@ Do not alter system packages, global Python installations, boot configuration, p
 
 12. Security and Account Safety
 
+- **Credential exfiltration boundary (explicit, owner-directed 2026-11-04):** no personal credential of any kind — account tokens, cookies, passwords, API keys, SSH or GitHub credentials, encryption keys — may ever be pushed, committed, uploaded, or otherwise shared from the local system, through ANY channel: repository content (including test fixtures, sample configs, log excerpts, database snapshots, and knowledgebase entries), commit messages, PR descriptions or review comments, issues, CI variables, pastes, web tools, or conversation output. If a real credential has already reached any such channel, report it immediately so it can be revoked and rotated; never attempt to "un-share" silently.
+- **Fake credentials are the only permitted test values, and they must be value-unrelated to the owner's real ones.** Synthetic tokens may mimic the real FORMAT (for example the `FAKE_TOKEN` shape in the tests: `base64(dummy_snowflake).base64(dummy).base64(random-looking)`) but must never be derived from, encode, obfuscate, rotate, or partially mask an actual secret in use — a masked real token is still a real token.
 - Never hardcode credentials or expose tokens, cookies, authorization headers, or secrets.
 - Never commit local credential databases or sensitive account data.
 - Use mocks and fixtures for automated tests.
@@ -566,7 +568,7 @@ Known constraints
 
 Remote
 
-- Repository: "libosterelezent/AutoClaimerMudae" (private). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
+- Repository: "bazaak-coder/AutoClaimerMudae" (private; owner account moved from "libosterelezent" on 2026-11-04 — the local remote is re-pointed, do not rely on the old-name redirect). Discord notifications flow through a native GitHub repo webhook in repository settings; no workflow files or local hook dispatchers exist.
 
 Final principle: Correctness, security, reproducibility, traceability, and owner control take precedence over speed. A passing test suite is necessary but not sufficient: independent review must examine the implementation's logic, security boundaries, and fragile areas before a change can be merged.
 

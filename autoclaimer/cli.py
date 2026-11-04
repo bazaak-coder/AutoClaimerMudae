@@ -30,11 +30,14 @@ from __future__ import annotations
 import asyncio
 import getpass
 import logging
+import os
 import shlex
+import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .adapters import AdapterError, PlatformAdapter
+from .audit import AuditLog
 from .credential_store import SQLiteCredentialStore
 from .credentials import CredentialProvider, CredentialProviderError
 from .logging_setup import redact_text
@@ -65,9 +68,24 @@ class AutoClaimerController:
         credentials: CredentialProvider | None = None,
         credential_store: SQLiteCredentialStore | None = None,
         idle_interval_seconds: float = 30.0,
+        config_path: str = "config.json",
+        accounts_path: str = "accounts.json",
     ) -> None:
         self._app_config = app_config
         self._accounts = accounts
+        # Review finding (startup-path defaults): bare `reload`/`doctor`
+        # used to fall back to CWD-relative config.json/accounts.json —
+        # an operator who started with explicit paths could silently
+        # adopt an UNRELATED config sitting in the working directory.
+        # The STARTUP paths are the defaults for both commands.
+        self._startup_config_path = config_path
+        self._startup_accounts_path = accounts_path
+        # Follow-up review finding: the last SUCCESSFULLY APPLIED logging
+        # settings, tracked separately from ``_app_config.logging`` — a
+        # reload whose logging reconfiguration failed must retry those
+        # settings on the next reload (they were never applied), even
+        # though the config itself was adopted.
+        self._last_applied_logging = app_config.logging
         self._store = store
         self._limiter = limiter
         self._credentials = credentials
@@ -75,6 +93,7 @@ class AutoClaimerController:
         # valid Fernet key is configured — credential commands then
         # explain instead of failing opaquely).
         self._credential_store = credential_store
+        self._audit = AuditLog(store)
         self._manager = WorkerManager(
             registry=registry,
             store=store,
@@ -143,11 +162,14 @@ class AutoClaimerController:
     async def credential_set(self, account_id: int, token: str) -> str:
         assert self._credential_store is not None
         await self._credential_store.set_token(account_id, token)
+        await self._audit.emit(category="credential", action="set", account_id=account_id)
         return f"credential stored (encrypted) for account {account_id}"
 
     async def credential_delete(self, account_id: int) -> str:
         assert self._credential_store is not None
         removed = await self._credential_store.delete_token(account_id)
+        if removed:
+            await self._audit.emit(category="credential", action="deleted", account_id=account_id)
         return (
             f"credential deleted for account {account_id}"
             if removed
@@ -174,6 +196,9 @@ class AutoClaimerController:
     async def credential_rotate(self) -> str:
         assert self._credential_store is not None
         count = await self._credential_store.rotate()
+        await self._audit.emit(
+            category="credential", action="rotated", detail=f"{count} re-encrypted"
+        )
         return f"rotation complete: {count} credential(s) re-encrypted under the primary key"
 
     async def credential_export(self, path: str) -> str:
@@ -181,6 +206,9 @@ class AutoClaimerController:
         enforced by the CLI layer; this stays a single loud operation."""
         assert self._credential_store is not None
         count = await self._credential_store.export_ciphertext(path)
+        await self._audit.emit(
+            category="credential", action="exported", detail=f"{count} records (ciphertext)"
+        )
         return (
             f"exported {count} credential(s) as CIPHERTEXT to {path} — the file "
             "contains no plaintext tokens; protect it exactly like the "
@@ -190,6 +218,11 @@ class AutoClaimerController:
     async def credential_import(self, path: str) -> str:
         assert self._credential_store is not None
         imported, skipped = await self._credential_store.import_ciphertext(path)
+        await self._audit.emit(
+            category="credential",
+            action="imported",
+            detail=f"{imported} imported, {skipped} current",
+        )
         return (
             f"imported {imported} credential(s) from {path} "
             f"({skipped} already current); every record was validated and "
@@ -208,6 +241,245 @@ class AutoClaimerController:
                 f"  [{finding.severity}] {finding.table} {finding.key}: "
                 f"{finding.problem}\n    → {finding.hint}"
             )
+        return lines
+
+    async def retry_task(self, account_id: int, task_id: str) -> str:
+        """Dead-letter manual retry (roadmap item 8)."""
+        record = await self._store.get_instance_by_ids(account_id, task_id)
+        await self._store.requeue_instance(record.id)
+        await self._audit.emit(
+            category="task", action="requeued", account_id=account_id, task_id=task_id
+        )
+        self._manager.wake(account_id)  # pick the requeued row up promptly
+        return f"requeued {account_id}/{task_id} (attempt budget reset)"
+
+    async def history_report(self, account_id: int, task_id: str) -> list[str]:
+        """Execution history for one task instance (newest first)."""
+        record = await self._store.get_instance_by_ids(account_id, task_id)
+        rows = await self._store.task_history(record.id)
+        lines = [f"history for {account_id}/{task_id}:"]
+        if not rows:
+            lines.append("  (no recorded attempts)")
+        for attempt, status, message, recorded_at in rows:
+            suffix = f" — {message}" if message else ""
+            lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
+        return lines
+
+    @property
+    def default_config_path(self) -> str:
+        """Startup config path — the default for bare `reload`/`doctor`."""
+        return self._startup_config_path
+
+    @property
+    def default_accounts_path(self) -> str:
+        """Startup accounts path — the default for bare `reload`/`doctor`."""
+        return self._startup_accounts_path
+
+    async def reload_config(self, config_path: str, accounts_path: str) -> list[str]:
+        """Safe runtime configuration reload (roadmap item 13).
+
+        Validate the new files FULLY first — an invalid configuration is
+        rejected and the running one is untouched. Then apply the
+        reloadable surface atomically and report restart-required
+        settings (never partially applied). In-flight executions keep
+        the snapshot they were claimed with.
+        """
+        from .config import load_config
+        from .logging_setup import setup_logging
+
+        new_app, new_accounts = load_config(config_path, accounts_path)  # full validation
+
+        old = self._app_config
+        lines: list[str] = []
+        restart_required: list[str] = []
+        if old.settings.max_concurrent_accounts != new_app.settings.max_concurrent_accounts:
+            restart_required.append(
+                f"max_concurrent_accounts {old.settings.max_concurrent_accounts} -> "
+                f"{new_app.settings.max_concurrent_accounts}"
+            )
+        if old.settings.send_jitter_seconds != new_app.settings.send_jitter_seconds:
+            restart_required.append("settings.send_jitter_seconds")
+        # Compare against the last APPLIED logging, NOT _app_config.logging:
+        # the failed reload adopted the config, so identical-looking
+        # settings must still retry (they never landed).
+        logging_changed = self._last_applied_logging != new_app.logging
+
+        # Atomic adoption (single synchronous swap — no partial states).
+        # Review finding: this runs BEFORE the logging reconfiguration —
+        # an unwritable log path used to abort the whole reload before
+        # the VALID configuration was applied, and raised out of the
+        # command. Adoption is not conditional on logging.
+        self._manager.update_configuration(new_app, new_accounts)
+        self._app_config = new_app
+        self._accounts = new_accounts
+        # BUG-030: reload_materialize applies account enabled changes and
+        # returns notes for any runtime override that shadowed the config.
+        lines.extend(await self._manager.reload_materialize())
+        if logging_changed:
+            try:
+                setup_logging(new_app.logging)  # idempotent: replaces handlers
+                self._last_applied_logging = new_app.logging  # only on success
+                lines.append(f"logging reconfigured (level {new_app.logging.level})")
+            except OSError as exc:
+                # setup_logging is atomic (old handlers survive a failed
+                # reconfiguration): the session keeps usable logging and
+                # the operator learns the new settings are broken.
+                lines.append(
+                    f"logging reconfiguration FAILED ({exc}); previous logging kept — "
+                    "fix settings.logging and reload again"
+                )
+        await self._audit.emit(
+            category="configuration",
+            action="changed",
+            detail=f"reloaded from {config_path}",
+        )
+        lines.insert(0, "configuration reloaded (validated; applied atomically)")
+        if restart_required:
+            lines.append(
+                "restart required for: "
+                + "; ".join(restart_required)
+                + " (running values kept until restart)"
+            )
+        return lines
+
+    async def backup_database(self, path: str) -> str:
+        """Consistent backup via VACUUM INTO (roadmap item 14)."""
+        size = await self._store.backup_to(path)
+        return f"backup written: {path} ({size} bytes, consistent snapshot)"
+
+    async def database_stats_report(self) -> list[str]:
+        """Growth-monitoring snapshot (roadmap item 14)."""
+        stats = await self._store.database_stats()
+        rows = ", ".join(f"{table}={count}" for table, count in stats["rows"].items())
+        return [
+            f"database: {stats['path']}",
+            f"  size {stats['size_bytes']} bytes | pages {stats['page_count']} "
+            f"({stats['page_size']} B each, {stats['freelist_pages']} free)",
+            f"  journal {stats['journal_mode']} (rollback journal; no WAL checkpoints)",
+            f"  rows: {rows}",
+        ]
+
+    async def doctor_report(self, config_path: str, accounts_path: str) -> list[str]:
+        """Operational diagnostics (roadmap item 15) — strictly READ-ONLY.
+
+        Checks configuration (parsed WITHOUT migrating — doctor never
+        rewrites files), database integrity, credential availability
+        (count only, never secrets), task registration wiring, account
+        health, and worker/scheduler status. Every WARN/FAIL carries an
+        actionable hint.
+        """
+        from .config import _load_json, parse_accounts_config, parse_app_config
+        from .models import ConfigValidationError
+
+        lines: list[str] = ["doctor:"]
+
+        # 1. Configuration validity (read-only parse — no migration).
+        try:
+            app = parse_app_config(_load_json(config_path))
+            accounts_cfg = parse_accounts_config(_load_json(accounts_path), app)
+            lines.append(
+                f"  [OK] configuration — {len(app.tasks)} task(s), "
+                f"{len(accounts_cfg.accounts)} account(s), channels resolved"
+            )
+        except (ConfigValidationError, OSError) as exc:
+            lines.append(f"  [FAIL] configuration — {exc}")
+            lines.append("      → fix the reported field and re-run doctor")
+            return lines  # nothing else can be checked meaningfully
+
+        # 2. Database accessibility + integrity (read-only diagnostics).
+        try:
+            known = {account.id for account in accounts_cfg.accounts}
+            findings = await self._store.integrity_report(known_account_ids=known)
+            if findings:
+                for finding in findings:
+                    lines.append(
+                        f"  [{'WARN' if finding.severity == 'warning' else 'FAIL'}] "
+                        f"database — {finding.table} {finding.key}: {finding.problem}"
+                    )
+                    lines.append(f"      → {finding.hint}")
+            else:
+                lines.append("  [OK] database — accessible, integrity clean")
+        except Exception as exc:  # typed store failures
+            lines.append(f"  [FAIL] database — {type(exc).__name__}: {exc}")
+            lines.append("      → check the file permissions/path of state.db")
+
+        # 3. Credential store availability (no secrets displayed).
+        if self._credential_store is not None:
+            try:
+                ids = await self._credential_store.account_ids()
+                lines.append(f"  [OK] credentials — encrypted store ready, {len(ids)} token(s)")
+            except Exception as exc:
+                lines.append(f"  [FAIL] credentials — {type(exc).__name__}: {exc}")
+        else:
+            lines.append(
+                "  [WARN] credentials — no valid FERNET key configured "
+                "(credential commands disabled)"
+            )
+            lines.append("      → set AUTOCLAIMER_FERNET_KEY (see 'credential generate-key')")
+
+        # 4. Registered task definitions vs configuration wiring.
+        registered = set(self._manager._registry.type_ids)  # noqa: SLF001
+        configured = set(app.tasks)
+        unregistered = sorted(configured - registered)
+        if unregistered:
+            lines.append(
+                f"  [WARN] tasks — configured but not registered: {', '.join(unregistered)}"
+            )
+            lines.append("      → instances for these tasks are retired, not executed")
+        else:
+            lines.append(f"  [OK] tasks — {len(registered)} registered type(s)")
+
+        # 5. Account health + 6. worker/scheduler status.
+        try:
+            health = self._manager.health()
+            status = await self._manager.status()
+            by_account = {info.account_id: info for info in status.workers}
+            for profile in accounts_cfg.accounts:
+                state = health[profile.id].state.value if profile.id in health else "unknown"
+                worker = by_account.get(profile.id)
+                queued = worker.queued if worker is not None else 0
+                marker = "OK" if state in ("healthy", "connecting", "unknown") else "WARN"
+                lines.append(
+                    f"  [{marker}] account {profile.id} — health={state}, "
+                    f"worker={worker.state.value if worker else 'not spawned'}, queued={queued}"
+                )
+            lines.append(f"  [OK] scheduler — {len(status.workers)} worker(s) tracked")
+        except Exception as exc:  # pragma: no cover - defensive
+            lines.append(f"  [WARN] runtime — status unavailable: {type(exc).__name__}: {exc}")
+        return lines
+
+    async def audit_report(self, limit: int) -> list[str]:
+        """Recent audit events, newest first (roadmap item 11)."""
+        events = await self._store.audit_events(limit=limit)
+        if not events:
+            return ["audit: no events recorded yet"]
+        lines = [f"audit: {len(events)} most recent event(s)"]
+        for timestamp, category, action, account_id, task_id, detail in events:
+            who = f" account={account_id}" if account_id is not None else ""
+            what = f" task={task_id}" if task_id else ""
+            suffix = f" — {detail}" if detail else ""
+            lines.append(f"  {timestamp} {category}.{action}{who}{what}{suffix}")
+        return lines
+
+    def health_report(self) -> list[str]:
+        """Per-account health (roadmap item 6): state, last success,
+        consecutive failures, and the last (redacted) error."""
+        health = self._manager.health()
+        if not health:
+            return ["health: no accounts observed yet"]
+        lines = ["health:"]
+        for account in sorted(health):
+            snapshot = health[account]
+            lines.append(
+                f"  account {account}: {snapshot.state.value}"
+                f" | successes {snapshot.total_successes}"
+                f" | failures {snapshot.total_failures}"
+                f" (streak {snapshot.consecutive_failures})"
+                f" | last success "
+                f"{snapshot.last_success_at.isoformat() if snapshot.last_success_at else '—'}"
+            )
+            if snapshot.last_error:
+                lines.append(f"    last error: {snapshot.last_error}")
         return lines
 
     # ----- account controls (valid before start) -----
@@ -576,6 +848,65 @@ class CliSession:
         self._exact_args(args, 0)
         return await self._controller.integrity_report()
 
+    async def _cmd_health(self, args: list[str]) -> list[str]:
+        """Per-account health: state, streaks, last success, last error."""
+        self._exact_args(args, 0)
+        return self._controller.health_report()
+
+    async def _cmd_retry(self, args: list[str]) -> str:
+        """Dead-letter manual retry: failed -> pending, fresh attempts."""
+        self._exact_args(args, 2)
+        account_id = self._account_arg(args[0])
+        return await self._controller.retry_task(account_id, args[1])
+
+    async def _cmd_doctor(self, args: list[str]) -> list[str]:
+        """Operational diagnostics: config, database, credentials, tasks,
+        workers — read-only, with actionable hints."""
+        if len(args) not in (0, 2):
+            raise ValueError("usage: doctor [config.json accounts.json]")
+        config_path = args[0] if args else self._controller.default_config_path
+        accounts_path = args[1] if args else self._controller.default_accounts_path
+        return await self._controller.doctor_report(config_path, accounts_path)
+
+    async def _cmd_backup(self, args: list[str]) -> str:
+        """Consistent database backup (VACUUM INTO; refuses to overwrite)."""
+        self._exact_args(args, 1)
+        return await self._controller.backup_database(args[0])
+
+    async def _cmd_dbstats(self, args: list[str]) -> list[str]:
+        """Database growth snapshot (sizes, pages, row counts)."""
+        self._exact_args(args, 0)
+        return await self._controller.database_stats_report()
+
+    async def _cmd_reload(self, args: list[str]) -> list[str]:
+        """Runtime configuration reload (validated, atomic, audited)."""
+        if len(args) not in (0, 2):
+            raise ValueError("usage: reload [config.json accounts.json]")
+        config_path = args[0] if args else self._controller.default_config_path
+        accounts_path = args[1] if args else self._controller.default_accounts_path
+        return await self._controller.reload_config(config_path, accounts_path)
+
+    async def _cmd_audit(self, args: list[str]) -> list[str]:
+        """Recent audit events (newest first)."""
+        limit = 20
+        if args:
+            self._exact_args(args, 1)
+            try:
+                limit = int(args[0])
+            except ValueError:
+                raise ValueError(f"limit must be an integer, got {args[0]!r}") from None
+            if not 0 < limit <= 1000:
+                raise ValueError("limit must be in (0, 1000]")
+        else:
+            self._exact_args(args, 0)
+        return await self._controller.audit_report(limit)
+
+    async def _cmd_history(self, args: list[str]) -> list[str]:
+        """Execution history for one task (newest first)."""
+        self._exact_args(args, 2)
+        account_id = self._account_arg(args[0])
+        return await self._controller.history_report(account_id, args[1])
+
     def _state_arg(self, raw: str) -> TaskInstanceState:
         try:
             return TaskInstanceState(raw)
@@ -598,6 +929,14 @@ class CliSession:
         "status": _cmd_status,
         "credential": _cmd_credential,
         "integrity": _cmd_integrity,
+        "health": _cmd_health,
+        "retry": _cmd_retry,
+        "history": _cmd_history,
+        "audit": _cmd_audit,
+        "reload": _cmd_reload,
+        "backup": _cmd_backup,
+        "dbstats": _cmd_dbstats,
+        "doctor": _cmd_doctor,
     }
 
 
@@ -623,6 +962,14 @@ USAGE = """commands:
                                   restore credentials (validated, re-encrypted under primary)
   credential generate-key         print a fresh Fernet key (first-time setup only)
   integrity                       read-only database diagnostic (never modifies data)
+  health                          account health: state, streaks, last success/error
+  retry <account> <task>          requeue a dead-lettered (failed) task with fresh attempts
+  history <account> <task>        execution history (attempts, outcomes, timestamps)
+  audit [limit]                  recent audit events (lifecycle, controls, credentials)
+  reload [config accounts]       validate + atomically apply new configuration at runtime
+  backup <path>                  consistent database backup (VACUUM INTO; refuses to overwrite)
+  dbstats                        database growth snapshot (size, pages, rows)
+  doctor [config accounts]       read-only diagnostics: config, DB, credentials, tasks, workers
   help                            this help
   quit | shutdown                 graceful shutdown and exit"""
 
@@ -639,3 +986,67 @@ async def stdin_secret_reader(prompt: str) -> str:
     warning and falls back to echoed stdin — piped/automated use stays
     possible, visibly."""
     return await asyncio.to_thread(getpass.getpass, prompt)
+
+
+def install_termination_handlers(
+    trigger: Callable[[], None],
+    *,
+    signals: tuple[signal.Signals, ...] = (signal.SIGINT, signal.SIGTERM),
+) -> Callable[[], None]:
+    """Install loop-level graceful-termination handlers (roadmap item 10).
+
+    Semantics (failure behavior defined before implementation):
+
+    - The FIRST signal invokes *trigger* once — the composition's
+      graceful path (drain workers, close adapters and stores).
+    - A SECOND signal restores DEFAULT handling: the operator can always
+      force-exit a stuck graceful shutdown. Guaranteed escape hatch.
+    - The handler never raises into the event loop; *trigger* runs as a
+      plain callback (schedule async work yourself, e.g. task.cancel()).
+    - Returns an uninstall callable (tests / embedding).
+
+    Known limitation (documented in docs/running.md): a blocked
+    interactive stdin read lives on a worker thread and cannot be
+    cancelled — exit may wait for the pending line.
+    """
+    loop = asyncio.get_running_loop()
+    fired: list[bool] = []
+
+    def _handle(sig: signal.Signals) -> None:
+        if fired:
+            # Second signal: restore default (force) handling for ALL
+            # installed signals and re-raise so the process dies now.
+            uninstall()
+            os.kill(os.getpid(), sig)
+            return
+        fired.append(True)
+        logger.info(
+            "termination signal received; starting graceful shutdown",
+            extra={"operation": "signal", "outcome": sig.name},
+        )
+        try:
+            trigger()
+        except Exception:  # pragma: no cover - trigger is task.cancel()
+            logger.exception("termination trigger failed")
+
+    def uninstall() -> None:
+        for sig in signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):  # pragma: no cover - win
+                pass
+
+    for sig in signals:
+        try:
+            loop.add_signal_handler(sig, _handle, sig)
+        except (NotImplementedError, RuntimeError):
+            # Review finding (Major): Windows event loops do not support
+            # loop-level signal handlers — the unguarded install aborted
+            # CLI STARTUP before the session task even ran. Degrade to
+            # the platform default (Ctrl+C still interrupts the runner).
+            logger.warning(
+                "event loop does not support signal handlers (%s); using platform default handling",
+                sig.name,
+                extra={"operation": "signal", "outcome": "handler_unsupported"},
+            )
+    return uninstall

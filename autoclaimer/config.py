@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,23 @@ def _contains_credential_key(value: Any, where: str) -> bool:
     return False
 
 
+def _optional_timeout(value: Any, where: str) -> float | None:
+    """Optional task-execution timeout: absent/null disables; a positive
+    finite number (in (0, 86400]) enables. Booleans are rejected.
+
+    Review finding: no ``math.isfinite`` — it float-CONVERTS its input,
+    so an oversized INTEGER escaped as ``OverflowError`` instead of a
+    ``ConfigValidationError``. The range comparison alone already
+    rejects NaN (all comparisons false) and ±inf, without conversion."""
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not 0 < value <= 86400:
+        raise ConfigValidationError(
+            f"{where} must be a finite number in (0, 86400] seconds, or null to disable."
+        )
+    return float(value)
+
+
 def _parse_channels(raw: Any) -> ChannelsConfig:
     """Global channel section: roll_claim required, mu/rt optional/null.
 
@@ -187,9 +205,22 @@ _RATELIMIT_KEYS = {
 def _duration(value: Any, where: str, *, minimum: float = 0.0) -> float:
     # bool is a subclass of int, so explicitly reject it; accept int or
     # float — but never NaN/Infinity (JSON parsers accept both).
-    if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
-        raise ConfigValidationError(f"{where} must be a finite number >= {minimum}.")
-    return float(value)
+    # Sibling of the _optional_timeout finding: math.isfinite float-
+    # CONVERTS its input, so an oversized int escaped as OverflowError
+    # instead of ConfigValidationError — and the trailing float() would
+    # overflow the same way. Finite-check floats only (no conversion);
+    # convert inside a clean-error guard.
+    message = f"{where} must be a finite number >= {minimum}."
+    if type(value) not in (int, float):
+        raise ConfigValidationError(message)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigValidationError(message)
+    if value < minimum:
+        raise ConfigValidationError(message)
+    try:
+        return float(value)
+    except OverflowError:
+        raise ConfigValidationError(f"{where} is too large to represent.") from None
 
 
 def _jitter_pair(value: Any) -> tuple[float, float]:
@@ -310,9 +341,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         "config",
     )
     version = _int(_required(data, "version", "config"), "config.version", minimum=1)
-    if version != 1:
+    if version != CURRENT_CONFIG_VERSION:
         raise ConfigValidationError(
-            f"Unsupported config.version {version}; supported version is 1."
+            f"Unsupported config.version {version}; supported version is {CURRENT_CONFIG_VERSION}."
         )
 
     if "channels" not in data:
@@ -334,6 +365,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             "max_concurrent_accounts",
             "shutdown_timeout_seconds",
             "send_jitter_seconds",
+            "task_timeout_seconds",
         },
         "config.settings",
     )
@@ -357,6 +389,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             maximum=600,
         ),
         send_jitter_seconds=_jitter_pair(s.get("send_jitter_seconds")),
+        task_timeout_seconds=_optional_timeout(
+            s.get("task_timeout_seconds"), "config.settings.task_timeout_seconds"
+        ),
     )
 
     td = _object(data.get("task_defaults", {}), "config.task_defaults")
@@ -373,7 +408,7 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
         t = _object(raw_definition, f"config.tasks.{task_id}")
         _only_keys(
             t,
-            {"enabled", "retry_limit", "parameters", "ratelimit", "priority"},
+            {"enabled", "retry_limit", "timeout_seconds", "parameters", "ratelimit", "priority"},
             f"config.tasks.{task_id}",
         )
         tasks[task_id] = TaskDefinition(
@@ -381,6 +416,9 @@ def parse_app_config(raw: Mapping[str, Any]) -> AppConfig:
             enabled=_bool(t.get("enabled", defaults.enabled), f"config.tasks.{task_id}.enabled"),
             retry_limit=_int(
                 t.get("retry_limit", defaults.retry_limit), f"config.tasks.{task_id}.retry_limit"
+            ),
+            timeout_seconds=_optional_timeout(
+                t.get("timeout_seconds"), f"config.tasks.{task_id}.timeout_seconds"
             ),
             parameters=_parameters(t.get("parameters", {}), f"config.tasks.{task_id}.parameters"),
             ratelimit=(
@@ -483,11 +521,107 @@ def parse_accounts_config(raw: Mapping[str, Any], app_config: AppConfig) -> Acco
     return AccountsConfig(version=version, accounts=tuple(profiles))
 
 
+#: The configuration schema version this build reads and writes. Bump
+#: when a config.json format change ships, register a migrator for the
+#: previous version in ``_CONFIG_MIGRATIONS``, and document the change.
+CURRENT_CONFIG_VERSION = 1
+
+#: Sequential config migrations: ``from_version -> callable`` producing
+#: the NEXT version's document (without the version key — the framework
+#: bumps it). Empty until a v2 schema exists; tests exercise the
+#: machinery through :func:`register_config_migration`.
+ConfigMigrator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+_CONFIG_MIGRATIONS: dict[int, ConfigMigrator] = {}
+
+
+def register_config_migration(from_version: int, migrator: ConfigMigrator) -> None:
+    """Register the migration FROM *from_version* (to from_version+1).
+
+    The framework's contract with each migrator: receive the previous
+    document, return the next one WITHOUT the ``version`` key (the
+    framework sets it), and preserve unrelated user settings.
+    """
+    if from_version < 1 or from_version >= CURRENT_CONFIG_VERSION + 10:
+        raise ConfigValidationError(
+            f"cannot register a config migration from version {from_version}."
+        )
+    _CONFIG_MIGRATIONS[from_version] = migrator
+
+
+def migrate_config_document(
+    raw: Mapping[str, Any], *, target: int | None = None
+) -> tuple[dict[str, Any], list[int]]:
+    """Pure, sequential migration of *raw* toward *target* (no I/O).
+
+    Returns ``(document, applied_from_versions)``. Raises
+    ConfigValidationError when a step is missing from the chain (no
+    migration path) — before any file is touched.
+    """
+    if target is None:
+        target = CURRENT_CONFIG_VERSION
+    document = dict(raw)
+    applied: list[int] = []
+    version = document.get("version")
+    if not isinstance(version, int):
+        raise ConfigValidationError("config.version must be an integer.")
+    while version < target:
+        step = _CONFIG_MIGRATIONS.get(version)
+        if step is None:
+            raise ConfigValidationError(
+                f"no registered migration from config version {version} to "
+                f"{version + 1}; upgrade AutoClaimer (or migrate manually) "
+                "and retry."
+            )
+        document = dict(step(document))
+        version += 1
+        document["version"] = version
+        applied.append(version - 1)
+    return document, applied
+
+
+def _migrate_config_file(path: Path, raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the config file ON DISK (roadmap item 12).
+
+    Order of operations (fail-safe by construction):
+    1. migrate PURELY (a raising migrator changes nothing on disk);
+    2. VALIDATE the migrated document through the full parser (an
+       invalid result changes nothing on disk);
+    3. write a BACKUP of the original beside it (``<name>.vN.bak``) —
+       never overwriting an existing backup;
+    4. ATOMIC write (temp file + rename) — a crash cannot leave a
+       half-written config, and no ``.tmp`` litter survives.
+    """
+    migrated, applied = migrate_config_document(raw)
+    parse_app_config(migrated)  # fail-safe validation before any write
+    backup = path.with_name(f"{path.name}.v{raw.get('version')}.bak")
+    if not backup.exists():
+        backup.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "config migrated",
+        extra={"operation": "config.migrate", "outcome": ",".join(map(str, applied))},
+    )
+    return migrated
+
+
 def load_config(
     config_path: str | Path, accounts_path: str | Path
 ) -> tuple[AppConfig, AccountsConfig]:
-    """Load and validate both files, including cross-file task references."""
-    app = parse_app_config(_load_json(config_path))
+    """Load and validate both files, including cross-file task references.
+
+    Roadmap item 12: an outdated ``config.json`` version is migrated
+    (backup + atomic rewrite) before parsing. ``accounts.json`` follows
+    the application schema version and has no independent migrations.
+    """
+    path = Path(config_path)
+    raw = _load_json(path)
+    version = raw.get("version")
+    if isinstance(version, int) and version < CURRENT_CONFIG_VERSION:
+        raw = _migrate_config_file(path, raw)
+    app = parse_app_config(raw)
     accounts = parse_accounts_config(_load_json(accounts_path), app)
     return app, accounts
 
@@ -516,5 +650,12 @@ def resolve_task_config(
         task_id=task_id,
         enabled=task.enabled if override.enabled is None else override.enabled,
         retry_limit=task.retry_limit if override.retry_limit is None else override.retry_limit,
+        # Timeout precedence (roadmap item 7): task definition, then the
+        # settings default; None on both = timeouts disabled.
+        timeout_seconds=(
+            task.timeout_seconds
+            if task.timeout_seconds is not None
+            else app.settings.task_timeout_seconds
+        ),
         parameters=parameters,
     )

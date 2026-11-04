@@ -207,3 +207,43 @@ def test_rotation_failure_path_never_dumps_raw_record(
     captured = capsys.readouterr()
     combined = captured.out + captured.err
     assert secret not in combined
+
+
+def test_failed_reconfiguration_keeps_existing_handlers(tmp_path: Path) -> None:
+    """Review finding (reload hardening): setup_logging removed the old
+    handlers BEFORE constructing the new file handler — an OSError from
+    the new configuration left the logger with NO handlers. A failed
+    reconfiguration must leave the previous, working logging in place."""
+    good = LoggingSettings(log_file=str(tmp_path / "logs" / "first.log"))
+    logger = setup_logging(good, also_stderr=False)
+    before = list(logger.handlers)
+    assert before
+
+    # A log path whose PARENT IS A FILE: handler construction fails.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    bad = LoggingSettings(log_file=str(blocker / "sub" / "second.log"))
+
+    with pytest.raises(OSError):
+        setup_logging(bad, also_stderr=False)
+
+    assert logger.handlers == before, "failed reconfiguration dropped the old handlers"
+
+
+def test_failed_reconfiguration_keeps_previous_level(tmp_path: Path) -> None:
+    """Review follow-up: setLevel ran BEFORE handler construction — a
+    failed reconfiguration kept the old handlers but applied the NEW
+    level (e.g. ERROR silently swallowing INFO/WARNING records). Both
+    the handlers and the level must stay unchanged on failure."""
+    good = LoggingSettings(log_file=str(tmp_path / "logs" / "first.log"), level="INFO")
+    logger = setup_logging(good, also_stderr=False)
+    assert logger.level == logging.INFO
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    bad = LoggingSettings(log_file=str(blocker / "sub" / "second.log"), level="ERROR")
+
+    with pytest.raises(OSError):
+        setup_logging(bad, also_stderr=False)
+
+    assert logger.level == logging.INFO, f"failed reconfiguration changed the level: {logger.level}"

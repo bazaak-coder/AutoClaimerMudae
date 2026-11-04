@@ -11,7 +11,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-from .cli import AutoClaimerController, CliSession, stdin_reader
+from .cli import (
+    AutoClaimerController,
+    CliSession,
+    install_termination_handlers,
+    stdin_reader,
+)
 from .config import load_config
 from .logging_setup import setup_logging
 from .mock_adapter import MockAdapter
@@ -74,12 +79,30 @@ async def async_main(config_path: str, accounts_path: str) -> int:
         credentials=credential_store,
         credential_store=credential_store,
         idle_interval_seconds=5.0,
+        config_path=config_path,
+        accounts_path=accounts_path,
     )
     logger.info("cli session starting", extra={"operation": "cli.start"})
     session = CliSession(
         controller, read_line=stdin_reader, write=lambda line: print(line, flush=True)
     )
-    await session.run()
+    # Roadmap item 10 (graceful shutdown hardening): SIGINT *and* SIGTERM
+    # trigger the SAME graceful path — cancelling the session task runs
+    # run()'s finally-block (workers drained within the shutdown budget,
+    # adapters and stores closed). A SECOND signal restores default
+    # handling so an operator can always force-exit. Known limitation: a
+    # blocked interactive stdin read may delay exit until the pending
+    # line arrives (a worker thread cannot be cancelled).
+    session_task = asyncio.create_task(session.run())
+
+    def _request_termination() -> None:
+        session_task.cancel()
+
+    install_termination_handlers(_request_termination)
+    try:
+        await session_task
+    except asyncio.CancelledError:
+        pass  # signal-triggered: graceful shutdown already ran
     return 0
 
 

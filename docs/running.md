@@ -92,8 +92,16 @@ The interactive REPL (`help` inside the session shows the same):
 | `queue [account]` | Scheduling order with priorities |
 | `cooldowns` | Active cooldowns and permits |
 | `errors` | Recent failures and retry times |
+| `audit [limit]` | Structured audit trail: task lifecycle, account/runtime controls, credential operations — persisted (survives restart), secret-free, newest first |
+| `reload [config accounts]` | Runtime configuration reload: full validation first, atomic apply of the reloadable surface, restart-required settings reported (not applied), `configuration.changed` audited. In-flight executions keep the snapshot they were claimed with. |
+| `retry <account> <task>` | Dead-letter manual retry: failed → pending with a fresh attempt budget (worker woken immediately) |
+| `history <account> <task>` | Bounded execution history: attempt, outcome, message, timestamp per row (newest first) |
 | `status` | Worker status snapshot |
-| `integrity` | Read-only database diagnostic (never modifies data) |
+| `health` | Per-account health: state (`healthy`/`connecting`/`disconnected`/`degraded`/`auth_failed`/`rate_limited`/`disabled`), success/failure totals, current streak, last success, last (redacted) error |
+| `integrity` | Read-only database diagnostic: reports findings, never modifies data |
+| `doctor [config accounts]` | Read-only diagnostics: config, database, credentials, tasks, workers — with actionable hints |
+| `dbstats` | Database growth snapshot: size, pages, row counts |
+| `backup <path>` | Consistent database backup (VACUUM INTO; refuses to overwrite) |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
 | `help` | Command help |
 | `quit` / `exit` / `shutdown` | Graceful shutdown and exit |
@@ -103,6 +111,26 @@ Input rules: account ids must be known accounts for account-control commands
 config); extra/unknown arguments are errors, never silently ignored; store,
 limiter, adapter, and credential failures are reported without killing the
 session.
+
+### Database maintenance
+
+AutoClaimer runs SQLite's **rollback journal** (not WAL — the shared-memory
+mapping is unreliable in the target environment), so there are no WAL
+checkpoints to manage: the journal is removed automatically after every
+commit.
+
+- **Growth monitoring:** `dbstats` reports file size, page/free-page
+  counts, the live journal mode, and per-table row counts. Growth is
+  structurally bounded: audit events (latest 1000) and per-task history
+  (latest 50 attempts) are pruned on write.
+- **Backup:** `backup <path>` writes a consistent, compacted snapshot
+  (`VACUUM INTO`) through the store's serialized connection — safe while
+  idle, and safe to run live (it waits for concurrent writes; it never
+  produces a torn copy). Existing targets are never overwritten.
+- **Restoration:** stop the application, replace `state.db` with the
+  backup file, restart. Credentials in the backup decrypt only with the
+  key that encrypted them — keep key and backup pairing in mind when
+  restoring across environments.
 
 ## Logging
 
@@ -118,6 +146,9 @@ session.
 | Scenario | Behavior |
 |---|---|
 | `quit` / `exit` / Ctrl-C / EOF | Graceful: workers drain within `shutdown_timeout_seconds`, stores and adapters close, credentials provider released. |
+| **SIGTERM** | Graceful (same path as Ctrl-C): first signal drains and exits 0; a blocked task is left honestly `running` and recovers on the next start. |
+| **Second signal** (SIGINT/SIGTERM again) | Force-exit escape hatch: default handling is restored, so a stuck graceful shutdown can always be killed. |
+| **SIGKILL** | No guarantees (no handler can run): tested separately — the database stays consistent (rollback journal) and restart recovers. |
 | Crash / kill mid-execution | Any `running` row is recovered to `pending` at next start (at-least-once semantics — a handler may re-run). |
 | Crash mid-transaction | SQLite rollback-journal recovery; per-step migrations are transactional; startup shape-verification rejects tampered schemas. |
 | Restart between rounds | Learned Mudae windows, cooldowns, and retry schedules persist in `state.db` and resume on schedule. |
@@ -140,8 +171,9 @@ each covered by `tests/test_crash_recovery.py`:
 
 Duplicate-execution guarantees: a recovered row is claimable again, but
 exactly one claimer wins at a time (claim is an atomic compare-and-set) and
-terminal rows are never re-claimable. Full kill-signal coverage at the
-process boundary (SIGTERM/SIGINT handling) is roadmap item 10.
+terminal rows are never re-claimable. Kill-signal behavior at the process
+boundary (SIGTERM/SIGINT, graceful-then-forced) is implemented and covered
+by the signal-shutdown test suite.
 
 ### Database diagnostics and recovery
 
@@ -177,6 +209,5 @@ touched by an explicit operator action.
 6. Restart and re-run `integrity` — expect `OK`.
 
 Verified by test: startup recovery, retry-schedule persistence, restart
-during active work, transaction cancellation at every boundary. Full
-kill-signal coverage (SIGTERM/SIGINT/forced) is a tracked roadmap item
-(graceful shutdown hardening, item 10).
+during active work, transaction cancellation at every boundary, and
+kill-signal coverage (SIGTERM/SIGINT/forced second-signal exit).

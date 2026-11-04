@@ -69,7 +69,7 @@ async def test_fresh_open_creates_schema_and_version(tmp_path: Path) -> None:
     try:
         version_row = await s._run(s._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == s.schema_version == 5  # v4: ROLLS kind split
+        assert version_row[0] == s.schema_version == 7  # v4: ROLLS kind split
     finally:
         await s.close()
     reopened = await make_store(path)
@@ -118,7 +118,7 @@ async def test_v1_database_is_migrated_to_current(tmp_path: Path) -> None:
         assert len(rows) == 1
         version_row = await migrated._run(migrated._fetchone_sync, "PRAGMA user_version", ())
         assert version_row is not None
-        assert version_row[0] == migrated.schema_version == 5  # v4: ROLLS kind split
+        assert version_row[0] == migrated.schema_version == 7  # v4: ROLLS kind split
     finally:
         await migrated.close()
 
@@ -687,7 +687,7 @@ async def test_v3_mudae_state_migrates_to_v4_keeping_rows(tmp_path: Path) -> Non
     store2 = TaskStateStore(db, clock=FakeClock())
     await store2.open()
     try:
-        assert store2.schema_version == 5
+        assert store2.schema_version == 7
         deadlines = await store2.mudae_deadlines(1)
         assert deadlines[MudaeStateKind.RT] == _future(3600)
         assert deadlines[MudaeStateKind.CLAIM] == _future(1800)
@@ -735,3 +735,191 @@ async def test_mudae_state_prunes_expired_rows(tmp_path: Path) -> None:
         assert kinds == {"rt"}  # expired claim row pruned
     finally:
         await store.close()
+
+
+async def test_idempotent_rerecord_does_not_duplicate_history(
+    store: TaskStateStore,
+) -> None:
+    """LOW-034: the idempotent re-record path (a double record_success of
+    the identical outcome — crash-recovery re-record) must not append a
+    second task_history row for the same attempt; history is the
+    per-attempt execution trail."""
+    record = await seed(store)
+    await store.claim(record.id)
+    outcome = TaskOutcome(TaskStatus.SUCCEEDED, message="done")
+    await store.record_success(record.id, outcome)
+    await store.record_success(record.id, outcome)  # idempotent path
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, f"history duplicated for one attempt: {rows}"
+
+
+# --- BUG-038: pre-claim terminal failures are part of the history trail ---
+
+
+async def test_record_abandoned_appends_history(store: TaskStateStore) -> None:
+    """BUG-038: record_abandoned is the terminal path for pre-execution
+    failures (invalid config, removed assignment, unregistered type) —
+    it must appear in task_history like every other terminal outcome."""
+    record = await seed(store)
+    abandoned = await store.record_abandoned(record.id, "task not assigned to this account")
+    assert abandoned.status is TaskInstanceState.FAILED
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, f"pre-claim failure missing from history: {rows}"
+    attempt, status, message, _recorded_at = rows[0]
+    assert attempt == record.attempt_count
+    assert status == "abandoned"
+    assert "not assigned" in message
+
+
+async def test_record_abandoned_is_idempotent_without_duplicate_history(
+    store: TaskStateStore,
+) -> None:
+    """BUG-038 companion (LOW-034 contract): re-abandoning an already
+    failed instance is a no-op — no second history row."""
+    record = await seed(store)
+    await store.record_abandoned(record.id, "invalid task config")
+    again = await store.record_abandoned(record.id, "invalid task config")
+    assert again.status is TaskInstanceState.FAILED
+    rows = await store.task_history(record.id)
+    assert len(rows) == 1, rows
+
+
+async def test_record_abandoned_survives_history_write_failure(tmp_path: Path) -> None:
+    """BUG-038 auxiliary contract: a history-write failure must never
+    break or undo the authoritative terminal transition (the history
+    table is dropped to force the failure)."""
+    s = await make_store()
+    try:
+        record = await seed(s)
+        await s._run(  # noqa: SLF001 — forcing the auxiliary write to fail
+            s._update_sync, "DROP TABLE task_history", ()
+        )
+        abandoned = await s.record_abandoned(record.id, "invalid task config")
+        assert abandoned.status is TaskInstanceState.FAILED
+        row = await s.get_instance(record.id)
+        assert row.status is TaskInstanceState.FAILED
+        assert row.last_outcome is not None
+        assert "invalid task config" in row.last_outcome.message
+    finally:
+        await s.close()
+
+
+def test_cancelled_close_does_not_leak_connection(tmp_path: Path) -> None:
+    """ResourceWarning audit (CI 'unclosed database' warnings): a store
+    dropped without close, or a close cancelled mid-thread-hop, left the
+    connection open — at loop teardown the shielded threaded close is
+    destroyed, and the leak surfaced as an unclosed-database
+    ResourceWarning (CI attributed them to unrelated later tests). A
+    finalizer safety net must guarantee the close (at latest at
+    interpreter exit). The scenarios run on their OWN loops (a worker
+    thread) so teardown actually happens; the last references drop in
+    the MAIN thread inside the warning trap."""
+    import contextlib
+    import gc
+    import threading
+    import warnings
+
+    result: dict[str, object] = {}
+
+    def scenario() -> None:
+        async def abandoned() -> None:
+            store = TaskStateStore(tmp_path / "leak1.db")
+            await store.open()
+            result["abandoned"] = store  # keep the ref past the thread
+
+        async def cancelled() -> None:
+            store = TaskStateStore(tmp_path / "leak2.db")
+            await store.open()
+            result["cancelled_conn"] = store._conn  # noqa: SLF001
+            closer = asyncio.create_task(store.close())
+            await asyncio.sleep(0)
+            closer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await closer
+            result["cleared"] = store._conn is None  # noqa: SLF001
+
+        asyncio.run(abandoned())  # teardown destroys the store, no close
+        asyncio.run(cancelled())  # teardown destroys the abandoned shielded task
+
+    thread = threading.Thread(target=scenario)
+    thread.start()
+    thread.join(timeout=10)
+    assert result.get("cleared") is True, "close() bookkeeping did not clear"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result.clear()  # drop the last references HERE, in the trap
+        gc.collect()
+    leaked = [w for w in caught if "unclosed database" in str(w.message)]
+    assert not leaked, f"connection(s) leaked: {leaked}"
+
+
+async def test_requeue_history_uses_pre_reset_attempt(
+    store: TaskStateStore,
+) -> None:
+    """CLOSURE-004: the requeue history row carried a hard-coded attempt
+    0 — real attempts start at 1, so operators saw a phantom '#0' in the
+    history output. The row must reference the attempt count being
+    RESET (the dead-letter's last attempt)."""
+    record = await seed(store)
+    await store.claim(record.id)  # attempt 1
+    await store.record_failure(
+        record.id,
+        TaskOutcome(TaskStatus.FAILED_PERMANENT, message="dead-lettered"),
+        retry_at=None,
+    )
+    requeued = await store.requeue_instance(record.id)
+    assert requeued.attempt_count == 0  # fresh budget
+    rows = await store.task_history(record.id)
+    requeue_rows = [r for r in rows if r[1] == "requeued"]
+    assert requeue_rows, f"no requeue history row: {rows}"
+    assert requeue_rows[0][0] == 1, f"requeue history references a phantom attempt: {requeue_rows}"
+
+
+async def test_database_stats_maps_sqlite_errors(store: TaskStateStore) -> None:
+    """Review finding: database_stats called asyncio.to_thread directly,
+    bypassing _run — a raw sqlite3.Error escaped instead of the typed
+    PersistenceError every other store operation maps to."""
+
+    def _broken_connection() -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    store._connection = _broken_connection  # type: ignore[assignment]  # noqa: SLF001
+    with pytest.raises(PersistenceError):
+        await store.database_stats()
+
+
+async def test_history_messages_are_redacted_at_write(store: TaskStateStore) -> None:
+    """Review finding: _append_history persisted raw outcome messages —
+    a credential-shaped fragment inside a handler error reached the
+    task_history table (and every later `history` CLI render) unredacted.
+    Messages must be redacted at WRITE, exactly like audit events."""
+    fake = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.FgHiJkLmNoPqRsTuVwXyZ0123456789abcd"
+    record = await seed(store)
+    await store.claim(record.id)
+    await store.record_failure(
+        record.id,
+        TaskOutcome(TaskStatus.FAILED_PERMANENT, message=f"login failed: {fake}"),
+        retry_at=None,
+    )
+    rows = await store.task_history(record.id)
+    messages = [row[2] for row in rows]
+    assert messages, "no history row was written"
+    assert not any(fake in m for m in messages), (
+        "raw credential-shaped message persisted to task_history"
+    )
+    assert any("[REDACTED-TOKEN]" in m for m in messages)
+
+
+async def test_history_row_written_for_messageless_outcome(store: TaskStateStore) -> None:
+    """Latent hole found while fixing the above: TaskOutcome.message
+    defaults to None and None[:500] raised inside _append_history's
+    auxiliary try — the history row was SILENTLY dropped for every
+    message-less terminal outcome."""
+    record = await seed(store, task_id="quiet_test")
+    await store.claim(record.id)
+    await store.record_success(record.id, TaskOutcome(TaskStatus.SUCCEEDED))
+    rows = await store.task_history(record.id)
+    assert any(row[1] == "succeeded" for row in rows), (
+        f"history row silently dropped for message-less outcome: {rows}"
+    )

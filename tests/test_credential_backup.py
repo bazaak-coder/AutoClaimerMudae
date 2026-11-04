@@ -1054,22 +1054,34 @@ async def test_import_phase1_off_event_loop(tmp_path: Path) -> None:
 
     target = await _open(tmp_path / "target.db", env)
     try:
-        heartbeats = [0]
+        # The property under test: the event loop stays RESPONSIVE while
+        # the import runs. Measured as heartbeat COUNT plus the LONGEST
+        # gap between beats — robust to runner speed (the old fixed
+        # count >50 had only ~4% margin and flaked on a loaded runner:
+        # 48 observed). Healthy run: ~50 beats, ~5ms gaps. A blocked
+        # loop: ~1 beat and a gap ~= the whole import.
+        beats: list[float] = []
         stop = asyncio.Event()
 
         async def heartbeat() -> None:
+            loop = asyncio.get_running_loop()
             while not stop.is_set():
-                heartbeats[0] += 1
+                beats.append(loop.time())
                 await asyncio.sleep(0.005)
 
+        loop = asyncio.get_running_loop()
+        start = loop.time()  # covers blocking BEFORE the first beat
         hb = asyncio.create_task(heartbeat())
         imported, _ = await target.import_ciphertext(bundle)
         stop.set()
         await hb
+        end = loop.time()  # covers blocking AFTER the last beat
         assert imported == 2000
-        assert heartbeats[0] > 50, (
-            f"event loop stalled during import (only {heartbeats[0]} heartbeats)"
-        )
+        assert len(beats) > 10, f"event loop stalled during import (only {len(beats)} heartbeats)"
+        markers = [start, *beats, end]
+        gaps = [later - earlier for earlier, later in zip(markers, markers[1:], strict=False)]
+        worst = max(gaps, default=0.0)
+        assert worst < 0.2, f"event loop stalled during import (longest heartbeat gap {worst:.3f}s)"
     finally:
         target.close()
 

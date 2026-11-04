@@ -97,89 +97,105 @@ Establish a safe procedure for backing up and restoring credential-related data.
 
 **Priority: P1**
 
-### [ ] 5. Fault-Injection Testing
+### [x] 5. Fault-Injection Testing
 
 Introduce systematic failure testing across workers, adapters, persistence, and rate limiting.
 
 **Acceptance criteria:**
 
-- [ ] Simulate adapter disconnections.
-- [ ] Simulate database read and write failures.
-- [ ] Simulate delayed responses and timeouts.
-- [ ] Simulate task cancellation at critical execution points.
-- [ ] Simulate rate-limit exceptions and repeated cooldowns.
-- [ ] Verify worker recovery and shutdown behavior.
-- [ ] Verify no leaked asynchronous tasks.
-- [ ] Verify failures are observable through structured logs.
+- [x] Simulate adapter disconnections. — disconnect storm (heals inside the transport layer within one worker attempt) and never-healing disconnects (transport bound exhausts → terminal with the exhaustion reason persisted)
+- [x] Simulate database read and write failures. — `DatabaseBusyError` injected on the scheduling read (worker backs off, survives, completes) and on outcome recording (row stays honestly `running`; restart recovers and re-executes)
+- [x] Simulate delayed responses and timeouts. — a bounded handler against a stalled adapter: recoverable classification, bounded retries, terminal with exhaustion reason — never a hang
+- [x] Simulate task cancellation at critical execution points. — graceful stop while a handler is mid-execution: no leaked asyncio tasks, row recoverable, restart completes it
+- [x] Simulate rate-limit exceptions and repeated cooldowns. — repeated server-directed `CooldownError`s waited out via the limiter (fake-clock verified: two ≥30 s deferrals, exactly one real send, no burst)
+- [x] Verify worker recovery and shutdown behavior. — every scenario asserts subsequent work still completes and `stop()` drains within budget
+- [x] Verify no leaked asynchronous tasks. — `asyncio.all_tasks()` baseline comparison after every scenario (drain-tolerant)
+- [x] Verify failures are observable through structured logs. — classified "task handler crashed" record with `exc_info` carrying the injected reason + structured operation/outcome extras
+
+**Completed:** 2026-11-01 (`tests/test_fault_injection.py` — 9 scenarios). Note: `RecordingSleep` doubles as a fake clock (sleep advances wall/mono) — cooldown waits loop until the wall deadline, so an instant sleep alone would busy-spin in real time.
 
 **Dependencies:** Existing integration test infrastructure.
 
-### [ ] 6. Account Health Monitoring
+### [x] 6. Account Health Monitoring
 
 Introduce an account health model that distinguishes connection state from account usability.
 
-**Suggested states:** `HEALTHY`, `CONNECTING`, `DISCONNECTED`, `DEGRADED`, `AUTH_FAILED`, `RATE_LIMITED`, `DISABLED`.
+**Suggested states:** `HEALTHY`, `CONNECTING`, `DISCONNECTED`, `DEGRADED`, `AUTH_FAILED`, `RATE_LIMITED`, `DISABLED` (+ `UNKNOWN` for a fresh session).
 
 **Acceptance criteria:**
 
-- [ ] Track account connection state independently.
-- [ ] Record the last successful interaction.
-- [ ] Track consecutive failures.
-- [ ] Detect authentication failures.
-- [ ] Distinguish temporary disconnections from permanent failures.
-- [ ] Expose account health through CLI status commands.
-- [ ] Avoid logging tokens or other credentials.
-- [ ] Define how health changes affect task scheduling.
+- [x] Track account connection state independently. — per-account in-memory monitor (`autoclaimer/health.py`), one snapshot view per account
+- [x] Record the last successful interaction. — `last_success_at` (+ totals) per account
+- [x] Track consecutive failures. — streak counter with `DEGRADED` at the threshold (3); reset on success
+- [x] Detect authentication failures. — account-fatal events latch `AUTH_FAILED` (only the explicit revive path clears it)
+- [x] Distinguish temporary disconnections from permanent failures. — `DISCONNECTED` (transient) vs `AUTH_FAILED` (latched) vs `DEGRADED` (streak)
+- [x] Expose account health through CLI status commands. — new `health` command: state, totals, streak, last success, last error
+- [x] Avoid logging tokens or other credentials. — error text passes the redaction filter and is length-bounded (tested)
+- [x] Define how health changes affect task scheduling. — documented + asserted: `AUTH_FAILED`/`DISABLED` never schedule (existing fatal-stop/enabled enforcement); `RATE_LIMITED`/`DEGRADED`/`DISCONNECTED` are informational — deferral stays with the limiter and retry policy. Observation layer, not an enforcement layer.
+
+**Completed:** 2026-11-01 (`autoclaimer/health.py`, worker/adapter wiring, CLI `health`; `tests/test_account_health.py` — 11 scenarios incl. worker-level end-to-end and CLI exposure).
 
 **Dependencies:** Discord adapter and account runtime.
 
-### [ ] 7. Task Execution Timeouts
+### [x] 7. Task Execution Timeouts
 
 Prevent individual tasks from remaining active indefinitely.
 
 **Acceptance criteria:**
 
-- [ ] Support configurable task timeouts.
-- [ ] Ensure timeout cancellation propagates correctly.
-- [ ] Persist timeout outcomes.
-- [ ] Distinguish timeout failures from ordinary exceptions.
-- [ ] Ensure cleanup executes after cancellation.
-- [ ] Prevent a timed-out task from continuing in the background.
-- [ ] Test timeout behavior during adapter operations.
+- [x] Support configurable task timeouts. — `settings.task_timeout_seconds` (default) + per-task `timeout_seconds` override; precedence task → settings; `null`/absent disables (backward compatible); validated (finite, (0, 86400], booleans rejected)
+- [x] Ensure timeout cancellation propagates correctly. — `asyncio.wait` + explicit cancel-and-await: the handler's cancellation cleanup provably runs
+- [x] Persist timeout outcomes. — FAILED_RECOVERABLE with a distinct message via the normal outcome recording; terminal rows now carry the last failure reason ("…; last failure: task execution timed after Xs")
+- [x] Distinguish timeout failures from ordinary exceptions. — a still-pending task after the deadline is a timeout; a handler *raising* `TimeoutError` keeps its exception identity (handler-crash path, different message) — tested both ways
+- [x] Ensure cleanup executes after cancellation. — cleanup-tracking handler: the `except CancelledError` block provably runs
+- [x] Prevent a timed-out task from continuing in the background. — the child task is cancelled AND awaited; stray-task assertion in tests
+- [x] Test timeout behavior during adapter operations. — timeout fires mid `send_message` on a stalled adapter: op cancelled (nothing sent), outcome recorded
+
+Also fixed en passant: the retry-exhaustion terminal message now includes the last failure reason (observability for every recoverable failure — groundwork for item 8), and shutdown during the timeout window leaks no handler tasks (worker-cancel propagation).
+
+**Completed:** 2026-11-01 (`tests/test_task_timeouts.py` — 12 scenarios incl. config matrix, precedence, cancel/cleanup, adapter-op timeout, shutdown-in-window).
 
 **Dependencies:** Worker lifecycle and task persistence.
 
-### [ ] 8. Dead-Letter Handling
+### [x] 8. Dead-Letter Handling
 
 Introduce a controlled mechanism for tasks that repeatedly fail.
 
 **Acceptance criteria:**
 
-- [ ] Define configurable maximum retry attempts.
-- [ ] Persist the final failure reason.
-- [ ] Keep exhausted tasks inspectable.
-- [ ] Prevent automatic infinite retry loops.
-- [ ] Support explicit manual retry.
-- [ ] Preserve task execution history.
-- [ ] Ensure dead-letter transitions survive restart.
+- [x] Define configurable maximum retry attempts. — existing `task_defaults` → task → override chain (pinned again here: retry_limit 1 → exactly 2 attempts)
+- [x] Persist the final failure reason. — terminal rows carry `…; last failure: <reason>` (item-7 fix, asserted)
+- [x] Keep exhausted tasks inspectable. — `tasks failed` listing + new `history <account> <task>` command (attempt, status, message, timestamp per row)
+- [x] Prevent automatic infinite retry loops. — worker retry bound (asserted: attempt_count never exceeds limit+1); restart does NOT resurrect dead-lettered rows
+- [x] Support explicit manual retry. — `retry <account> <task>` CLI → `requeue_instance`: failed → pending with a fresh attempt budget, wake the worker, requeue event in history; non-failed rows are rejected with a typed error
+- [x] Preserve task execution history. — schema v6 `task_history`: one bounded row per recorded outcome (success/waiting/failed/requeued), retention 50 per instance, newest-first query
+- [x] Ensure dead-letter transitions survive restart. — tested across two restarts (dead-letter persists; requeue persists; row pending and due)
+
+Auxiliary contract (tested): a history-write failure is logged and swallowed — the `task_instances` outcome write is the source of truth and never breaks.
+
+**Completed:** 2026-11-01 (schema v6 migration + shape verification; `tests/test_dead_letter.py` — 7 scenarios).
 
 **Dependencies:** Retry scheduler and persistent task state.
 
-### [ ] 9. Rate-Limit Stress Testing
+### [x] 9. Rate-Limit Stress Testing
 
 Validate rate-limiter behavior under concurrent account and task workloads.
 
 **Acceptance criteria:**
 
-- [ ] Test concurrent requests across multiple accounts.
-- [ ] Test sequential tasks within an account.
-- [ ] Verify account-specific policies.
-- [ ] Verify task-specific policies.
-- [ ] Verify global limits.
-- [ ] Verify cooldown handling.
-- [ ] Test repeated rate-limit responses.
-- [ ] Verify cancellation does not bypass limiter cleanup.
-- [ ] Confirm that retry scheduling does not create request bursts.
+- [x] Test concurrent requests across multiple accounts. — 6 accounts × 2 tasks × 3 sends under one global min-interval
+- [x] Test sequential tasks within an account. — per-account overlap violations asserted zero under concurrent load
+- [x] Verify account-specific policies. — strict account paced at its interval while the other stayed fast (measured real gaps)
+- [x] Verify task-specific policies. — task-level interval reached operations end to end through the worker's policy binding
+- [x] Verify global limits. — `max_concurrent_accounts` peak never exceeded 3 slots under 12 concurrent task executions
+- [x] Verify cooldown handling. — repeated server-directed 429s waited out via the limiter (fake-clock verified)
+- [x] Test repeated rate-limit responses. — two consecutive cooldown scripts then success: exactly one real send
+- [x] Verify cancellation does not bypass limiter cleanup. — mid-flight cancellations left every permit at `in_use == 0` and a probe operation completed immediately
+- [x] Confirm that retry scheduling does not create request bursts. — cooldown waits ≥ the recorded window; no sub-interval send pairs on any account
+
+Measurement discipline: pacing tests use the REAL clock with generous floors (no exact-equality timing); cooldown storms use the fake clock (instant, clock-advancing) — mixing them silently destroys pacing measurement (found while building the suite).
+
+**Completed:** 2026-11-01 (`tests/test_rate_limit_stress.py` — 5 scenarios).
 
 **Dependencies:** Existing rate limiter and worker system.
 
@@ -189,24 +205,26 @@ Validate rate-limiter behavior under concurrent account and task workloads.
 
 **Priority: P2**
 
-### [ ] 10. Graceful Shutdown and Restart Hardening
+### [x] 10. Graceful Shutdown and Restart Hardening
 
 Standardize shutdown and recovery behavior across different termination scenarios.
 
 **Acceptance criteria:**
 
-- [ ] Test SIGINT.
-- [ ] Test SIGTERM.
-- [ ] Test graceful shutdown during active tasks.
-- [ ] Test forced process termination separately.
-- [ ] Verify adapters close correctly.
-- [ ] Verify worker tasks do not leak.
-- [ ] Verify eligible tasks resume after restart.
-- [ ] Document which termination scenarios cannot guarantee graceful cleanup.
+- [x] Test SIGINT. — real child process, full composition, termination mid-task
+- [x] Test SIGTERM. — same; previously SIGTERM was completely unhandled (instant death, no cleanup) — now wired to the same graceful path as Ctrl-C (`install_termination_handlers` + `__main__` wiring)
+- [x] Test graceful shutdown during active tasks. — blocked handler mid-execution: exit 0, GRACEFUL marker, row honestly `running`
+- [x] Test forced process termination separately. — SIGKILL: no marker, non-zero exit, database consistent, restart recovers
+- [x] Verify adapters close correctly. — in-process assertion: every adapter `closed` after shutdown
+- [x] Verify worker tasks do not leak. — in-process `asyncio.all_tasks()` baseline; process-level: a leaked-task child would hang the exit timeout
+- [x] Verify eligible tasks resume after restart. — restart with a working handler completes the interrupted row (both after graceful AND forced termination)
+- [x] Document which termination scenarios cannot guarantee graceful cleanup. — `docs/running.md` shutdown matrix: SIGKILL guarantees nothing; a blocked interactive stdin read may delay signal-triggered exit; second signal = documented force-exit escape hatch (tested)
+
+**Completed:** 2026-11-01 (`tests/test_signal_shutdown.py` — 5 scenarios; `install_termination_handlers` in cli.py; `__main__` signal wiring).
 
 **Dependencies:** Runtime lifecycle and persistence.
 
-### [ ] 11. Structured Audit Events
+### [x] 11. Structured Audit Events
 
 Introduce a consistent event trail for important runtime operations.
 
@@ -214,75 +232,91 @@ Introduce a consistent event trail for important runtime operations.
 
 **Acceptance criteria:**
 
-- [ ] Use structured event fields.
-- [ ] Include timestamps and relevant account/task identifiers.
-- [ ] Never include credentials or authentication tokens.
-- [ ] Separate audit events from debug logging.
-- [ ] Ensure important events remain useful after restart.
+- [x] Use structured event fields. — schema v7 `audit_events`: timestamp, category, action, account_id, task_id, detail (typed columns, not prose)
+- [x] Include timestamps and relevant account/task identifiers. — asserted per event
+- [x] Never include credentials or authentication tokens. — detail redacted at the emit boundary (tested with a token-shaped adversarial detail); credential events carry ids/actions only
+- [x] Separate audit events from debug logging. — dedicated `autoclaimer.audit` logger + persisted table, queryable via `audit [limit]` CLI — not buried in debug output
+- [x] Ensure important events remain useful after restart. — events persist across restarts (tested); bounded retention (latest 1000)
+
+Events wired: task started/completed/failed/retried/requeued, account paused/resumed/enabled/disabled, runtime paused/resumed, credential set/deleted/imported/exported/rotated. `configuration.changed` is reserved for the runtime-reload feature (item 13) — nothing changes configuration at runtime today. Emission is auxiliary (tested): an audit failure never breaks the audited operation.
+
+**Completed:** 2026-11-01 (`autoclaimer/audit.py`, schema v7, worker/controller emit sites, CLI `audit`; `tests/test_audit_events.py` — 8 scenarios).
 
 **Dependencies:** Logging and persistence architecture.
 
-### [ ] 12. Configuration Migration Framework
+### [x] 12. Configuration Migration Framework
 
 Prepare for future configuration schema changes without breaking existing installations.
 
 **Acceptance criteria:**
 
-- [ ] Introduce an explicit configuration schema version.
-- [ ] Detect outdated configuration versions.
-- [ ] Provide sequential migrations.
-- [ ] Validate migrated configuration.
-- [ ] Preserve existing user settings.
-- [ ] Back up configuration before migration.
-- [ ] Test migration from supported previous versions.
-- [ ] Fail safely when a migration cannot complete.
+- [x] Introduce an explicit configuration schema version. — `CURRENT_CONFIG_VERSION` in config.py; the parser names it in errors; `accounts.json` follows the application version (no independent migrations — documented)
+- [x] Detect outdated configuration versions. — `load_config` checks before parsing
+- [x] Provide sequential migrations. — `register_config_migration(from_version, migrator)` + pure `migrate_config_document` chain (version bumped by the framework, not migrators)
+- [x] Validate migrated configuration. — the migrated document goes through the FULL parser before anything is written
+- [x] Preserve existing user settings. — asserted (migrators copy and extend, never drop)
+- [x] Back up configuration before migration. — `<name>.vN.bak` beside the original; existing backups are never overwritten (tested)
+- [x] Test migration from supported previous versions. — the production chain is empty until v2 exists; the machinery is fully exercised through the PUBLIC registration API with a schema-compatible sample migration (the documented pattern for the first real schema change), incl. a two-step chain
+- [x] Fail safely when a migration cannot complete. — raising migrator OR invalid migrated document leaves the original file byte-identical (no backup, no .tmp); missing-chain and future-version errors are actionable
+
+Order of operations is fail-safe by construction: migrate purely → validate → backup → atomic tmp+rename.
+
+**Completed:** 2026-11-01 (`tests/test_config_migration.py` — 10 scenarios).
 
 **Dependencies:** Configuration models and validation.
 
-### [ ] 13. Safe Runtime Configuration Reload
+### [x] 13. Safe Runtime Configuration Reload
 
 Allow selected settings to change without restarting the entire application.
 
 **Acceptance criteria:**
 
-- [ ] Identify reloadable and restart-required settings.
-- [ ] Validate new configuration before applying it.
-- [ ] Apply changes atomically where possible.
-- [ ] Avoid partially applied configuration.
-- [ ] Ensure active tasks use a well-defined configuration snapshot.
-- [ ] Record configuration changes in audit events.
+- [x] Identify reloadable and restart-required settings. — reloadable: task definitions (enabled/parameters/retry/timeout), global channels, ratelimit layers, logging (handlers reconfigured idempotently), account assignments, shutdown timeout; restart-required (reported, never partially applied): `max_concurrent_accounts` (execution slots built at start), `send_jitter_seconds` (cached adapters)
+- [x] Validate new configuration before applying it. — full `load_config` validation first; an invalid reload is rejected and the running configuration keeps serving (tested)
+- [x] Apply changes atomically where possible. — single synchronous no-yield swap of (app, accounts) on the manager — worker iterations see the old pair or the new one, never a mix
+- [x] Avoid partially applied configuration. — restart-required settings are reported while the running values are kept; nothing is half-applied
+- [x] Ensure active tasks use a well-defined configuration snapshot. — each execution resolves its configuration at claim time; a reload mid-execution does not change the running task's channel (tested)
+- [x] Record configuration changes in audit events. — `configuration.changed` (the event reserved in item 11, now wired)
+
+Surface: CLI `reload [config accounts]` (defaults config.json/accounts.json) — validates, applies atomically, reports restart-required items, nudges workers, materializes new assignments.
+
+**Completed:** 2026-11-01 (`WorkerManager.update_configuration`/`reload_materialize`, controller `reload_config`, CLI `reload`; `tests/test_config_reload.py` — 5 scenarios).
 
 **Dependencies:** Configuration migration framework and runtime controls.
 
-### [ ] 14. SQLite Maintenance
+### [x] 14. SQLite Maintenance
 
 Introduce database maintenance procedures for long-running installations.
 
 **Acceptance criteria:**
 
-- [ ] Document WAL checkpoint behavior.
-- [ ] Monitor database file growth.
-- [ ] Provide safe backup procedures.
-- [ ] Avoid maintenance during conflicting active transactions.
-- [ ] Test maintenance while the runtime is idle.
-- [ ] Document restoration procedures.
+- [x] Document WAL checkpoint behavior. — the deployment deliberately runs the ROLLBACK journal, not WAL (shared-memory mapping unreliable in the target environment — `persistence._connect`); there are no WAL checkpoints, the journal is auto-removed after each commit, and `dbstats` surfaces the live journal mode so a silent switch cannot go unnoticed
+- [x] Monitor database file growth. — `dbstats` CLI + `database_stats()`: file size, page/free-page counts, per-table row counts; growth is structurally bounded by audit/history retention (verified end to end)
+- [x] Provide safe backup procedures. — `backup <path>` CLI + `backup_to()`: consistent snapshot via `VACUUM INTO` on the guarded connection (compacted, self-contained); refuses to overwrite existing targets
+- [x] Avoid maintenance during conflicting active transactions. — the backup serializes through the connection guard: a concurrent write completes first or waits within the busy timeout — never a torn copy (tested against an open write transaction on a second connection)
+- [x] Test maintenance while the runtime is idle. — idle backup + restoration verified on a seeded store
+- [x] Document restoration procedures. — `docs/running.md` "Database maintenance": stop (or back up live), replace `state.db` with the backup, remember key↔backup pairing for credentials
+
+**Completed:** 2026-11-01 (`tests/test_db_maintenance.py` — 5 scenarios).
 
 **Dependencies:** SQLite persistence.
 
-### [ ] 15. CLI Diagnostics
+### [x] 15. CLI Diagnostics
 
 Provide a diagnostic command for troubleshooting installations (`autoclaimer doctor`).
 
 **Acceptance criteria:**
 
-- [ ] Check configuration validity.
-- [ ] Check database accessibility and integrity.
-- [ ] Check credential-store availability without displaying secrets.
-- [ ] Check registered task definitions.
-- [ ] Report account connection status.
-- [ ] Report worker and scheduler status.
-- [ ] Provide actionable failure explanations.
-- [ ] Avoid modifying application state during ordinary diagnostics.
+- [x] Check configuration validity. — full parse of both files, FAIL-first with the actionable validation error
+- [x] Check database accessibility and integrity. — reuses the read-only integrity diagnostics (item 2); typed failure line with a hint on store errors
+- [x] Check credential-store availability without displaying secrets. — readiness + token COUNT only; WARN (never FAIL) when no Fernet key, with the setup hint
+- [x] Check registered task definitions. — registry types vs configured tasks: WARN on unregistered wiring gaps with the "retired, not executed" hint
+- [x] Report account connection status. — per-account health state (item 6) in the report
+- [x] Report worker and scheduler status. — worker state + queue depth per account, scheduler summary
+- [x] Provide actionable failure explanations. — every WARN/FAIL line carries a `→` hint; invalid config short-circuits with the fix instruction
+- [x] Avoid modifying application state during ordinary diagnostics. — strictly read-only: configuration is parsed WITHOUT migrating (verified — outdated config + registered migrator leaves the file byte-identical, no backup), database checks are the read-only diagnostics
+
+**Completed:** 2026-11-01 (CLI `doctor [config accounts]`; `tests/test_doctor.py` — 6 scenarios).
 
 **Dependencies:** Existing CLI, persistence, and runtime components.
 
@@ -292,36 +326,40 @@ Provide a diagnostic command for troubleshooting installations (`autoclaimer doc
 
 **Priority: P1/P2**
 
-### [ ] 16. Dependency Security Scanning
+### [x] 16. Dependency Security Scanning
 
 Add dependency vulnerability checks to CI.
 
 **Acceptance criteria:**
 
-- [ ] Scan production dependencies.
-- [ ] Scan development dependencies.
-- [ ] Report vulnerable dependency versions.
-- [ ] Define a policy for critical and high-severity findings.
-- [ ] Keep dependency lockfiles synchronized.
-- [ ] Avoid silently accepting known vulnerabilities.
+- [x] Scan production dependencies. — `uv export --locked --all-extras --no-emit-project` → pip-audit (resolved, hashed requirements)
+- [x] Scan development dependencies. — same export includes dev/test extras (ruff, mypy, pytest, hypothesis, xdist…)
+- [x] Report vulnerable dependency versions. — pip-audit output names package, version, and advisory IDs; job fails on ANY finding
+- [x] Define a policy for critical and high-severity findings. — policy: ANY known vulnerability fails the job; exceptions are EXPLICIT `--ignore-vuln` entries that must carry a reason + link in the PR that adds them (documented in the workflow)
+- [x] Keep dependency lockfiles synchronized. — `uv export --locked` itself fails when uv.lock drifts from pyproject.toml; the existing `verify-actions-lockfile` job pins action versions
+- [x] Avoid silently accepting known vulnerabilities. — weekly `schedule` re-scan: advisories published against versions we already ship retrigger the workflow even with no code change
+
+**Completed:** 2026-11-01 (CI `dependency-audit` job + weekly schedule; verified locally: current tree audits clean — "No known vulnerabilities found").
 
 **Dependencies:** GitHub Actions workflow.
 
-### [ ] 17. Static Analysis Enforcement
+### [x] 17. Static Analysis Enforcement
 
 Enforce consistent code-quality checks in CI.
 
 **Acceptance criteria:**
 
-- [ ] Run Ruff.
-- [ ] Run mypy.
-- [ ] Fail CI when enforced checks fail.
-- [ ] Keep configuration centralized.
-- [ ] Document intentional exceptions.
+- [x] Run Ruff. — lint + format-check as separate CI steps (`bash -e`, exit-code-strict)
+- [x] Run mypy. — strict mode, separate CI step
+- [x] Fail CI when enforced checks fail. — each check is its own step; a failure fails the job (verified the hard way: CI's newer ruff caught findings piped local runs had masked)
+- [x] Keep configuration centralized. — ruff + mypy + pytest config all in pyproject.toml; CI adds no flags
+- [x] Document intentional exceptions. — vendored `mudae_parser` + its three test files: excluded from ruff/mypy strict (byte-identical upstream, proven by its own 80-test suite — see autoclaimer/mudae_parser/VENDORED.md); no per-module mypy downgrades exist. ALSO: `scripts/gates.sh` runs the exact CI gates locally with `set -euo pipefail` and no output pipes — exit codes can no longer be masked
+
+**Completed:** 2026-11-01 (`scripts/gates.sh`; verification of the existing CI steps).
 
 **Dependencies:** Existing project configuration.
 
-### [ ] 18. Critical-Path Coverage
+### [x] 18. Critical-Path Coverage
 
 Improve test coverage around sensitive runtime components.
 
@@ -329,14 +367,16 @@ Improve test coverage around sensitive runtime components.
 
 **Acceptance criteria:**
 
-- [ ] Define meaningful coverage targets for critical modules.
-- [ ] Enforce targets in CI.
-- [ ] Prefer behavior and failure-path coverage over arbitrary line coverage.
-- [ ] Ensure important regressions have dedicated tests.
+- [x] Define meaningful coverage targets for critical modules. — `scripts/coverage-gates.py`: per-module floors on all 12 critical modules (credential_store 85%, persistence 92%, workers 89%, ratelimit 94%, config 92%, discord_adapter 79%, health 95%, audit 95%, cli 77%, mudae_tasks 88%, adapters 95%, logging_setup 90%) — each floor is the measured coverage minus a small buffer: regression fences, not vanity numbers (measured values recorded in the table's comments)
+- [x] Enforce targets in CI. — dedicated `coverage` job: pytest --cov → json → gates script; below-floor modules fail the job by name
+- [x] Prefer behavior and failure-path coverage over arbitrary line coverage. — no global `fail_under`; the suite is fail-first regression-driven (crash recovery, fault injection, cancellation matrices, adversarial redaction); floors only fence the critical paths
+- [x] Ensure important regressions have dedicated tests. — every confirmed bug since PR #2 landed with a fail-first regression test (established practice; coverage table records the result)
+
+**Completed:** 2026-11-01 (pytest-cov + floors script + CI job; measured baseline: TOTAL 89%).
 
 **Dependencies:** Existing test suite.
 
-### [ ] 19. Property-Based Testing
+### [x] 19. Property-Based Testing
 
 Use generated inputs to test invariants that are difficult to cover with example-based tests.
 
@@ -344,25 +384,31 @@ Use generated inputs to test invariants that are difficult to cover with example
 
 **Acceptance criteria:**
 
-- [ ] Define invariants before generating test cases.
-- [ ] Include malformed and boundary inputs.
-- [ ] Ensure failures are reproducible through saved examples or seeds.
-- [ ] Keep test execution practical for CI.
+- [x] Define invariants before generating test cases. — every property's docstring states its invariant BEFORE the generation (7 properties)
+- [x] Include malformed and boundary inputs. — invalid channel values (zero/negative/bool/float/text) always raise the TYPED error; boundary attempt counts (up to 10 000) and full-range timestamps
+- [x] Ensure failures are reproducible through saved examples or seeds. — hypothesis `derandomize=True`: re-runs reproduce the exact failing example (and the first run DID find a real bug — see below)
+- [x] Keep test execution practical for CI. — 75 examples/property, no deadlines; the whole property suite runs in ~3 s
+
+**Found a REAL bug on first run:** `_backoff_delay` computed `2 ** (attempt-1)` raw — OverflowError at attempt ≥ 1024 (a huge configured retry_limit would crash the limiter instead of capping). Fixed with a clamped exponent; the property now proves monotonicity + the cap for the full range.
+
+**Completed:** 2026-11-01 (`tests/test_property_based.py` — 7 properties; hypothesis added to test extras).
 
 **Dependencies:** Test infrastructure.
 
-### [ ] 20. Test Isolation
+### [x] 20. Test Isolation
 
 Ensure tests do not depend on execution order or shared external state.
 
 **Acceptance criteria:**
 
-- [ ] Isolate SQLite databases per test.
-- [ ] Isolate temporary configuration and credential files.
-- [ ] Avoid real Discord connections in ordinary CI.
-- [ ] Ensure asynchronous tasks are cleaned up.
-- [ ] Ensure tests can run independently.
-- [ ] Verify parallel test execution where supported.
+- [x] Isolate SQLite databases per test. — tmp_path file DBs per test or per-test `:memory:` databases (35 sites); zero shared database handles
+- [x] Isolate temporary configuration and credential files. — all config/credential fixtures generated under tmp_path per test
+- [x] Avoid real Discord connections in ordinary CI. — live-Discord tests skip by default (env-gated `pytestmark`, 3 tests; 1 dataset test); everything else runs on the deterministic mock
+- [x] Ensure asynchronous tasks are cleaned up. — leaked-task baseline assertions in the fault-injection, signal, and timeout suites; graceful-stop paths verified
+- [x] Ensure tests can run independently. — no order dependence: any single test runs green alone (no module-scoped mutable state)
+- [x] Verify parallel test execution where supported. — pytest-xdist added; the FULL suite runs green under `-n 4` (verified across repeated runs and wired into the CI coverage job — the strongest order/shared-state proof). Wall-clock pacing measurements self-skip under workers (recorded timestamps bunch under CPU contention even though the limiter ledger is honored — documented in the module) and run in the serial job
+
+**Completed:** 2026-11-01 (pytest-xdist in test extras; CI coverage job runs `-n 4`; timing-sensitive marker).
 
 **Dependencies:** Existing test infrastructure.
 
