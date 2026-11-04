@@ -1243,6 +1243,24 @@ class WorkerManager:
     async def _record(
         self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
     ) -> None:
+        # ERR-005: one bounded DatabaseBusyError retry, mirroring
+        # _reschedule — a single transient busy on the post-claim
+        # outcome write previously propagated to the loop guard and
+        # stranded the claimed row running until restart. A second
+        # failure still propagates (documented restart-recovery bucket).
+        try:
+            await self._record_once(instance_id, outcome, retry_at=retry_at)
+        except DatabaseBusyError:
+            logger.warning(
+                "outcome record hit a busy database; retrying once",
+                extra={"operation": "task.record", "outcome": "busy_retry"},
+            )
+            await asyncio.sleep(0.5)
+            await self._record_once(instance_id, outcome, retry_at=retry_at)
+
+    async def _record_once(
+        self, instance_id: int, outcome: TaskOutcome, *, retry_at: datetime | None
+    ) -> None:
         if outcome.status is TaskStatus.SUCCEEDED:
             await self._store.record_success(instance_id, outcome)
         else:

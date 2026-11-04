@@ -966,3 +966,77 @@ async def test_unprintable_handler_exception_still_records_outcome(
     finally:
         await manager.stop()
         await store.close()
+
+
+# ERR-005: a transiently-busy outcome write gets one bounded retry
+
+
+async def test_outcome_record_survives_one_busy_failure(tmp_path: Path) -> None:
+    """ERR-005: _record had no bounded retry (its sibling _reschedule
+    has one) — a single DatabaseBusyError on the post-claim outcome
+    write propagated to the loop guard and stranded the claimed row
+    running until manager restart."""
+
+    class _OnceBusyRecordStore:
+        def __init__(self, inner: TaskStateStore) -> None:
+            self._inner = inner
+            self.failed_once = False
+
+        async def record_success(self, instance_id: int, outcome: Any) -> Any:
+            if not self.failed_once:
+                self.failed_once = True
+                raise DatabaseBusyError("injected: outcome write locked")
+            return await self._inner.record_success(instance_id, outcome)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    async def handler(context: Any) -> TaskOutcome:
+        return TaskOutcome(TaskStatus.SUCCEEDED)
+
+    app = parse_app_config(
+        {
+            "version": 1,
+            "channels": {"roll_claim": 111111111111111111},
+            "settings": {"max_concurrent_accounts": 1, "shutdown_timeout_seconds": 2},
+            "ratelimit": {"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+            "tasks": {"job": {"parameters": {}}},
+        }
+    )
+    accounts = parse_accounts_config(
+        {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["job"]}]}, app
+    )
+    registry = TaskRegistry()
+    registry.register(
+        TaskType(
+            id="job",
+            description="probe",
+            validate_config=lambda config: None,
+            handler=handler,
+        )
+    )
+    real_store = TaskStateStore(tmp_path / "state.db")
+    await real_store.open()
+    manager = WorkerManager(
+        registry=registry,
+        store=_OnceBusyRecordStore(real_store),
+        limiter=RateLimiter(store=real_store),
+        app_config=app,
+        accounts=accounts,
+        adapter_factory=lambda account_id: MockAdapter(),
+        idle_interval_seconds=0.05,
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            row = await real_store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.SUCCEEDED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.SUCCEEDED, (
+            f"one busy outcome-write stranded the row: {row.status.value}"
+        )
+    finally:
+        await manager.stop()
+        await real_store.close()
