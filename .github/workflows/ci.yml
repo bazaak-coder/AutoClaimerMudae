@@ -8,12 +8,19 @@ on:
   # the dependency-audit job (workflow-structure recommendation
   # 2026-11-05); this workflow is PR/push verification only.
 
+# Recommendation B: obsolete runs on superseded PR commits are
+# cancelled instead of consuming Actions minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   quality:
     name: Lint, type-check, test (py${{ matrix.python-version }})
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +29,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+        with:
+          # Recommendation D: no authenticated Git operations here
+          persist-credentials: false
 
       - name: Install uv (with Python ${{ matrix.python-version }})
         uses: astral-sh/setup-uv@v6.4.0
@@ -45,12 +55,16 @@ jobs:
 
   coverage:
     name: Critical-path coverage gates
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+        with:
+          # Recommendation D: no authenticated Git operations here
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6.4.0
@@ -72,12 +86,16 @@ jobs:
 
   build:
     name: Build distribution
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+        with:
+          # Recommendation D: no authenticated Git operations here
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6.4.0
@@ -94,14 +112,43 @@ jobs:
           test -n "$(find dist -maxdepth 1 -name '*.tar.gz')" || { echo "no sdist"; exit 1; }
           test -n "$(find dist -maxdepth 1 -name '*.whl')" || { echo "no wheel"; exit 1; }
 
+      - name: Inspect wheel contents (no tests, dev files, or local config)
+        # Recommendation A: the wheel must ship ONLY the package and its
+        # metadata — source-tree tests cannot detect packaging leaks.
+        run: |
+          python -m zipfile -l dist/*.whl | awk 'NR>1 {print $1}' | sort > wheel-files.txt
+          cat wheel-files.txt
+          if grep -Eqi '(^|/)(tests|knowledgebase|\.venv|\.github)(/|$)|accounts\.json$|config\.json$|state\.db(\.|$)|\.db$|\.env$' wheel-files.txt; then
+            echo "::error::wheel packages files it must not (tests, dev files, local config, or credentials)"
+            grep -Ei '(^|/)(tests|knowledgebase|\.venv|\.github)(/|$)|accounts\.json$|config\.json$|state\.db(\.|$)|\.db$|\.env$' wheel-files.txt || true
+            exit 1
+          fi
+          # Everything must live under autoclaimer/ or the dist-info.
+          if grep -Ev '^(autoclaimer/|autoclaimer-[0-9][^/]*\.dist-info/)' wheel-files.txt; then
+            echo "::error::wheel contains paths outside the package"
+            exit 1
+          fi
+
+      - name: Clean-install the wheel (no dev extras) and import it
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/pip install --quiet dist/*.whl
+          /tmp/wheel-check/bin/pip check
+          /tmp/wheel-check/bin/python -c \
+            "import autoclaimer, autoclaimer.cli, autoclaimer.mudae_parser; print('import-ok')"
+
   verify-actions-lockfile:
     name: Verify actions lockfile
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+        with:
+          # Recommendation D: no authenticated Git operations here
+          persist-credentials: false
 
       - name: Verify pinned actions against the lockfile
         run: |
