@@ -53,8 +53,16 @@ reviews:
           implementation details rather than the documented contract.
     - path: ".github/workflows/**"
       instructions: |
-        - Least-privilege permissions, pinned action SHAs, no secrets
-          exposed to untrusted code, no live Discord account actions in CI.
+        - Least-privilege permissions; no secrets exposed to untrusted
+          code; no live Discord account actions in CI.
+        - Action pinning model (do NOT flag version tags): every `uses:`
+          ref is a version tag locked by `.github/workflows/actions.lock`
+          (per-workflow allowlist of exact refs with resolved commits and
+          owner/repo IDs), enforced by the required "Verify actions
+          lockfile" CI job on every PR. Full-SHA refs are intentionally
+          NOT used: gh actions-lock normalizes SHA refs back to tags.
+          Legitimate findings: actions missing from the lockfile, refs
+          not covered by the verify job, or elevated permissions.
   auto_review:
     enabled: true
     drafts: false
