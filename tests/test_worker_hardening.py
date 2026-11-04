@@ -1978,3 +1978,54 @@ async def test_timeout_suppressing_completion_is_permanent_no_duplicate(
         with suppress(Exception):
             await manager.stop()
         await store.close()
+
+
+async def test_persistence_error_escaping_suppressed_cancel_not_retried(
+    tmp_path: Path,
+) -> None:
+    """PR #14 review (Major): an exception escaping a SUPPRESSED timeout
+    cancellation kept its identity and landed in _execute's
+    except-PersistenceError branch — classified RECOVERABLE and retried
+    after the attempt's side effects had already landed. The escapee
+    must be marked: terminal PERMANENT, exactly once executed."""
+    side_effects: list[str] = []
+
+    async def handler(context: Any) -> TaskOutcome:
+        try:
+            await asyncio.Event().wait()  # park until the timeout cancels
+        except asyncio.CancelledError:
+            side_effects.append(context.task_id)  # the duplicate-risk action
+            raise DatabaseBusyError("late store busy (injected)") from None  # transient-looking
+        raise AssertionError("unreachable")
+
+    manager, store = await _one_account_manager(
+        tmp_path,
+        handler,
+        settings={"task_timeout_seconds": 0.15},
+        task_settings={"retry_limit": 3},  # a retry WOULD run on the bug
+        ratelimit={"backoff_base_seconds": 0.01, "backoff_cap_seconds": 0.02},
+    )
+    try:
+        await manager.start()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        row = await store.get_instance_by_ids(ACCOUNT, "job")
+        while asyncio.get_running_loop().time() < deadline:
+            row = await store.get_instance_by_ids(ACCOUNT, "job")
+            if row.status is TaskInstanceState.FAILED:
+                break
+            await asyncio.sleep(0.02)
+        assert row.status is TaskInstanceState.FAILED, (
+            f"row never reached terminal failed: {row.status.value}"
+        )
+        await asyncio.sleep(0.3)  # any retry would have started by now
+        assert side_effects == ["job"], (
+            f"escaping persistence error was retried (duplicate side effects): {side_effects}"
+        )
+        assert row.attempt_count == 1, f"budget consumed by retries: {row.attempt_count}"
+        assert row.last_outcome is not None and "suppressed cancellation" in (
+            row.last_outcome.message or ""
+        ), f"outcome message does not name the escape: {row.last_outcome}"
+    finally:
+        with suppress(Exception):
+            await manager.stop()
+        await store.close()

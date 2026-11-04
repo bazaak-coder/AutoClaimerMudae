@@ -88,6 +88,16 @@ class _Unwind(Enum):
     ABANDONED = "abandoned"  # suppressed the cancel, still running — never retry
 
 
+class _EscapedCancelledAttempt(Exception):
+    """PR #14 review (Major): an exception raised by a handler AFTER it
+    suppressed a timeout cancellation. The attempt's cancellation was
+    not respected, so its outcome is uncertain and it must NEVER be
+    retried (duplicate-side-effect risk) — even when the escaped
+    exception is PersistenceError-family transient that would otherwise
+    classify recoverable. The original exception is preserved as
+    ``__cause__``; the worker records the attempt terminally."""
+
+
 def _safe_error_text(error: BaseException | str) -> str:
     """ERR-004: an exception whose ``__str__`` raises (plugin wrapping
     lazily-evaluated state) must not break outcome messages — fall back
@@ -1183,6 +1193,38 @@ class WorkerManager:
                 return
             except asyncio.CancelledError:
                 raise  # uncertain outcome: instance stays running
+            except _EscapedCancelledAttempt as exc:
+                # PR #14 review (Major): this exception escaped a handler
+                # AFTER it suppressed a timeout cancellation — the
+                # attempt's outcome is uncertain (side effects may have
+                # landed), so never retry it, even though the cause may
+                # be a PersistenceError-family transient.
+                cause = exc.__cause__ or exc  # __cause__ None only if raised bare
+                self._health_failure(account_id, cause)
+                logger.error(
+                    "task handler raised after suppressing cancellation; "
+                    "failing attempt permanently",
+                    extra={
+                        "account_id": account_id,
+                        "task_id": record.task_id,
+                        "operation": "task.execute",
+                        "outcome": "suppressed_cancel_escape",
+                    },
+                )
+                await self._record(
+                    record.id,
+                    TaskOutcome(
+                        TaskStatus.FAILED_PERMANENT,
+                        message=(
+                            "task execution timed out; handler suppressed "
+                            f"cancellation and raised {type(cause).__name__} — "
+                            "attempt failed permanent (outcome uncertain; "
+                            "manual requeue once verified)"
+                        ),
+                    ),
+                    retry_at=None,
+                )
+                return
             except PersistenceError as exc:
                 # Audit fix: a persistence fault raised INSIDE a handler
                 # (deadline read/write) is a transient infrastructure
@@ -1365,7 +1407,18 @@ class WorkerManager:
             raise
         if pending:
             task.cancel()
-            unwind = await self._await_child_unwind(task, context=context)
+            try:
+                unwind = await self._await_child_unwind(task, context=context)
+            except asyncio.CancelledError:
+                raise  # this worker was cancelled: propagate
+            except AccountFatalError:
+                raise  # fatal containment is already never-retry
+            except Exception as exc:
+                # PR #14 review (Major): the escapee keeps its identity
+                # (as __cause__) but is MARKED — a suppressed-cancellation
+                # attempt must never be retried, and the PersistenceError
+                # branch must not classify it recoverable.
+                raise _EscapedCancelledAttempt from exc
             logger.warning(
                 "task execution timed out",
                 extra={
