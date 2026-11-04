@@ -65,7 +65,7 @@ def test_timeout_config_validation_and_precedence() -> None:
     )
 
 
-@pytest.mark.parametrize("bad", [0, -1, True, "5", 1e309])
+@pytest.mark.parametrize("bad", [0, -1, True, "5", 1e309, 10**400])
 def test_invalid_timeout_values_rejected(bad: Any) -> None:
     with pytest.raises(ConfigValidationError, match="timeout"):
         parse_app_config(

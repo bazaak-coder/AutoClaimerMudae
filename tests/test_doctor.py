@@ -139,8 +139,6 @@ async def test_corrupt_database_reports_findings(tmp_path: Path) -> None:
         conn = sqlite3.connect(tmp_path / "state.db")
         with conn:
             conn.execute(
-                "UPDATE task_instances SET status = 'garbage' WHERE id = -1"
-            ) if False else conn.execute(
                 "INSERT INTO scope_cooldowns (scope, deadline, server_directed) "
                 "VALUES ('x', 'garbage', 1)"
             )
@@ -152,7 +150,7 @@ async def test_corrupt_database_reports_findings(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_doctor_neever_migrates_an_outdated_config(tmp_path: Path) -> None:
+async def test_doctor_never_migrates_an_outdated_config(tmp_path: Path) -> None:
     """READ-ONLY proof: with an outdated config version and a REGISTERED
     migrator, doctor parses without rewriting — no .bak, no version
     bump, byte-identical file."""
@@ -173,7 +171,8 @@ async def test_doctor_neever_migrates_an_outdated_config(tmp_path: Path) -> None
         assert cfg_path.read_bytes() == before  # untouched
         assert not list(tmp_path.glob("*.bak"))
         # Doctor names the actionable version mismatch.
-        assert "Unsupported config.version" in report or "[FAIL] configuration" in report
+        assert "[FAIL] configuration" in report
+        assert "Unsupported config.version" in report
     finally:
         config_module.CURRENT_CONFIG_VERSION = 1
         config_module._CONFIG_MIGRATIONS.pop(1, None)
@@ -189,6 +188,6 @@ async def test_running_doctor_reports_worker_states(tmp_path: Path) -> None:
         await controller.start()
         await asyncio.sleep(0.2)  # workers spawn
         report = await _run_doctor(controller, tmp_path)
-        assert "worker=running" in report or "worker=idle" in report or "worker=" in report
+        assert "worker=running" in report or "worker=idle" in report
     finally:
         await controller.shutdown()

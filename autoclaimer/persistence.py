@@ -977,7 +977,11 @@ class TaskStateStore:
                 "rows": rows,
             }
 
-        return await asyncio.to_thread(_stats)
+        # Review finding: this was a raw asyncio.to_thread, bypassing
+        # _run — no store serialization and, worse, no sqlite3.Error →
+        # PersistenceError mapping (a raw driver error escaped to the
+        # CLI). Same path as every other store operation.
+        return await self._run(_stats)
 
     async def audit_events(self, *, limit: int = 50) -> tuple[tuple[Any, ...], ...]:
         """Recent audit events, newest first:

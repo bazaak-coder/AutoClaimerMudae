@@ -828,3 +828,131 @@ async def test_reload_racing_stop_spawns_no_ghost_worker(tmp_path: Path) -> None
         )
     finally:
         await controller.shutdown()
+
+
+# --- review round: stale runtime overrides and logging-reload hardening ---
+
+
+async def test_removed_accounts_runtime_override_does_not_outlive_removal(
+    tmp_path: Path,
+) -> None:
+    """Review finding: a runtime enabled-override for an account REMOVED
+    by reload was never discarded — re-adding the account left the stale
+    override shadowing its configured enabled state (a "runtime control"
+    from an era in which the account did not exist)."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        controller.manager.set_account_enabled(ACCOUNT, False)  # explicit override
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(tmp_path / "accounts.json", {"version": 1, "accounts": []})  # removed
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert controller.manager.account_enabled(ACCOUNT) is False  # parked
+
+        # Re-added with the configured default (enabled): the override
+        # from the removed era must NOT shadow it.
+        _write(
+            tmp_path / "accounts.json",
+            {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe"]}]},
+        )
+        lines = await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert controller.manager.account_enabled(ACCOUNT) is True, (
+            "stale runtime override from the removed era shadowed the re-added config"
+        )
+        assert not any("runtime" in line and str(ACCOUNT) in line for line in lines)
+    finally:
+        await controller.shutdown()
+
+
+async def test_fatal_accounts_override_survives_removal(tmp_path: Path) -> None:
+    """The never-revive policy for account-fatal accounts outranks a
+    re-add: the fatal containment's disable-override must SURVIVE the
+    account's removal (a reload must not revive a dead-credential
+    account by dropping the override)."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+        # Simulate the fatal containment latch (disable + fatal marker).
+        controller.manager._fatal_accounts.add(ACCOUNT)  # noqa: SLF001 — the latch under test
+        controller.manager.set_account_enabled(ACCOUNT, False)
+
+        _write(tmp_path / "config.json", _config_doc(tasks={"probe": {"parameters": {}}}))
+        _write(tmp_path / "accounts.json", {"version": 1, "accounts": []})
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        _write(
+            tmp_path / "accounts.json",
+            {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["probe"]}]},
+        )
+        await controller.reload_config(
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert controller.manager.account_enabled(ACCOUNT) is False, (
+            "re-adding a fatal account revived it (never-revive violated)"
+        )
+    finally:
+        await controller.shutdown()
+
+
+async def test_reload_survives_logging_reconfiguration_failure(tmp_path: Path) -> None:
+    """Review finding: reload_config reconfigured logging BEFORE adopting
+    the validated configuration and without handling OSError — an
+    unwritable log path aborted the whole reload (valid config never
+    applied) out of reload_config. Adoption must happen and the failure
+    must be reported, not raised."""
+    executions: list[float] = []
+    controller, store = _recurring_controller(tmp_path, executions)
+    await store.open()
+    try:
+        await controller.start()
+        await _wait_status(store, ACCOUNT, "probe", TaskInstanceState.WAITING)
+
+        blocker = tmp_path / "blocker"  # a FILE where a directory is needed
+        blocker.write_text("not a directory", encoding="utf-8")
+        _write(
+            tmp_path / "config.json",
+            {
+                **_config_doc(tasks={"probe": {"parameters": {}}}),
+                "logging": {
+                    "log_file": str(blocker / "sub" / "new.log"),
+                    "level": "INFO",
+                    "max_bytes": 100000,
+                    "backup_count": 1,
+                },
+            },
+        )
+        # Adoption is observed by ADDING an account (the registered probe
+        # task materializes for it) — independent of the broken logging.
+        _write(
+            tmp_path / "accounts.json",
+            {
+                "version": 1,
+                "accounts": [
+                    {"id": ACCOUNT, "tasks": ["probe"]},
+                    {"id": OTHER, "tasks": ["probe"]},
+                ],
+            },
+        )
+
+        lines = await controller.reload_config(  # must NOT raise
+            str(tmp_path / "config.json"), str(tmp_path / "accounts.json")
+        )
+        assert any("logging" in line and "fail" in line.lower() for line in lines), (
+            f"logging failure not reported: {lines}"
+        )
+        row = await store.get_instance_by_ids(OTHER, "probe")
+        assert row is not None, "valid configuration was not adopted due to the logging failure"
+    finally:
+        await controller.shutdown()

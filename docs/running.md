@@ -98,6 +98,10 @@ The interactive REPL (`help` inside the session shows the same):
 | `history <account> <task>` | Bounded execution history: attempt, outcome, message, timestamp per row (newest first) |
 | `status` | Worker status snapshot |
 | `health` | Per-account health: state (`healthy`/`connecting`/`disconnected`/`degraded`/`auth_failed`/`rate_limited`/`disabled`), success/failure totals, current streak, last success, last (redacted) error |
+| `integrity` | Read-only database diagnostic: reports findings, never modifies data |
+| `doctor [config accounts]` | Read-only diagnostics: config, database, credentials, tasks, workers — with actionable hints |
+| `dbstats` | Database growth snapshot: size, pages, row counts |
+| `backup <path>` | Consistent database backup (VACUUM INTO; refuses to overwrite) |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
 | `help` | Command help |
 | `quit` / `exit` / `shutdown` | Graceful shutdown and exit |
@@ -167,8 +171,9 @@ each covered by `tests/test_crash_recovery.py`:
 
 Duplicate-execution guarantees: a recovered row is claimable again, but
 exactly one claimer wins at a time (claim is an atomic compare-and-set) and
-terminal rows are never re-claimable. Full kill-signal coverage at the
-process boundary (SIGTERM/SIGINT handling) is roadmap item 10.
+terminal rows are never re-claimable. Kill-signal behavior at the process
+boundary (SIGTERM/SIGINT, graceful-then-forced) is implemented and covered
+by the signal-shutdown test suite.
 
 ### Database diagnostics and recovery
 
@@ -204,6 +209,5 @@ touched by an explicit operator action.
 6. Restart and re-run `integrity` — expect `OK`.
 
 Verified by test: startup recovery, retry-schedule persistence, restart
-during active work, transaction cancellation at every boundary. Full
-kill-signal coverage (SIGTERM/SIGINT/forced) is a tracked roadmap item
-(graceful shutdown hardening, item 10).
+during active work, transaction cancellation at every boundary, and
+kill-signal coverage (SIGTERM/SIGINT/forced second-signal exit).

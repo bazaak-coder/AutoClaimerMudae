@@ -104,18 +104,21 @@ def setup_logging(
 
     Repeated calls replace existing handlers (idempotent for tests and
     reconfiguration). Returns the configured logger.
+
+    Review finding (reload hardening): the swap is ATOMIC — the new file
+    handler is constructed (the failure point: unwritable path, missing
+    permissions) BEFORE any old handler is removed, so a failed
+    reconfiguration leaves the previous, working logging in place.
     """
     logger = logging.getLogger(logger_name)
     logger.setLevel(settings.level.upper())
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
 
     formatter = StructuredRedactingFormatter(
         fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
+    # Construct FIRST: an OSError here must not have removed anything.
     log_path = Path(settings.log_file)
     if log_path.parent and not log_path.parent.exists():
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +129,10 @@ def setup_logging(
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
     logger.addHandler(file_handler)
 
     if also_stderr:

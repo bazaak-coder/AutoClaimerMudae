@@ -158,8 +158,12 @@ class AccountHealthMonitor:
             # More specific than DISABLED: the credential is dead
             # regardless of the operator's disable.
             health.state = AccountHealthState.AUTH_FAILED
-        elif health.state is AccountHealthState.DISABLED:
-            pass  # BUG-036: a late in-flight failure keeps the latch
+        elif health.state in (AccountHealthState.AUTH_FAILED, AccountHealthState.DISABLED):
+            # BUG-036 + review finding: a late in-flight failure keeps
+            # EITHER latch — AUTH_FAILED previously leaked into
+            # DEGRADED/DISCONNECTED, masking the dead-credential state
+            # that only an explicit revive may clear.
+            pass
         elif health.consecutive_failures >= DEGRADED_THRESHOLD:
             health.state = AccountHealthState.DEGRADED
         else:

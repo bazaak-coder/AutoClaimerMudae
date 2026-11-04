@@ -874,3 +874,16 @@ async def test_requeue_history_uses_pre_reset_attempt(
     requeue_rows = [r for r in rows if r[1] == "requeued"]
     assert requeue_rows, f"no requeue history row: {rows}"
     assert requeue_rows[0][0] == 1, f"requeue history references a phantom attempt: {requeue_rows}"
+
+
+async def test_database_stats_maps_sqlite_errors(store: TaskStateStore) -> None:
+    """Review finding: database_stats called asyncio.to_thread directly,
+    bypassing _run — a raw sqlite3.Error escaped instead of the typed
+    PersistenceError every other store operation maps to."""
+
+    def _broken_connection() -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    store._connection = _broken_connection  # type: ignore[assignment]  # noqa: SLF001
+    with pytest.raises(PersistenceError):
+        await store.database_stats()

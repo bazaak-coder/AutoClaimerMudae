@@ -488,6 +488,15 @@ class WorkerManager:
         for account_id in list(self._enabled):
             if account_id not in configured_ids:
                 self._enabled[account_id] = False
+                # Review finding: a runtime enabled-override for a
+                # REMOVED account is stale — without this discard, a
+                # later re-add inherited an override from an era in
+                # which the account did not exist, shadowing its
+                # configured enabled state. FATAL accounts keep theirs:
+                # the fatal containment's never-revive policy outranks
+                # any re-add.
+                if account_id not in self._fatal_accounts:
+                    self._runtime_enabled_overrides.discard(account_id)
         for profile in self._accounts.accounts:
             if self._enabled.get(profile.id, profile.enabled):
                 await self._materialize(profile.id)
@@ -1735,11 +1744,16 @@ class WorkerManager:
         LOW-033: the pending emission is strongly referenced (see
         ``_audit_tasks``) so the collector can never drop it mid-flight;
         ``stop()`` gives outstanding emissions a bounded chance to land.
+
+        Review nit: the loop check runs BEFORE the coroutine is created —
+        the old ensure_future-in-try created the coroutine first and
+        abandoned it (RuntimeWarning: never awaited) on the no-loop path.
         """
         try:
-            task: asyncio.Task[None] = asyncio.ensure_future(self._audit.emit(**event))
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # no running loop: skip (the operation itself succeeded)
+        task: asyncio.Task[None] = loop.create_task(self._audit.emit(**event))
         self._audit_tasks.add(task)
         task.add_done_callback(self._audit_tasks.discard)
 

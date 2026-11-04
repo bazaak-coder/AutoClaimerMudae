@@ -404,3 +404,22 @@ async def test_disabled_latch_survives_inflight_completions() -> None:
     monitor.record_disabled(ACCOUNT)
     monitor.record_failure(ACCOUNT, "token revoked", fatal=True)
     assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.AUTH_FAILED
+
+
+def test_nonfatal_failure_preserves_auth_failed_latch() -> None:
+    """Review finding: record_failure preserved the DISABLED latch from a
+    late in-flight failure (BUG-036) but NOT AUTH_FAILED — a non-fatal
+    failure arriving after a fatal one overwrote it with
+    DISCONNECTED/DEGRADED, masking the dead-credential latch that only an
+    explicit revive may clear."""
+    monitor = AccountHealthMonitor()
+    monitor.record_failure(ACCOUNT, AccountFatalError("Login failed"), fatal=True)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.AUTH_FAILED
+
+    monitor.record_failure(ACCOUNT, "late in-flight hiccup")  # non-fatal
+
+    snap = monitor.snapshot()[ACCOUNT]
+    assert snap.state is AccountHealthState.AUTH_FAILED, (
+        f"non-fatal failure overwrote the fatal latch: {snap.state}"
+    )
+    assert snap.consecutive_failures == 2  # the streak itself still counts

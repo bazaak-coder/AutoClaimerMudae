@@ -128,10 +128,30 @@ def _spawn(workdir: Path, mode: str) -> subprocess.Popen[str]:
     )
 
 
-def _await_ready(proc: subprocess.Popen[str]) -> str:
+def _await_ready(proc: subprocess.Popen[str], timeout: float = 30.0) -> str:
+    """Bounded readiness wait (review finding): a stalled or crashed
+    child must FAIL the test with its output — including any traceback —
+    not hang the run on a blocking readline."""
     assert proc.stdout is not None
-    line = proc.stdout.readline()
-    assert line.strip() == "READY", f"child not ready: {line!r}"
+    stdout = proc.stdout
+    import threading
+
+    got: dict[str, str] = {}
+
+    def _read() -> None:
+        got["line"] = stdout.readline()
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():  # stalled child: kill, drain, fail loudly
+        proc.kill()
+        out, _ = proc.communicate(timeout=10)
+        raise AssertionError(f"child never became READY within {timeout}s; output so far:\n{out}")
+    line = got.get("line", "")
+    if line.strip() != "READY":
+        out, _ = proc.communicate(timeout=10)
+        raise AssertionError(f"child not ready: {line!r}; remaining output:\n{out}")
     return line
 
 
@@ -220,27 +240,33 @@ def test_forced_kill_keeps_database_consistent_and_resumable(tmp_path: Path) -> 
 # --- second-signal escape hatch -----------------------------------------------------
 
 
-def test_second_signal_forces_exit_from_stuck_graceful(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
+def test_second_signal_forces_exit_from_stuck_graceful(tmp_path: Path, sig: signal.Signals) -> None:
     """A graceful shutdown that never progresses ("hang" mode): the
     SECOND signal restores default handling and kills the process — the
-    operator always retains a force-exit."""
+    operator always retains a force-exit. Review finding: parametrized
+    over BOTH signals (each sent on both attempts), and the return code
+    must match termination BY that signal — a nonzero exception-based
+    exit must not pass as a forced exit."""
     work = tmp_path / "run"
     proc = _spawn(work, "hang")
     try:
         _await_ready(proc)
-        proc.send_signal(signal.SIGTERM)
+        proc.send_signal(sig)
         # The stuck graceful path never prints GRACEFUL; give it a beat,
         # then force.
         import time
 
         time.sleep(0.5)
         assert proc.poll() is None  # still alive: first signal swallowed
-        proc.send_signal(signal.SIGTERM)
+        proc.send_signal(sig)
         out, _ = proc.communicate(timeout=20)
     finally:
         if proc.poll() is None:  # pragma: no cover - safety
             proc.kill()
-    assert proc.returncode != 0  # force-killed by the second signal
+    assert proc.returncode == -int(sig), (  # killed BY the signal on POSIX
+        f"child exit {proc.returncode} is not forced termination by {sig.name}"
+    )
     assert "GRACEFUL" not in out
 
 

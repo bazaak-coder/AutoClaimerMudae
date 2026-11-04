@@ -274,17 +274,31 @@ class AutoClaimerController:
             )
         if old.settings.send_jitter_seconds != new_app.settings.send_jitter_seconds:
             restart_required.append("settings.send_jitter_seconds")
-        if old.logging != new_app.logging:
-            setup_logging(new_app.logging)  # idempotent: replaces handlers
-            lines.append(f"logging reconfigured (level {new_app.logging.level})")
+        logging_changed = old.logging != new_app.logging
 
         # Atomic adoption (single synchronous swap — no partial states).
+        # Review finding: this runs BEFORE the logging reconfiguration —
+        # an unwritable log path used to abort the whole reload before
+        # the VALID configuration was applied, and raised out of the
+        # command. Adoption is not conditional on logging.
         self._manager.update_configuration(new_app, new_accounts)
         self._app_config = new_app
         self._accounts = new_accounts
         # BUG-030: reload_materialize applies account enabled changes and
         # returns notes for any runtime override that shadowed the config.
         lines.extend(await self._manager.reload_materialize())
+        if logging_changed:
+            try:
+                setup_logging(new_app.logging)  # idempotent: replaces handlers
+                lines.append(f"logging reconfigured (level {new_app.logging.level})")
+            except OSError as exc:
+                # setup_logging is atomic (old handlers survive a failed
+                # reconfiguration): the session keeps usable logging and
+                # the operator learns the new settings are broken.
+                lines.append(
+                    f"logging reconfiguration FAILED ({exc}); previous logging kept — "
+                    "fix settings.logging and reload again"
+                )
         await self._audit.emit(
             category="configuration",
             action="changed",

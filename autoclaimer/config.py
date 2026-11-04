@@ -118,10 +118,15 @@ def _contains_credential_key(value: Any, where: str) -> bool:
 
 def _optional_timeout(value: Any, where: str) -> float | None:
     """Optional task-execution timeout: absent/null disables; a positive
-    finite number (in (0, 86400]) enables. Booleans are rejected."""
+    finite number (in (0, 86400]) enables. Booleans are rejected.
+
+    Review finding: no ``math.isfinite`` — it float-CONVERTS its input,
+    so an oversized INTEGER escaped as ``OverflowError`` instead of a
+    ``ConfigValidationError``. The range comparison alone already
+    rejects NaN (all comparisons false) and ±inf, without conversion."""
     if value is None:
         return None
-    if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 86400:
+    if type(value) not in (int, float) or not 0 < value <= 86400:
         raise ConfigValidationError(
             f"{where} must be a finite number in (0, 86400] seconds, or null to disable."
         )

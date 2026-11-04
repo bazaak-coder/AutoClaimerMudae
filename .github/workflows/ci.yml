@@ -96,7 +96,15 @@ jobs:
         # exceptions are EXPLICIT and must carry a reason + expiry:
         # append `--ignore-vuln GHSA-XXXX-XXXX-XXXX` below with a
         # comment, and link the analysis in the PR that adds it.
+        #
+        # Review finding: pip-audit HONORS environment markers —
+        # platform/python-gated pins (tzdata on win32, colorama on
+        # win32, audioop-lts on 3.13+) were silently skipped on this
+        # Linux runner. The policy is every LOCKED version (uv 0.13 has
+        # no --all-platforms export), so strip the markers in place;
+        # name==version and --hash stay untouched.
         run: |
+          sed -Ei 's/ ; [^\\]*\\$/ \\/' requirements.txt
           uvx pip-audit \
             --disable-pip \
             --require-hashes \
