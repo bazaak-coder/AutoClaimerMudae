@@ -42,4 +42,5 @@ __pycache__/
 .coverage
 
 # Runtime rotating log (never commit; written next to the CWD at runtime)
-autoclaimer.log
+*.log
+autoclaimer.log.*
