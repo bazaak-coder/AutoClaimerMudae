@@ -286,12 +286,21 @@ class DiscordAdapter:
             # CredentialProviderError — missing/dead credentials are
             # ACCOUNT-FATAL (the documented policy), not a generic
             # per-instance permanent failure.
+            # BUG-006 (PR #8 audit): the protocol is sync, and the store-
+            # backed provider can park on its connection guard for up to
+            # busy_timeout behind an import/export/rotate — the call ran
+            # ON the event loop, freezing every account. Off-load it.
             try:
-                token = self._credentials.get_token(self._account_id)
+                token = await asyncio.to_thread(self._credentials.get_token, self._account_id)
             except CredentialProviderError as exc:
                 fatal = AccountFatalError(f"credential provider: {exc}")
                 self._latch_fatal(fatal)  # is_healthy flips; account stops
                 raise fatal from exc
+            if self._closed:
+                # Review finding: a close() completing while the token
+                # fetch was off-loop previously resumed into login() on
+                # the closed client.
+                raise AdapterError("adapter closed during startup")
             try:
                 await self._client.login(token)
             except discord.DiscordException as exc:

@@ -293,3 +293,39 @@ async def test_rollback_journal_mode_is_the_deployment_mode(tmp_path: Path) -> N
     assert str(mode).lower() == "delete"  # rollback journal, no WAL
     # No stray journal artifacts remain after a clean close.
     assert not db.with_suffix(".db-journal").exists()
+
+
+async def test_wal_file_is_converted_back_to_rollback_journal(tmp_path: Path) -> None:
+    """BUG-002 (PR #8 audit): an inherited WAL database (left by an
+    external tool, a restored backup, or an older build) silently kept
+    running WAL — voiding the documented crash-recovery model and, in
+    the PRoot target, reintroducing the unreliable-WAL failure the
+    design excludes. The store must PIN the mode on every open."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    external = sqlite3.connect(db)
+    try:
+        external.execute("PRAGMA journal_mode = WAL").fetchone()
+    finally:
+        external.close()
+    conn = sqlite3.connect(db)
+    try:
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    finally:
+        conn.close()
+
+    store = TaskStateStore(db)
+    await store.open()
+    await store.create_instance(271485504361996288, "probe")  # usable
+    await store.close()
+
+    probe = sqlite3.connect(db)
+    try:
+        mode = str(probe.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    finally:
+        probe.close()
+    assert mode == "delete", (
+        f"store kept an inherited WAL journal mode: {mode} — the "
+        "crash-recovery guarantees describe the rollback journal"
+    )

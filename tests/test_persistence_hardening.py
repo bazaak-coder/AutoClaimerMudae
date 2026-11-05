@@ -1,6 +1,7 @@
 """Batch 3 regression tests (Phase 9 persistence hardening)."""
 
 import asyncio
+import contextlib
 import itertools
 import sqlite3
 import threading
@@ -541,5 +542,70 @@ async def test_guard_reorder_rollback_before_begin_still_cleans_up(tmp_path: Pat
         row = await store.get_instance(record.id)
         assert row.status is TaskInstanceState.RUNNING
         assert row.attempt_count == 1
+    finally:
+        await store.close()
+
+
+# --- PR #8 audit BUG-001: repeated cancellation vs the shielded drain ---
+
+
+async def test_double_cancel_preserves_innocent_acknowledged_write(
+    tmp_path: Path,
+) -> None:
+    """BUG-001 (PR #8 audit): a SECOND cancellation of a transaction-
+    owning task broke the shielded drain — the store lock was released
+    while the failed transaction was still open, an innocent concurrent
+    write's statements silently JOINED the zombie transaction, and the
+    delayed ROLLBACK destroyed the already-acknowledged write. With the
+    rollback GATE the write BLOCKS while the rollback is pending
+    (asserted deterministically), then survives it."""
+    store = await open_store(tmp_path)
+    try:
+        record = await store.create_instance(ACCOUNT, "probe")
+
+        # A tracked in-flight call that stalls the drain deterministically
+        # (as any long guarded call would: integrity_check, VACUUM INTO).
+        release = asyncio.Event()
+
+        async def staller() -> None:
+            await release.wait()
+
+        fake = asyncio.create_task(staller())
+        store._in_flight.add(fake)  # noqa: SLF001 — the widened window
+        fake.add_done_callback(store._in_flight.discard)  # noqa: SLF001
+
+        setup_done = asyncio.Event()  # claim landed — no timing assumption
+
+        async def txn_body() -> None:
+            async with store.transaction():
+                await store.claim(record.id)
+                setup_done.set()
+                await asyncio.sleep(30)  # park; the first cancel lands here
+
+        task_a = asyncio.create_task(txn_body())
+        await asyncio.wait_for(setup_done.wait(), timeout=5.0)
+        task_a.cancel()  # 1st cancel: the drain starts, parks on the staller
+        # 2nd cancel (broke the one-shot shield pre-fix) only once the
+        # cleanup is actually pending — event-driven, not a fixed sleep.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not store._rollback_pending and asyncio.get_running_loop().time() < deadline:  # noqa: SLF001 — the latch under test
+            await asyncio.sleep(0.01)
+        assert store._rollback_pending, "cleanup never became pending"  # noqa: SLF001
+        task_a.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task_a
+
+        # The innocent bystander: with the rollback pending, its write
+        # must BLOCK at the gate (deterministic — no timing dependence).
+        innocent_task = asyncio.create_task(store.create_instance(ACCOUNT, "innocent"))
+        await asyncio.sleep(0.2)
+        assert not innocent_task.done(), "the write ran while a rollback was pending (no gate)"
+        release.set()  # the drain completes; the ROLLBACK lands; the gate opens
+        innocent = await asyncio.wait_for(innocent_task, timeout=5.0)
+
+        probe = await store.get_instance(innocent.id)
+        assert probe is not None and probe.task_id == "innocent", (
+            f"acknowledged write destroyed by the delayed rollback: {probe}"
+        )
     finally:
         await store.close()

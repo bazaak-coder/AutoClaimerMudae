@@ -553,3 +553,24 @@ async def test_rotation_handles_malformed_text_ciphertext_typed(tmp_path: Path) 
             await store.rotate()
     finally:
         store.close()
+
+
+async def test_reopen_after_close_works(tmp_path: Path) -> None:
+    """BUG-007 (PR #8 audit): close() latched _closed forever — open()
+    after close() left the store permanently "not open" for embedders
+    and tooling (production constructs fresh stores, so it was latent)."""
+    from autoclaimer.credentials import CredentialProviderError
+
+    store = SQLiteCredentialStore(
+        tmp_path / "state.db", load_fernet_keys({PRIMARY_KEY_ENV: generate_fernet_key()})
+    )
+    await store.open()
+    await store.set_token(ACCOUNT, "fake-token")
+    store.close()
+    await store.open()  # the reopen under test
+    try:
+        assert await store.has_token(ACCOUNT) is True
+    except CredentialProviderError as exc:
+        raise AssertionError(f"reopen left the store unusable: {exc}") from exc
+    finally:
+        store.close()

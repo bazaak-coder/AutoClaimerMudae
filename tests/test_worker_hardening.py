@@ -1909,11 +1909,16 @@ async def test_unprintable_account_fatal_still_contains(
     try:
         with caplog.at_level(logging.WARNING, logger="autoclaimer.workers"):
             await manager.start()
-            deadline = asyncio.get_running_loop().time() + 3.0
+            # Poll for BOTH terminal states: the row's FAILED record and
+            # the account's containment disable are separate awaits —
+            # observing FAILED alone races the disable on a loaded runner
+            # (CI flake: "account never contained" while it landed a
+            # beat later).
+            deadline = asyncio.get_running_loop().time() + 5.0
             row = await store.get_instance_by_ids(ACCOUNT, "job")
             while asyncio.get_running_loop().time() < deadline:
                 row = await store.get_instance_by_ids(ACCOUNT, "job")
-                if row.status is TaskInstanceState.FAILED:
+                if row.status is TaskInstanceState.FAILED and not manager.account_enabled(ACCOUNT):
                     break
                 await asyncio.sleep(0.02)
         assert row.status is TaskInstanceState.FAILED, (

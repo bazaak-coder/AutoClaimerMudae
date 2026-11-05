@@ -305,6 +305,11 @@ def _map_sqlite_error(exc: sqlite3.Error) -> PersistenceError:
 #: transaction-cancellation cleanup (VERIFY-001 fix).
 _DRAIN_TIMEOUT_SECONDS = 5.0
 
+#: Outer bound for completing the drain-and-rollback under REPEATED
+#: cancellation (BUG-001): the drain's own 5s settle wait plus the
+#: ROLLBACK's guarded hop with margin.
+_CLEANUP_BOUND_SECONDS = _DRAIN_TIMEOUT_SECONDS + 2.0
+
 #: Per-instance execution-history retention (roadmap item 8): bounded so
 #: history can never grow the database unboundedly.
 _HISTORY_KEEP_PER_INSTANCE = 50
@@ -349,6 +354,13 @@ class TaskStateStore:
         self._clock = clock
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        # BUG-001 (PR #8 audit): while a failed transaction's ROLLBACK is
+        # pending, all other store calls wait at this gate — the guard
+        # serializes statements, but statements on an OPEN zombie
+        # transaction join it; the gate closes that window.
+        self._rollback_pending = False
+        self._rollback_landed = asyncio.Event()
+        self._rollback_tasks: set[asyncio.Task[None]] = set()
         # Task-scoped transaction flag: re-entrancy must never let a second
         # coroutine bypass the lock while another holds it.
         self._txn_owner: ContextVar[object | None] = ContextVar(
@@ -381,6 +393,21 @@ class TaskStateStore:
             # unreliable under PRoot thread emulation; this store is a single
             # serialized writer, which the default rollback journal serves
             # correctly on every filesystem.
+            # BUG-002 (PR #8 audit): PIN the mode — an inherited WAL file
+            # (external tool, restored backup, older build) previously
+            # stayed WAL silently, voiding every crash-recovery guarantee
+            # this module documents and test-pins.
+            is_memory = str(self._path) == ":memory:" or str(self._path).startswith("file::memory:")
+            pinned = str(conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0]).lower()
+            if pinned != "delete" and not is_memory:
+                # In-memory databases (tests) report "memory": no file,
+                # no crash-recovery model to pin — allowed. Any other
+                # mode means the pin itself failed — refuse rather than
+                # run on an unknown journal model.
+                raise PersistenceError(
+                    f"could not pin the rollback journal (got {pinned!r}); "
+                    "refusing to run on an unknown journal model"
+                )
             return conn
 
         async with self._lock:
@@ -542,6 +569,7 @@ class TaskStateStore:
     # ----- execution helpers -----
 
     async def _call_threaded(self, fn: Callable[..., _T], *args: Any) -> _T:
+        await self._await_rollback_gate()
         """Run *fn* on a worker thread, serialized by a CONNECTION GUARD.
 
         Repo-sweep fix (ChatGPT unranked risk, promoted by deterministic
@@ -576,6 +604,54 @@ class TaskStateStore:
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
 
+    def _begin_locked_rollback(self, where: str) -> asyncio.Task[None]:
+        """Start the drain-and-rollback as a tracked, shield-cleaned task
+        and LATCH the pending-rollback gate (BUG-001, PR #8 audit).
+
+        The old bare ``asyncio.shield(drain)`` absorbed exactly one
+        cancel — a second ``cancel()`` raised out of the shield while the
+        drain was parked, ``transaction()`` unwound through
+        ``async with self._lock`` releasing the store lock over the
+        STILL-OPEN transaction, and any writer that acquired the guard
+        during the drain window executed INSIDE the zombie transaction:
+        its acknowledged write was then destroyed by the detached
+        ROLLBACK. Statement-level guard serialization cannot prevent
+        this (the statements run on the open transaction); the GATE can:
+        while a rollback is pending, every other store call waits for it
+        to land before touching the connection. The cleanup task itself
+        (and its ROLLBACK) bypasses the gate.
+        """
+        self._rollback_pending = True
+        self._rollback_landed.clear()
+        task = asyncio.create_task(self._drain_and_rollback(where))
+        self._rollback_tasks.add(task)
+
+        def _landed(done: asyncio.Task[None]) -> None:
+            self._rollback_tasks.discard(done)
+            # Review finding: retrieve a failed cleanup's exception (never
+            # an unretrieved-task warning) and report it — the gate opens
+            # on completion either way (waiters must never deadlock on a
+            # broken cleanup), with the connection state marked uncertain.
+            if not done.cancelled() and done.exception() is not None:
+                logger.error(
+                    "transaction cleanup failed; gate opening on best-effort "
+                    "completion (connection state uncertain — restart "
+                    "recovery applies)",
+                    extra={"operation": "store.cleanup", "outcome": "cleanup_failed"},
+                )
+            if not self._rollback_tasks:
+                self._rollback_pending = False
+                self._rollback_landed.set()
+
+        task.add_done_callback(_landed)
+        return task
+
+    async def _await_rollback_gate(self) -> None:
+        """Block non-cleanup callers while a failed transaction's
+        ROLLBACK is pending (BUG-001). The cleanup task bypasses this."""
+        if self._rollback_pending and asyncio.current_task() not in self._rollback_tasks:
+            await self._rollback_landed.wait()
+
     async def _drain_and_rollback(self, where: str) -> None:
         """Transaction-cancellation cleanup: settle, THEN roll back.
 
@@ -605,6 +681,7 @@ class TaskStateStore:
         """Run one database call; inside a transaction the caller's lock covers us."""
         if self._txn_owner.get() is asyncio.current_task():
             return await self._call_threaded(fn, *args)
+        await self._await_rollback_gate()
         async with self._lock:
             return await self._call_threaded(fn, *args)
 
@@ -652,19 +729,19 @@ class TaskStateStore:
                 # transaction. The DRAIN-then-rollback settles the
                 # abandoned call FIRST (no RLock-FIFO assumption), then
                 # rolls back whatever it opened.
-                await asyncio.shield(self._drain_and_rollback("cancelled BEGIN"))
+                await asyncio.shield(self._begin_locked_rollback("cancelled BEGIN"))
                 raise
             try:
                 yield
             except BaseException:
                 self._txn_owner.reset(token)
-                await asyncio.shield(self._drain_and_rollback("transaction failure"))
+                await asyncio.shield(self._begin_locked_rollback("transaction failure"))
                 raise
             self._txn_owner.reset(token)
             try:
                 await self._call_threaded(self._connection().execute, "COMMIT")
             except BaseException:
-                await asyncio.shield(self._drain_and_rollback("failed commit"))
+                await asyncio.shield(self._begin_locked_rollback("failed commit"))
                 raise
 
     # ----- queries -----
@@ -1302,7 +1379,11 @@ class TaskStateStore:
                     )
                 )
 
-        await self._call_threaded(_scan_sync)
+        # BUG-003 (PR #8 audit): the scan previously called
+        # _call_threaded directly, bypassing the store lock — it read
+        # UNCOMMITTED rows and reported findings for data that was then
+        # rolled back. Serialize like every other reader.
+        await self._run(_scan_sync)
         return tuple(findings)
 
     async def fail_account_queue(self, account_id: int, message: str) -> int:
@@ -1594,12 +1675,23 @@ def _decode_row(row: sqlite3.Row) -> TaskInstanceRecord:
             message=payload.get("message", ""),
             retry_at=_parse_ts(retry_at_raw) if retry_at_raw is not None else None,
         )
+    # BUG-005 (PR #8 audit): coerce with validation — a hand-edited or
+    # corrupt row with TEXT integer columns previously decoded
+    # "successfully" (a str leaked into the record; SQLite arithmetic
+    # then silently coerced it to 0, resetting the retry budget) and the
+    # integrity scanner reported the row healthy.
+    account_id = int(row["account_id"])
+    if not 0 < account_id <= 2**63 - 1:
+        raise ValueError(f"account_id out of snowflake range: {account_id}")
+    attempt_count = int(row["attempt_count"])
+    if not 0 <= attempt_count < 2**31:
+        raise ValueError(f"attempt_count out of range: {attempt_count}")
     return TaskInstanceRecord(
-        id=row["id"],
-        account_id=row["account_id"],
+        id=int(row["id"]),
+        account_id=account_id,
         task_id=row["task_id"],
         status=TaskInstanceState(row["status"]),
-        attempt_count=row["attempt_count"],
+        attempt_count=attempt_count,
         created_at=_parse_ts(row["created_at"]),
         updated_at=_parse_ts(row["updated_at"]),
         last_outcome=outcome,

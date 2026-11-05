@@ -4,13 +4,15 @@ The diagnostic is strictly read-only: every scenario asserts both the
 findings AND that the database content is untouched afterwards.
 """
 
+import asyncio
+import contextlib
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from autoclaimer.persistence import TaskStateStore
+from autoclaimer.persistence import PersistenceError, TaskStateStore
 
 ACCOUNT = 271485504361996288
 OTHER = 380028190142042112
@@ -522,5 +524,94 @@ async def test_oversized_ids_and_account_values_are_clipped(tmp_path: Path) -> N
         # The oversized account_id appears (clipped) — the findings are
         # still actionable, just bounded.
         assert any("A" in f.key for f in findings if "account=" in f.key)
+    finally:
+        await store.close()
+
+
+async def test_integrity_report_waits_for_inflight_transactions(tmp_path: Path) -> None:
+    """BUG-003 (PR #8 audit): integrity_report called _call_threaded
+    directly, bypassing the store lock/gate — the scan read UNCOMMITTED
+    rows and emitted findings for data that was then rolled back (false
+    diagnostics an operator would act on). The scan must serialize with
+    every other store reader."""
+    import sys
+
+    sys.path.insert(0, ".")
+    from autoclaimer.persistence import TaskStateStore
+
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    try:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def txn_with_uncommitted_orphan() -> None:
+            async with store.transaction():
+                # An uncommitted row for an account not in any config.
+                await store._call_threaded(lambda: _raw_insert_orphan(store))
+                entered.set()
+                await release.wait()
+
+        task = asyncio.create_task(txn_with_uncommitted_orphan())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            findings_task = asyncio.create_task(store.integrity_report(known_account_ids=set()))
+            await asyncio.sleep(0.2)
+            assert not findings_task.done(), (
+                "the integrity scan ran while a transaction was uncommitted "
+                "(it bypassed the store's serialization)"
+            )
+            task.cancel()  # the txn rolls back; the scan must NOT have
+            # read its uncommitted orphan (it waits on the store lock).
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            findings = await findings_task
+            orphans = [f for f in findings if "999999999999999999" in str(f)]
+            assert not orphans, f"findings over uncommitted/rolled-back data: {orphans}"
+        finally:
+            release.set()  # never deadlock close() on the parked txn
+            if not task.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        await store.close()
+
+
+def _raw_insert_orphan(store: "TaskStateStore") -> None:
+    conn = store._connection()  # noqa: SLF001 — inside the txn, guarded
+    assert conn is not None
+    conn.execute(
+        "INSERT INTO task_instances (account_id, task_id, status, attempt_count,"
+        " created_at, updated_at) VALUES (999999999999999999, 'ghost', 'pending',"
+        " 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+    )
+
+
+async def test_semantically_invalid_integer_columns_are_findings(
+    tmp_path: Path,
+) -> None:
+    """BUG-005 (PR #8 audit): a TEXT attempt_count ('seven') decoded
+    "successfully" into records (str leaked; SQLite arithmetic coerced
+    it to 0 — silently resetting the retry budget) and the scanner
+    reported the row healthy. Decode-time validation now contains it as
+    a corrupt-row finding."""
+    store = TaskStateStore(tmp_path / "state.db")
+    await store.open()
+    try:
+        record = await store.create_instance(271485504361996288, "probe")
+        conn = sqlite3.connect(tmp_path / "state.db")
+        with conn:
+            conn.execute(
+                "UPDATE task_instances SET attempt_count = 'seven' WHERE id = ?",
+                (record.id,),
+            )
+        conn.close()
+
+        findings = await store.integrity_report()
+        task_findings = [f for f in findings if "corrupt" in str(f).lower()]
+        assert task_findings, f"scanner green-lit a semantically invalid row: {findings}"
+        with pytest.raises(PersistenceError, match="corrupt task_instances row"):
+            await store.get_instance(record.id)
     finally:
         await store.close()
