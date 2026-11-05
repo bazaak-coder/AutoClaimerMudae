@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Items 1–20 are implemented, independently reviewed, and MERGED to `main` (the PR #8–#12 stack plus their post-merge review rounds — 817 automated tests green). Items 21–25 and 27 are not started; item 26 is planned.
+**Backlog status:** Proposed — not yet implemented or merged.
 
 ## Priority Definitions
 
@@ -32,7 +32,7 @@ Investigate database behavior under abrupt process termination, rather than rely
 - [x] Test termination during an active transaction. — `test_kill_during_active_transaction_rolls_back` (hot-journal rollback, store usable)
 - [x] Test termination during state updates. — uncommitted rolled back / committed durable (`test_kill_after_committed_update_is_durable`)
 - [x] Test termination during task claiming and completion. — `test_kill_while_claimed_recovers_without_stranding`, `test_kill_during_completion_rolls_back_and_reschedules` (at-least-once)
-- [x] Verify journal-based crash recovery after process restart. — WAL is deliberately NOT used (its shared memory mapping is unreliable in the target environment; see `persistence._connect`), so WAL recovery was NOT tested and is NOT claimed: rollback-journal (hot-journal) recovery is what was verified, with the deployment mode pinned by test (`test_rollback_journal_mode_is_the_deployment_mode`)
+- [x] Verify SQLite WAL recovery after process restart. — the store deliberately runs the rollback journal (WAL's shared memory is unreliable in the target environment); hot-journal recovery verified instead and the mode pinned by test (`test_rollback_journal_mode_is_the_deployment_mode`)
 - [x] Verify no permanently stranded task states. — `test_recovery_leaves_terminal_states_untouched` (status matrix)
 - [x] Verify eligible tasks are recovered without duplicate execution. — `test_recovered_task_cannot_be_double_claimed` (atomic claim CAS; terminal rows never re-claimable)
 - [x] Document expected behavior for each interruption point. — `docs/running.md` → "Crash recovery by interruption point"
@@ -54,7 +54,7 @@ Add safeguards for detecting database corruption and inconsistent persisted stat
 - [x] Never automatically delete potentially recoverable user data. — the diagnostic is strictly read-only (asserted by tests)
 - [x] Document a recovery procedure. — `docs/running.md` → "Database diagnostics and recovery"
 
-**Completed:** 2026-10-31 (`tests/test_integrity.py` — 15 scenarios incl. page corruption, CLI surface, and read-only assertions).
+**Completed:** 2026-10-31 (`tests/test_integrity.py` — 6 scenarios incl. page corruption, CLI surface, and read-only assertions).
 
 **Dependencies:** SQLite persistence layer.
 
@@ -87,7 +87,7 @@ Establish a safe procedure for backing up and restoring credential-related data.
 - [x] Test restoration using a separate temporary environment. — round-trip test exports from one database and restores into a fresh store/database; plus a re-encryption-under-new-primary test proving the old key can be discarded afterwards
 - [x] Document key and backup compatibility requirements. — bundle usable only with the export-time primary or any still-configured retired key; restored rows re-encrypted under the current primary
 
-**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 23 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
+**Completed:** 2026-10-31 (`tests/test_credential_backup.py` — 6 scenarios). Also fixed during testing: import idempotency now compares the underlying TOKEN, not ciphertext (Fernet never repeats ciphertexts).
 
 **Dependencies:** Credential recovery documentation.
 
@@ -482,22 +482,65 @@ Provide optional runtime metrics for external monitoring.
 - [ ] Endpoint exposure is configurable.
 - [ ] Document network-access and authentication considerations.
 
+
+---
+
+## Phase 6 — Production Runtime Composition
+
+**Priority: P1**
+
+### [ ] 26. Streamlined Production Composition Root
+
+Replace the demo-only process entry point with a small, explicit production composition layer that connects the existing configuration, persistence, credential, task, adapter, health, audit, and controller components. Keep `__main__.py` thin; do not rewrite existing subsystems or introduce a generic dependency-injection framework.
+
+**Design direction:**
+
+- Add a focused runtime/composition module responsible for constructing and owning application dependencies.
+- Make the normal `python -m autoclaimer` path launch the real Discord/Mudae runtime.
+- Retain the mock runtime behind an explicit `--demo` (or equivalent clearly named) option.
+- Keep construction separate from execution so tests can inspect the composed runtime without logging in to Discord.
+- Reuse existing lifecycle, signal-handling, controller, worker, health, audit, and persistence contracts wherever possible.
+
+**Acceptance criteria:**
+
+- [ ] Load and validate the production configuration and account assignments before starting workers.
+- [ ] Open the SQLite state store and encrypted credential store using the established database/configuration contract.
+- [ ] Fail closed with actionable errors when production credentials or the encryption key are missing, invalid, or unusable; never silently fall back to mock or plaintext credentials.
+- [ ] Build the real `TaskRegistry` and register the supported Mudae tasks through `register_mudae_tasks(...)`.
+- [ ] Validate enabled account task assignments against the production registry before execution; report unregistered or invalid assignments before workers start.
+- [ ] Build the rate limiter and `AutoClaimerController` using the existing configuration and runtime contracts.
+- [ ] Provide an adapter factory that creates an isolated `DiscordAdapter`/Discord client for each account while sharing only the appropriate credential-provider and persistence services.
+- [ ] Preserve lazy connection behavior; constructing the runtime must not eagerly log in every account.
+- [ ] Wire real Discord connection lifecycle events into account health and persisted audit events, including connected and disconnected transitions; classify authentication-fatal conditions without exposing tokens or sensitive response content.
+- [ ] Ensure lifecycle/audit callbacks are tracked and drained or safely completed during shutdown; no untracked fire-and-forget tasks.
+- [ ] Keep `__main__.py` as a thin entry point and make the production path the default; expose the mock composition only through an explicit demo option.
+- [ ] Handle partial startup failure by closing every resource already opened, in the correct ownership order.
+- [ ] Reuse the established SIGINT/SIGTERM and graceful-shutdown path; close adapters, credential resources, and persistence exactly once.
+- [ ] Add deterministic mock-based composition tests for construction, task registration, per-account adapter isolation, fail-closed behavior, lifecycle-to-health/audit wiring, partial-startup cleanup, and shutdown.
+- [ ] Keep live Discord login/reconnect verification separately environment-gated and document the disposable-account requirements; ordinary CI must not contact Discord.
+- [ ] Update running/setup documentation to describe production startup, demo mode, required credential setup, and failure/recovery behavior.
+
+**Required design note before implementation:** Document the ownership graph and startup/shutdown sequence, including failure and cancellation behavior for each resource. Explicitly state which component owns each adapter, client, store, credential provider, controller, and lifecycle callback.
+
+**Completion gate:** The implementation must be delivered as its own PR, pass CI, receive an independent bug/security/fragile-code review, and have all confirmed findings fixed and re-reviewed before merge.
+
+**Dependencies:** Existing config and account models; SQLite persistence and credential store; Mudae task registry; Discord adapter; controller/worker lifecycle; account health and audit infrastructure.
+
+
 ---
 
 ## Recommended Implementation Order
 
 | Order | Task | Priority | Reason |
 |---|---|---|---|
-| 1 | SQLite crash-recovery audit | P0 | Protect persisted runtime state |
-| 2 | Database integrity checks | P0 | Detect corrupted or inconsistent state |
-| 3 | Credential recovery documentation | P0 | Prevent avoidable credential loss |
-| 4 | Fault-injection testing | P1 | Validate failure handling |
-| 5 | Account health monitoring | P1 | Improve multi-account reliability |
-| 6 | Task execution timeouts | P1 | Prevent stuck tasks |
-| 7 | Dead-letter handling | P1 | Prevent endless retry cycles |
-| 8 | Rate-limit stress testing | P1 | Validate concurrent execution |
-| 9 | Dependency security scanning | P1 | Reduce supply-chain risk |
-| 10 | Configuration migration framework | P2 | Protect future upgrades |
+| 1 | Merge the existing PR stack (#8 → #9 → #10 → #11), one PR at a time | P1 | Each PR must be reviewed, fixed, re-reviewed, and CI-green before the next dependent PR is merged |
+| 2 | #26 Streamlined production composition root | P1 | Connect the existing framework to the real Discord/Mudae runtime |
+| 3 | Live Discord runtime verification | P1 | Verify login, reconnect, fatal-close, and shutdown behavior with a disposable account after composition exists |
+| 4 | #22 Execution history export | P2 | Add machine-readable export to existing history/audit data |
+| 5 | #21 Simulation mode | P2 | Provide an explicit no-Discord execution path beyond the existing demo |
+| 6 | #24 Task dependencies | P3 | Design note first; implement only when a concrete workflow requires it |
+| 7 | #25 Metrics endpoint | P3 | Defer until the production composition and network-exposure model are stable |
+| 8 | #23 Controlled task discovery | P3 / Deferred | Existing registration contract is sufficient; defer dynamic discovery until a second concrete consumer exists |
 
 ---
 
@@ -515,6 +558,20 @@ These remain ongoing development requirements rather than one-time tasks:
 - Keep mock-based tests separate from tests requiring real external services.
 - Document environmental limitations when a test cannot be executed.
 - Avoid introducing abstractions without a concrete use case.
+
+
+### PR Review and Merge Sequence
+
+For the current stacked PRs and all future production-runtime work:
+
+1. Review the next PR in dependency order for correctness, security, regressions, and fragile lifecycle/concurrency paths.
+2. Record findings with exact file/line evidence and severity; distinguish confirmed defects from items needing verification.
+3. Fix confirmed findings in that PR and add regression tests where appropriate.
+4. Re-review the updated PR head and verify its CI checks with `gh`.
+5. Merge only when the review is clear, required fixes are present, and CI is green; then move to the next dependent PR.
+6. Do not merge the entire stack at once. Keep the production composition root in a separate PR after the existing stack is merged and the base branch is verified.
+
+The assistant review is an additional review gate, not a substitute for the repository's normal CI or any required human approval.
 
 ## Definition of Done
 
