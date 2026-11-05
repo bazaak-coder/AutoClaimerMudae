@@ -54,6 +54,13 @@ from .workers import WorkerManager
 
 logger = logging.getLogger(__name__)
 
+
+def _retrieve_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve a finished task's exception (never an unretrieved warning)."""
+    if not task.cancelled():
+        task.exception()
+
+
 LineReader = Callable[[str], Awaitable[str]]
 LineWriter = Callable[[str], None]
 
@@ -310,24 +317,32 @@ class AutoClaimerController:
                 raise ValueError(f"export write failed: {exc}") from exc
         except asyncio.CancelledError:
             _, pending = await asyncio.wait({write_task}, timeout=5.0)
-            if not pending:
-                # The thread finished despite our cancellation: if it
-                # PUBLISHED (no exception — a ValueError here means the
-                # conditional publish refused), the audit event still
-                # lands — an export without its audit trail is an
-                # integrity gap. Best-effort: audit failures never mask
-                # the cancellation.
-                failed = (
-                    write_task.done() and write_task.exception() is not None
-                ) or write_task.cancelled()
-                if not failed:
-                    with suppress(Exception):
+            # Review finding: a straggler write task's later exception
+            # must be retrieved — never an unretrieved-task warning.
+            if pending:
+                for task in pending:
+                    task.add_done_callback(_retrieve_exception)
+            cancelled_task = write_task.cancelled()
+            failed = (
+                write_task.done() and not cancelled_task and (write_task.exception() is not None)
+            )
+            if not pending and not failed:
+                # The thread finished despite our cancellation and it
+                # PUBLISHED (a ValueError here means the conditional
+                # publish refused): the audit event still lands — an
+                # export without its audit trail is an integrity gap.
+                # Review finding: the audit await is BOUNDED (a blocked
+                # store must not hang the cancelled caller past the
+                # drain) and best-effort — failures never mask the
+                # cancellation.
+                with suppress(Exception):
+                    async with asyncio.timeout(5.0):
                         await self._audit.emit(
                             category="runtime",
                             action="history_exported",
                             detail=f"{len(rows)} rows to {target} (caller cancelled)",
                         )
-            else:
+            elif pending:
                 # Still writing after the bounded drain: publication is
                 # unknown — report it, never claim the audit trail.
                 logger.warning(

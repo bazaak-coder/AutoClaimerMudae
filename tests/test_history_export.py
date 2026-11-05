@@ -246,11 +246,15 @@ async def test_export_while_workers_active(tmp_path: Path) -> None:
 async def test_export_cancellation_still_audits_a_completed_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review finding (Major): cancelling export_history while the
-    thread-write runs must not strand a PUBLISHED file without its audit
-    event — the write is shield-tracked and drained bounded; a completed
-    publish still audits before the cancellation re-raises."""
+    """Review findings (Major + Minor): cancelling export_history while
+    the thread-write runs must not strand a PUBLISHED file without its
+    audit event. Synchronized at the WRITE itself (a bare sleep cannot
+    prove the query finished and the write began) — the atomic write is
+    gated; cancellation lands only after the write ENTERED; the gate
+    releases inside the write; the published file and its audit event
+    are then asserted UNCONDITIONALLY."""
     import autoclaimer.audit as audit_module
+    import autoclaimer.cli as cli_module
 
     events: list[str] = []
     original_emit = audit_module.AuditLog.emit
@@ -261,31 +265,43 @@ async def test_export_cancellation_still_audits_a_completed_publish(
         await original_emit(self, **event)  # type: ignore[arg-type]
 
     monkeypatch.setattr(audit_module.AuditLog, "emit", _recording_emit)
+
+    # Gate the write: write_entered fires when the threaded write STARTS;
+    # write_release lets it finish. Cancellation lands only between.
+    write_entered = asyncio.Event()
+    write_release = asyncio.Event()
+    real_atomic_write = cli_module.AutoClaimerController._atomic_write
+
+    def _gated_atomic_write(bound_self: object, target: Path, payload: str) -> None:  # noqa: ARG001
+        write_entered.set()
+        import time
+
+        deadline = time.monotonic() + 5.0
+        while not write_release.is_set() and time.monotonic() < deadline:
+            time.sleep(0.005)  # thread-side gate (to_thread cannot await)
+        real_atomic_write(target, payload)
+
+    monkeypatch.setattr(cli_module.AutoClaimerController, "_atomic_write", _gated_atomic_write)
     controller, store = await _seeded_controller(tmp_path)
     try:
         target = tmp_path / "cancel.jsonl"
+        export_task = asyncio.create_task(
+            controller.export_history(str(target), account_id=None, since=None, until=None)
+        )
+        await asyncio.wait_for(write_entered.wait(), timeout=5.0)  # write BEGAN
+        export_task.cancel()
+        write_release.set()  # the write completes under the bounded drain
+        with pytest.raises(asyncio.CancelledError):
+            await export_task
 
-        async def _cancelling_export() -> None:
-            task = asyncio.create_task(
-                controller.export_history(str(target), account_id=None, since=None, until=None)
-            )
-            await asyncio.sleep(0)  # let it reach the shielded write
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        # Unconditional: the drain completed, the file published, and the
+        # audit event MUST have landed.
+        assert target.exists(), "the gated write should have published"
+        assert any(str(target) in detail for detail in events), (
+            "published export without its history_exported audit event"
+        )
 
-        await _cancelling_export()
-        await asyncio.sleep(0.05)  # the thread publishes; drain completes
-        # Re-run the drain semantics: the file either exists with its
-        # audit event, or the write was still in flight (warned, never
-        # silently un-audited). Assert the invariant that matters:
-        if target.exists():
-            assert any(str(target) in detail for detail in events), (
-                "published export without its history_exported audit event"
-            )
-        # And the contained path still works afterwards.
+        # The contained path still works afterwards.
         final = tmp_path / "after.jsonl"
         result = await controller.export_history(
             str(final), account_id=None, since=None, until=None
