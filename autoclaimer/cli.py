@@ -293,7 +293,13 @@ class AutoClaimerController:
             raise ValueError(f"refusing to overwrite existing file: {target}")
         rows = await self._store.export_history(account_id=account_id, since=since, until=until)
         payload = "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in rows)
-        await asyncio.to_thread(self._atomic_write, target, payload)
+        try:
+            await asyncio.to_thread(self._atomic_write, target, payload)
+        except OSError as exc:
+            # Containment (review finding, Major): a filesystem failure —
+            # unwritable directory, full disk — is an operator fix, not a
+            # reason to kill the REPL and every worker with it.
+            raise ValueError(f"export write failed: {exc}") from exc
         await self._audit.emit(
             category="runtime",
             action="history_exported",
@@ -303,7 +309,14 @@ class AutoClaimerController:
 
     @staticmethod
     def _atomic_write(target: Path, payload: str) -> None:
-        """Temp-file + os.replace write (the credential-store pattern)."""
+        """Temp-file + CONDITIONAL publish (review finding: os.replace
+        overwrites unconditionally — a file appearing between the
+        exists() check and the publish would be silently lost).
+        ``os.link(tmp, target)`` fails with FileExistsError when the
+        target exists, making the no-overwrite guarantee atomic with the
+        publish. Hard links are unsupported on some filesystems
+        (PRoot/Android mounts) — those OSErrors fail closed with a clear
+        message rather than risking an overwrite."""
         import tempfile
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -311,7 +324,16 @@ class AutoClaimerController:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
-            os.replace(tmp, target)
+            try:
+                os.link(tmp, target)  # conditional publish: FileExistsError wins
+            except FileExistsError:
+                raise ValueError(f"refusing to overwrite existing file: {target}") from None
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot safely publish {target} on this filesystem "
+                    f"(hard links unsupported: {exc})"
+                ) from exc
+            os.unlink(tmp)
         except BaseException:
             with suppress(OSError):
                 os.unlink(tmp)

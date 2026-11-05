@@ -13,7 +13,7 @@ import pytest
 from autoclaimer.cli import AutoClaimerController, CliSession
 from autoclaimer.config import parse_accounts_config, parse_app_config
 from autoclaimer.mock_adapter import MockAdapter
-from autoclaimer.persistence import PersistenceError, TaskInstanceState, TaskStateStore
+from autoclaimer.persistence import TaskInstanceState, TaskStateStore
 from autoclaimer.ratelimit import RateLimiter
 from autoclaimer.registry import TaskOutcome, TaskRegistry, TaskStatus, TaskType
 
@@ -136,26 +136,50 @@ async def test_export_refuses_overwrite_and_bad_filters(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_export_atomic_no_partial_file_on_failure(
+async def test_export_atomic_no_partial_file_on_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A write failure must leave NO file behind (atomic replace only)."""
+    """A WRITE failure (review finding: the old test failed the READ,
+    never exercising the write path) must leave NO target file and NO
+    temp litter — and surface as a contained ValueError."""
+    import os as os_module
+
+    def _exploding_link(src: object, dst: object, *args: object) -> None:
+        raise OSError(28, "No space left on device")  # ENOSPC (injected)
+
+    monkeypatch.setattr(os_module, "link", _exploding_link)
     controller, store = await _seeded_controller(tmp_path)
     try:
-        import autoclaimer.persistence as persistence_module
-
-        original = persistence_module.TaskStateStore.export_history
-
-        async def _exploding_export(self: object, **kwargs: object) -> list[dict[str, object]]:
-            raise PersistenceError("database is locked (injected)")
-
-        monkeypatch.setattr(persistence_module.TaskStateStore, "export_history", _exploding_export)
         target = tmp_path / "atomic.jsonl"
-        with pytest.raises(PersistenceError):
+        with pytest.raises(ValueError, match="cannot safely publish"):
             await controller.export_history(str(target), account_id=None, since=None, until=None)
         assert not target.exists()
         assert list(tmp_path.glob(".atomic.jsonl.*.tmp")) == []  # no temp litter
-        monkeypatch.setattr(persistence_module.TaskStateStore, "export_history", original)
+    finally:
+        await controller.shutdown()
+        await store.close()
+
+
+async def test_export_publish_refuses_a_file_created_in_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conditional publish: a target created AFTER the exists()
+    check is NOT silently overwritten (review finding on os.replace)."""
+    import os as os_module
+
+    controller, store = await _seeded_controller(tmp_path)
+    try:
+        target = tmp_path / "race.jsonl"
+        real_link = os_module.link
+
+        def _sneaky_link(src: str, dst: str, *args: object) -> None:
+            Path(dst).write_text("someone else got here first", encoding="utf-8")
+            real_link(src, dst, *args)  # now raises FileExistsError
+
+        monkeypatch.setattr(os_module, "link", _sneaky_link)
+        with pytest.raises(ValueError, match="refusing to overwrite"):
+            await controller.export_history(str(target), account_id=None, since=None, until=None)
+        assert target.read_text(encoding="utf-8") == "someone else got here first"
     finally:
         await controller.shutdown()
         await store.close()
@@ -178,14 +202,13 @@ async def test_export_while_workers_active(tmp_path: Path) -> None:
         {"version": 1, "accounts": [{"id": ACCOUNT, "tasks": ["loop"]}]}, app
     )
     registry = TaskRegistry()
-    executions = 0
+    rounds = asyncio.Event()
 
     async def handler(context: object) -> TaskOutcome:
-        nonlocal executions
-        executions += 1
+        rounds.set()  # deterministic: one event per completed round
         return TaskOutcome(
             TaskStatus.FAILED_RECOVERABLE,
-            retry_at=datetime.now(UTC) + timedelta(seconds=0.1),
+            retry_at=datetime.now(UTC) + timedelta(seconds=0.05),
             message="round",
         )
 
@@ -205,13 +228,16 @@ async def test_export_while_workers_active(tmp_path: Path) -> None:
     )
     await controller.start()
     try:
-        await asyncio.sleep(0.3)  # rounds accumulate
-        before = executions
+        # Deterministic (review finding): synchronize on a completed
+        # round via an event, never wall-clock; generous deadlines for
+        # CI load; retry_limit 5 with 0.05s retries cannot exhaust
+        # before several rounds land even under load.
+        await asyncio.wait_for(rounds.wait(), timeout=5.0)
         target = tmp_path / "live.jsonl"
         await controller.export_history(str(target), account_id=ACCOUNT, since=None, until=None)
-        await asyncio.sleep(0.3)
-        assert executions > before, "workers stopped or were interrupted by the export"
         assert target.exists()
+        rounds.clear()
+        await asyncio.wait_for(rounds.wait(), timeout=5.0)  # >=1 round AFTER the export
     finally:
         await controller.shutdown()
         await store.close()
