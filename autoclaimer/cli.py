@@ -40,6 +40,7 @@ from .adapters import AdapterError, PlatformAdapter
 from .audit import AuditLog
 from .credential_store import SQLiteCredentialStore
 from .credentials import CredentialProvider, CredentialProviderError
+from .health import AccountHealthMonitor
 from .logging_setup import redact_text
 from .models import AccountsConfig, AppConfig
 from .persistence import PersistenceError, TaskInstanceState, TaskStateStore
@@ -70,6 +71,7 @@ class AutoClaimerController:
         idle_interval_seconds: float = 30.0,
         config_path: str = "config.json",
         accounts_path: str = "accounts.json",
+        health: AccountHealthMonitor | None = None,
     ) -> None:
         self._app_config = app_config
         self._accounts = accounts
@@ -96,6 +98,7 @@ class AutoClaimerController:
         self._audit = AuditLog(store)
         self._manager = WorkerManager(
             registry=registry,
+            health=health,
             store=store,
             limiter=limiter,
             app_config=app_config,

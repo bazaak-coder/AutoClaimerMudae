@@ -41,6 +41,9 @@ __pycache__/
 .venv/
 .coverage
 
+# ZCode session artifacts
+.zcode/
+
 # Runtime rotating log (never commit; written next to the CWD at runtime)
 *.log
 autoclaimer.log.*

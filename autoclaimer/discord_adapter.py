@@ -86,6 +86,7 @@ import logging
 import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any
 
 import discord
@@ -120,6 +121,17 @@ _DEFAULT_JITTER_RANGE = (0.4, 1.2)
 #: ``settings.send_jitter_seconds`` in config.json.
 _DEFAULT_SEND_JITTER_RANGE = (0.203, 0.567)
 
+
+class LifecycleTransition(Enum):
+    """Gateway connection transitions observed by an optional lifecycle
+    hook (ROADMAP item 26). Emitted on TRANSITIONS only (deduplicated);
+    ``FATAL`` fires exactly once, with the account-fatal latch."""
+
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    FATAL = "fatal"
+
+
 #: Gateway close codes the library itself refuses to reconnect on
 #: (``DiscordWebSocket._can_handle_close``, discord.py-self 2.1.0).
 #: 4004 = authentication failed (token invalidated mid-session),
@@ -145,9 +157,16 @@ class DiscordAdapter:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         event_queue_size: int = 64,
         startup_timeout: float = 60.0,
+        on_lifecycle: Callable[[LifecycleTransition], Awaitable[None] | None] | None = None,
     ) -> None:
         self._account_id = account_id
         self._credentials = credentials
+        # Lifecycle observation (ROADMAP item 26): the hook is invoked on
+        # gateway connection TRANSITIONS; an awaitable result becomes a
+        # TRACKED task drained by close() (never fire-and-forget).
+        self._on_lifecycle = on_lifecycle
+        self._lifecycle_state: LifecycleTransition | None = None
+        self._lifecycle_tasks: set[asyncio.Task[None]] = set()
         # The library's Client is terminal after close(): a restart needs a
         # fresh instance. An injected client is consumed by the first start;
         # client_factory (or the default) supplies replacements afterwards.
@@ -193,6 +212,7 @@ class DiscordAdapter:
         """
         if self._fatal is None:
             self._fatal = error
+            self._emit_lifecycle(LifecycleTransition.FATAL)
             logger.error(
                 "discord adapter hit account-fatal error",
                 extra={
@@ -214,6 +234,10 @@ class DiscordAdapter:
         self._connect_error = None
         self._started = False
         self._bridges_registered = False
+        # Lifecycle dedupe resets too (review finding 5): a cancelled-
+        # then-restarted connect cycle must not carry a stale CONNECTED
+        # that would swallow the next real transition.
+        self._lifecycle_state = None
 
     # ----- event subscription -----
 
@@ -315,6 +339,7 @@ class DiscordAdapter:
             if self._closed:
                 await self._abort_startup(ready_task)
                 raise AdapterError("adapter closed during startup")
+            self._emit_lifecycle(LifecycleTransition.CONNECTED)
             return  # ready: connection task keeps running in the background
         if self._connect_task in done:
             # Connection ended before readiness (crash or early return).
@@ -378,9 +403,150 @@ class DiscordAdapter:
             ("on_reaction_add", self._on_reaction_add),
             ("on_raw_reaction_add", self._on_raw_reaction_add),
             ("on_raw_message_edit", self._on_raw_message_edit),
+            # Lifecycle bridges (registered only when a hook is present):
+            # on_ready/on_disconnect fire across mid-flight reconnects,
+            # which the connect(reconnect=True) task survives without
+            # dying — so _connect_finished alone cannot observe blips.
+            *(
+                ()
+                if self._on_lifecycle is None
+                else (
+                    ("on_ready", self._on_lifecycle_ready),
+                    ("on_disconnect", self._on_lifecycle_disconnect),
+                )
+            ),
         ):
             self._client.event(_named_bridge(event_name, handler))
         self._bridges_registered = True
+
+    async def _on_lifecycle_ready(self) -> None:
+        self._emit_lifecycle(LifecycleTransition.CONNECTED)
+
+    async def _on_lifecycle_disconnect(self) -> None:
+        self._emit_lifecycle(LifecycleTransition.DISCONNECTED)
+
+    def _emit_lifecycle(self, transition: LifecycleTransition) -> None:
+        """Fire the lifecycle hook on a TRANSITION (deduplicated).
+
+        Sync by necessity (fatal/disconnected latch from the connect
+        task's done-callback): the hook's synchronous part runs inline;
+        an awaitable result becomes a tracked task whose exception (if
+        any) is logged — a broken observer can never break the adapter.
+        Never emits after close() (teardown must not run observer code).
+        A hook that raises SYNCHRONOUSLY consumes its transition (logged,
+        dropped): the state machine advances regardless, by design.
+        """
+        if self._closed or self._lifecycle_state is transition:
+            return
+        self._lifecycle_state = transition
+        hook = self._on_lifecycle
+        if hook is None:
+            return
+        try:
+            result = hook(transition)
+        except Exception:
+            logger.exception(
+                "lifecycle hook raised; observation dropped",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.lifecycle",
+                    "outcome": "observer_error",
+                },
+            )
+            return
+        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+            try:
+                task: asyncio.Task[None] = asyncio.ensure_future(self._run_lifecycle(result))
+            except RuntimeError:  # no running loop (defensive: no such path today)
+                logger.error(
+                    "lifecycle observer could not be scheduled",
+                    extra={
+                        "account_id": self._account_id,
+                        "operation": "discord.lifecycle",
+                        "outcome": "observer_error",
+                    },
+                )
+                return
+            self._lifecycle_tasks.add(task)
+            task.add_done_callback(self._lifecycle_tasks.discard)
+
+    async def _run_lifecycle(self, awaitable: Awaitable[None]) -> None:
+        try:
+            await awaitable
+        except Exception:
+            logger.exception(
+                "lifecycle hook task failed; observation dropped",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.lifecycle",
+                    "outcome": "observer_error",
+                },
+            )
+
+    async def _reap_connect_task(self, task: asyncio.Task[None]) -> None:
+        """Bounded reap of a cancelled connect task (review finding:
+        EVERY post-cancel await must be bounded — the previous bare
+        ``await task`` hung close() forever on a cancellation-suppressing
+        connect loop). A task still pending after the reap is reported,
+        never silently abandoned."""
+        await asyncio.wait({task}, timeout=5.0)
+        if not task.done():
+            logger.error(
+                "connection task ignored cancellation and was abandoned "
+                "at close (bounded shutdown)",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.close",
+                    "outcome": "connect_task_abandoned",
+                },
+            )
+
+    async def _drain_lifecycle_tasks(self) -> None:
+        """Complete tracked observer tasks under ONE shared 5-second
+        deadline (N stalled observers cost 5s total, not 5s each), so
+        close() cannot hang on stuck observers. Observer-side
+        cancellation is contained (an observer's CancelledError never
+        aborts the drain); outer cancellation cancels every straggler
+        and re-raises after the sweep."""
+        pending = {t for t in self._lifecycle_tasks if not t.done()}
+        if not pending:
+            return
+        try:
+            _, stragglers = await asyncio.wait(pending, timeout=5.0)
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            if pending:  # reap; never re-raise from inside the sweep
+                await asyncio.wait(pending, timeout=0.5)
+            self._report_unreaped(pending)
+            raise
+        for task in stragglers:
+            task.cancel()
+        # Reap the cancelled stragglers (0.5s best effort) so close()
+        # never returns with pending tasks ("Task was destroyed"
+        # warnings, lost audit writes at loop teardown). Best effort: a
+        # cancellation-SUPPRESSING observer may outlive the reap — it is
+        # reported (below), never silently abandoned.
+        if stragglers:
+            await asyncio.wait(stragglers, timeout=0.5)
+        self._report_unreaped(pending)
+
+    def _report_unreaped(self, tasks: set[asyncio.Task[None]]) -> None:
+        """Log observers still alive after the bounded reap (review
+        finding): the shutdown contract is bounded and best-effort, and
+        an abandoned observer is reported rather than silent."""
+        abandoned = [t for t in tasks if not t.done()]
+        if abandoned:
+            logger.error(
+                "%d lifecycle observer(s) ignored cancellation and were "
+                "abandoned at close (bounded shutdown)",
+                len(abandoned),
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.close",
+                    "outcome": "observers_abandoned",
+                },
+            )
 
     def _connect_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -395,6 +561,8 @@ class DiscordAdapter:
         translated = _translate_error(error)
         if isinstance(translated, AccountFatalError):
             self._latch_fatal(translated)
+        else:
+            self._emit_lifecycle(LifecycleTransition.DISCONNECTED)
         logger.warning(
             "discord connection task failed",
             extra={
@@ -441,23 +609,23 @@ class DiscordAdapter:
             try:
                 await self._client.close()
             finally:
-                task = self._connect_task
-                if task is not None and not task.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                        task.cancel()
+                try:
+                    task = self._connect_task
+                    if task is not None and not task.done():
                         try:
-                            await asyncio.shield(task)
-                        except (asyncio.CancelledError, discord.DiscordException):
-                            pass
-                    except TimeoutError:
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, discord.DiscordException):
-                            pass
+                            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            task.cancel()
+                            await self._reap_connect_task(task)
+                        except TimeoutError:
+                            task.cancel()
+                            await self._reap_connect_task(task)
+                finally:
+                    # Review finding: the drain must run on EVERY teardown
+                    # exit path — an exception or cancellation in the steps
+                    # above must not abandon tracked observers.
+                    await self._drain_lifecycle_tasks()
         logger.info(
             "discord client closed",
             extra={"account_id": self._account_id, "operation": "discord.close"},

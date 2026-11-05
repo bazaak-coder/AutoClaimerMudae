@@ -138,3 +138,103 @@ abandon an *await*, never the database's consistency.
   authorization headers, key/value secrets), including rotation-failure dumps.
 - CLI: destructive credential operations are explicit; token entry uses
   hidden input; tokens are never command arguments.
+
+## Composition root (ROADMAP item 26 — required design note)
+
+`autoclaimer/runtime.py` (`build_runtime`) constructs and owns every
+dependency; `__main__` stays a thin entry (argument parsing →
+composition → session → signals). **Construction is separate from
+execution**: nothing logs into Discord or claims work during
+`build_runtime` — the worker opens each account's `DiscordAdapter`
+lazily on first execution.
+
+### Ownership graph (arrows = owns/closes; order matters)
+
+```
+build_runtime() → Runtime (owns everything below)
+  TaskStateStore          opened 1st, closed LAST
+  SQLiteCredentialStore   opened 2nd, closed 2nd-last (IS the CredentialProvider)
+  TaskRegistry            pure (register_mudae_tasks(registry, store))
+  RateLimiter             store-backed cooldowns
+  AccountHealthMonitor    shared: injected into the controller → WorkerManager
+  AutoClaimerController   → WorkerManager → RateLimitedAdapter(per account)
+                                       → DiscordAdapter(per account, lazy login)
+  AuditLog(store)         ×2: the manager's and the composition's (lifecycle)
+```
+
+### Startup sequence — each step's failure closes everything opened
+before it, in reverse order, then raises `RuntimeStartupError` with the
+actionable operator fix
+
+1. `load_config` — validation failure aborts with NOTHING opened (no
+   `state.db` is even created) and surfaces as a typed
+   `ConfigValidationError` (the entry point prints it and exits 2).
+2. `setup_logging`.
+3. **Production**: `load_fernet_keys()` — missing/invalid key aborts
+   with setup instructions BEFORE the state store opens (a first-time
+   operator with no key finds no stray `state.db`). **Demo**: warn and
+   continue (historical posture).
+4. `TaskStateStore.open()` — an open failure (busy, permissions) is
+   converted to an actionable `RuntimeStartupError`.
+5. **Production**: `SQLiteCredentialStore.open()` + preflight — every
+   ENABLED account must have a stored token (missing ids listed with the
+   `--demo` + `credential set` hint; disabled accounts are exempt).
+6. Registry: `register_mudae_tasks(registry, store)`.
+7. **Production**: registry preflight — every enabled account's assigned
+   task id must be REGISTERED (a task defined in config but with no
+   registered type is listed and aborts startup — fail closed, not a
+   silently skipped task).
+   Error contract: prerequisite failures raise `RuntimeStartupError`
+   (actionable text, everything opened already closed); configuration
+   failures raise the typed `ConfigValidationError`. Both surface as a
+   one-line message and exit code 2 at the entry point.
+8. `RateLimiter`, `AccountHealthMonitor`, lifecycle wiring, and the
+   controller (with `health` injected) — per-account
+   `DiscordAdapter(account_id, credentials=store,
+   send_jitter_range=settings.send_jitter_seconds, on_lifecycle=hook)`,
+   one isolated adapter per account, one shared credential provider.
+
+### Lifecycle wiring (gateway → health/audit)
+
+`DiscordAdapter.on_lifecycle` fires on TRANSITIONS only (deduplicated):
+READY/connect → `CONNECTED`; non-fatal connection death or gateway
+disconnect → `DISCONNECTED`; the account-fatal latch → `FATAL` (exactly
+once). The hook records health synchronously (`record_connected` /
+`record_disconnected` / fatal → `record_failure(fatal=True)` — all
+latch-preserving: `AUTH_FAILED`/`DISABLED` survive reconnects) and
+returns the audit emission coroutine; the ADAPTER tracks that awaitable
+in a bounded set and drains it in `close()` — observers are never
+fire-and-forget, and a raising observer is logged and dropped, never
+breaking the adapter. Mid-flight reconnect blips are observed via
+`on_ready`/`on_disconnect` bridges (the `connect(reconnect=True)` task
+survives them, so its done-callback alone cannot see them).
+
+### Shutdown sequence (reuses the established machinery)
+
+Signal → session-task cancel → `CliSession.run()` finally →
+`controller.shutdown()`: workers drained within the shutdown budget →
+adapters closed (each close drains that adapter's lifecycle observers
+under a 5s deadline, itself bounded by the manager's per-adapter close
+timeout — an operator shutdown budget under ~5s cuts the drain short,
+cancelling straggling observers) → credential store closed → state
+store closed. Teardown emits NO lifecycle transitions (observer code
+never runs during close): an operator-initiated shutdown therefore
+records no final `account.disconnected`. Every
+step is idempotent and exception-guarded; `controller.shutdown()` is
+terminal/one-shot; `WorkerManager.stop()` remains restartable.
+**Cancellation**: an outer cancellation of teardown completes the
+synchronous cleanup and re-raises (adapters) or completes the bounded
+drain first; partial-startup cleanup (which never constructed a
+controller) closes components directly in reverse ownership order.
+
+### Failure/cancellation behavior per resource
+
+| Resource | Failure behavior | Cancellation behavior |
+|---|---|---|
+| Config load | typed `ConfigValidationError`; nothing opened | n/a (sync) |
+| Fernet key (production) | `RuntimeStartupError` with setup steps | n/a (sync) |
+| State store open | typed `PersistenceError`; cleanup closes it | guard-drained |
+| Credential store open/preflight | actionable abort; store + db closed | idempotent sync close |
+| Registry/limiter/controller | pure construction; cannot fail open | n/a |
+| DiscordAdapter construction | offline; login deferred to worker | n/a at build time |
+| Lifecycle observers | logged + dropped, adapter unaffected; a sync-raising observer consumes its transition (logged) | tracked, drained ≤5s in close (further bounded by the manager's per-adapter close timeout); stragglers cancelled and reaped best-effort — a cancellation-suppressing observer is reported (`observers_abandoned`) rather than silently dropped |

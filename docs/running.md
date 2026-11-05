@@ -10,73 +10,74 @@
 
 ## Booting
 
-### Demo entry point (shipped)
+### Production entry point (default)
 
 ```
 python -m autoclaimer [config.json] [accounts.json]
 ```
 
-This runs the **demo composition**: the deterministic mock adapter, a `ping`
-task, the interactive CLI, and — when a valid `AUTOCLAIMER_FERNET_KEY` is
-present — the encrypted credential store, so `credential …` commands work
-out of the box. It sends no Discord traffic. Use it to validate configuration
-and manage credentials.
+This runs the **production composition** (ROADMAP item 26): the real
+Discord adapters (one isolated client per account, logged in lazily by
+the worker on first execution), the Mudae task registry
+(`roll`/`mu`/`rt`), the central rate limiter, durable SQLite state next
+to the config file, and gateway-lifecycle wiring into account health and
+the audit trail. The interactive CLI is the control surface — nothing
+runs until you enter `start` (booting is inert: no logins, no claims);
+SIGINT/
+SIGTERM run the established graceful path.
 
-### Real Discord composition (library)
+**Prerequisites** (startup FAILS CLOSED with the fix in the error
+message when any is missing — nothing half-starts, nothing leaks):
 
-Production wiring composes the same components with the real adapter. The
-composition root is a tracked follow-up (see the
-[roadmap](../ROADMAP.md)); until it ships, a deployment looks like:
+1. A Fernet key in `AUTOCLAIMER_FERNET_KEY` (generate one with
+   `credential generate-key` in `--demo` mode, or see
+   [credentials.md](credentials.md)).
+2. A stored token for every **enabled** account — the `credential`
+   commands need a running session, so use `--demo` mode for first-time
+   setup: `python -m autoclaimer --demo <config> <accounts>` with the
+   SAME config/accounts paths your production invocation uses (the
+   tokens live in the `state.db` next to that config — the wrong paths
+   store them in a different database), then `credential set
+   <account_id>` (disabled accounts are exempt).
+3. Every task assigned to an enabled account must have a registered
+   task type — a task defined in `config.json` but not registered is
+   reported and aborts startup.
 
-```python
-import asyncio
-from pathlib import Path
+Failure modes: an invalid key, a missing token, or an unregistered task
+each print one actionable line and exit with code 2 after closing
+everything already opened (in reverse ownership order — the design note
+in [architecture.md](architecture.md#composition-root-roadmap-item-26--required-design-note)
+has the full ownership graph and sequences).
 
-from autoclaimer.cli import AutoClaimerController, CliSession, stdin_reader
-from autoclaimer.config import load_config
-from autoclaimer.credential_store import SQLiteCredentialStore, load_fernet_keys
-from autoclaimer.discord_adapter import DiscordAdapter
-from autoclaimer.logging_setup import setup_logging
-from autoclaimer.mudae_tasks import register_mudae_tasks
-from autoclaimer.persistence import TaskStateStore
-from autoclaimer.ratelimit import RateLimiter, resolve_policy
-from autoclaimer.registry import TaskRegistry
+### Demo entry point
 
-
-async def main() -> None:
-    app, accounts = load_config("config.json", "accounts.json")
-    setup_logging(app.logging)
-
-    db = Path("state.db")
-    store = TaskStateStore(db)
-    await store.open()
-
-    credentials = SQLiteCredentialStore(db, load_fernet_keys())
-    await credentials.open()
-
-    registry = TaskRegistry()
-    register_mudae_tasks(registry, store=store)
-
-    controller = AutoClaimerController(
-        app_config=app,
-        accounts=accounts,
-        store=store,
-        limiter=RateLimiter(default_policy=resolve_policy(app.ratelimit), store=store),
-        registry=registry,
-        adapter_factory=lambda account_id: DiscordAdapter(
-            account_id=account_id, credentials=credentials
-        ),
-        credentials=credentials,
-        credential_store=credentials,
-    )
-    session = CliSession(
-        controller, read_line=stdin_reader, write=lambda line: print(line, flush=True)
-    )
-    await session.run()
-
-
-asyncio.run(main())
 ```
+python -m autoclaimer --demo [config.json] [accounts.json]
+```
+
+The historical mock composition: the deterministic mock adapter, a
+`ping` task, no Discord traffic, and credential MANAGEMENT available
+when a valid key is present (a warning — not an abort — when it is not).
+Demo divergences from production: it registers only the `ping` task and
+skips the registry preflight, and polls faster (`idle_interval_seconds`
+5 vs the production default 30).
+
+**Warning — never enter `start` in demo mode against your production
+config directory.** Due `roll`/`mu`/`rt` rows in the production
+`state.db` are NOT idle for the demo registry: the worker treats their
+task types as unregistered and **retires them terminally** (each would
+need a manual `retry` afterwards; production does not recreate them on
+restart). For anything beyond credential setup, point `--demo` at a
+separate config directory with its own `state.db`.
+
+### Custom composition (library)
+
+`autoclaimer.runtime.build_runtime(config, accounts, *, demo=False)` is
+the composition root — call it directly to assemble and inspect the
+runtime without running it (construction never logs into Discord). The
+ownership graph, startup/shutdown sequences, and per-resource failure
+behavior are documented in
+[architecture.md](architecture.md#composition-root-roadmap-item-26--required-design-note).
 
 ## CLI reference
 

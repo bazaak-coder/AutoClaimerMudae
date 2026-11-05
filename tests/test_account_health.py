@@ -423,3 +423,47 @@ def test_nonfatal_failure_preserves_auth_failed_latch() -> None:
         f"non-fatal failure overwrote the fatal latch: {snap.state}"
     )
     assert snap.consecutive_failures == 2  # the streak itself still counts
+
+
+def test_lifecycle_transitions_record_and_preserve_latches() -> None:
+    """ROADMAP item 26: connected/disconnected transitions are first-class
+    health observations, latch-preserving like every other record_* call."""
+    monitor = AccountHealthMonitor()
+    monitor.record_connected(ACCOUNT)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.HEALTHY
+    monitor.record_disconnected(ACCOUNT)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.DISCONNECTED
+    monitor.record_connected(ACCOUNT)  # reconnect restores
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.HEALTHY
+
+    # The latches survive both transitions.
+    monitor.record_failure(ACCOUNT, AccountFatalError("revoked"), fatal=True)
+    monitor.record_connected(ACCOUNT)
+    monitor.record_disconnected(ACCOUNT)
+    assert monitor.snapshot()[ACCOUNT].state is AccountHealthState.AUTH_FAILED
+
+    monitor.record_disabled(OTHER)
+    monitor.record_connected(OTHER)
+    monitor.record_disconnected(OTHER)
+    assert monitor.snapshot()[OTHER].state is AccountHealthState.DISABLED
+
+    # Unresolved failure states survive a reconnect (review finding): only
+    # a successful task clears RATE_LIMITED / DEGRADED, not a connection.
+    third = 111222333444555666
+    monitor.record_rate_limited(third)
+    monitor.record_connected(third)
+    assert monitor.snapshot()[third].state is AccountHealthState.RATE_LIMITED
+    monitor.record_success(third)
+    assert monitor.snapshot()[third].state is AccountHealthState.HEALTHY
+
+    # Review finding: a disconnect→connect blip must not launder failure
+    # states into HEALTHY (DISCONNECTED was an intermediary that cleared
+    # RATE_LIMITED/DEGRADED without any successful task).
+    fourth = 777888999000111222
+    monitor.record_rate_limited(fourth)
+    monitor.record_disconnected(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.RATE_LIMITED
+    monitor.record_connected(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.RATE_LIMITED
+    monitor.record_success(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.HEALTHY
