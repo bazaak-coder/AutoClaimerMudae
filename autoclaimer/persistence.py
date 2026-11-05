@@ -308,6 +308,8 @@ _DRAIN_TIMEOUT_SECONDS = 5.0
 #: Per-instance execution-history retention (roadmap item 8): bounded so
 #: history can never grow the database unboundedly.
 _HISTORY_KEEP_PER_INSTANCE = 50
+# Export cap: one bounded read, independent of per-instance retention.
+_EXPORT_MAX_ROWS = 100_000
 
 #: Audit-event retention (roadmap item 11): bounded, newest kept.
 _AUDIT_KEEP = 1000
@@ -877,6 +879,61 @@ class TaskStateStore:
             (instance_id, limit),
         )
         return tuple((int(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows)
+
+    async def export_history(
+        self,
+        *,
+        account_id: int | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = _EXPORT_MAX_ROWS,
+    ) -> list[dict[str, Any]]:
+        """Export rows for the execution-history export (ROADMAP item 22).
+
+        Read-only, filterable by account and UTC date range, oldest-first
+        for a chronological export file. Messages were REDACTED at write
+        (``_append_history``), so the export is secret-free by
+        construction; ``recorded_at`` is the canonical UTC isoformat, so
+        the date range compares lexicographically in SQL. Rides the
+        store's serialized connection like every read — workers are
+        never interrupted, only briefly queued.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("h.account_id = ?")
+            params.append(account_id)
+        if since is not None:
+            if since.tzinfo is None:
+                raise PersistenceError("export 'since' must be timezone-aware UTC")
+            clauses.append("h.recorded_at >= ?")
+            params.append(_format_ts(since))
+        if until is not None:
+            if until.tzinfo is None:
+                raise PersistenceError("export 'until' must be timezone-aware UTC")
+            clauses.append("h.recorded_at < ?")
+            params.append(_format_ts(until))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = await self._run(
+            self._fetchall_sync,
+            "SELECT h.recorded_at, h.account_id, h.task_id, h.attempt, h.status, "
+            "h.message, i.status AS current_status "
+            f"FROM task_history h LEFT JOIN task_instances i ON i.id = h.instance_id "
+            f"{where} ORDER BY h.id ASC LIMIT ?",
+            (*params, limit),
+        )
+        return [
+            {
+                "recorded_at": str(r[0]),
+                "account_id": int(r[1]),
+                "task_id": str(r[2]),
+                "attempt": int(r[3]),
+                "status": str(r[4]),
+                "message": str(r[5]),
+                "instance_status": str(r[6]) if r[6] is not None else None,
+            }
+            for r in rows
+        ]
 
     async def record_audit_event(
         self,

@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Proposed — not yet implemented or merged.
+**Backlog status:** Items 1–20 are merged. Item 22 (history export) is complete on this branch; item 26 (composition root) is merged pending this file's item-26 checkbox flip (PR #31); items 21, 23, 24, 25, and 27 are not started.
 
 ## Priority Definitions
 
@@ -431,18 +431,21 @@ Provide a way to test task scheduling without performing real Discord actions.
 - [ ] Never send real Discord messages in simulation mode.
 - [ ] Clearly distinguish simulated from real execution.
 
-### [ ] 22. Execution History Export
+### [x] 22. Execution History Export
 
 Allow users to export task execution history.
 
 **Acceptance criteria:**
 
-- [ ] Support a machine-readable export format.
-- [ ] Include timestamps, task outcomes, and failure reasons.
-- [ ] Exclude credentials and sensitive authentication data.
-- [ ] Support date and account filters.
-- [ ] Avoid interrupting active workers.
+- [x] Support a machine-readable export format.
+- [x] Include timestamps, task outcomes, and failure reasons.
+- [x] Exclude credentials and sensitive authentication data.
+- [x] Support date and account filters.
+- [x] Avoid interrupting active workers.
 
+**Completed:** 2026-11-05 (PR: `TaskStateStore.export_history` + the `export`
+CLI command — JSON Lines, atomic no-overwrite write, account/date filters,
+redaction at write flows through, read-only on the serialized store).
 ### [ ] 23. Controlled Task Discovery
 
 Prepare a safe mechanism for discovering and registering task implementations.

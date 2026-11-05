@@ -79,6 +79,21 @@ ownership graph, startup/shutdown sequences, and per-resource failure
 behavior are documented in
 [architecture.md](architecture.md#composition-root-roadmap-item-26--required-design-note).
 
+## Execution-history export
+
+`export <path> [account <id>] [since <date>] [until <date>]` writes the
+recorded execution history as **JSON Lines** (one object per line:
+`recorded_at`, `account_id`, `task_id`, `attempt`, `status`, `message`,
+`instance_status`), oldest-first. The write is atomic (temp file +
+replace) and **refuses to overwrite** an existing target. Messages were
+redacted when they were written to the database, so the export contains
+no tokens or secrets by construction. The read rides the store's
+serialized connection — active workers are briefly queued, never
+interrupted. Filters: `account` (any snowflake — history may outlive a
+deconfigured account), `since` (inclusive), `until` (exclusive); dates
+are UTC `YYYY-MM-DD` or full ISO timestamps. Exported rows are capped at
+100,000 per file.
+
 ## CLI reference
 
 The interactive REPL (`help` inside the session shows the same):
@@ -103,6 +118,7 @@ The interactive REPL (`help` inside the session shows the same):
 | `doctor [config accounts]` | Read-only diagnostics: config, database, credentials, tasks, workers — with actionable hints |
 | `dbstats` | Database growth snapshot: size, pages, row counts |
 | `backup <path>` | Consistent database backup (VACUUM INTO; refuses to overwrite) |
+| `export <path> [account <id>] [since <date>] [until <date>]` | Execution-history export (JSON Lines; refuses to overwrite; dates UTC, `until` exclusive) |
 | `credential …` | Encrypted-token management ([credentials.md](credentials.md)) |
 | `help` | Command help |
 | `quit` / `exit` / `shutdown` | Graceful shutdown and exit |
