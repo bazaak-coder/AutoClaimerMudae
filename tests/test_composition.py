@@ -242,3 +242,45 @@ async def test_shutdown_is_idempotent_and_closes_stores(tmp_path: Path) -> None:
     probe = TaskStateStore(tmp_path / "state.db")
     await probe.open()
     await probe.close()
+
+
+async def test_cleanup_failure_does_not_mask_the_startup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 1: a credential-store close that RAISES during the
+    abort cleanup must neither leak the state store nor replace the
+    actionable RuntimeStartupError."""
+    from autoclaimer.credential_store import SQLiteCredentialStore
+
+    config, accounts = _write_files(tmp_path)
+    await _store_token(tmp_path, ACCOUNT, PRODUCTION_ENV)
+
+    def _exploding_close() -> None:
+        raise RuntimeError("close exploded (injected)")
+
+    original_close = SQLiteCredentialStore.close
+    calls: list[str] = []
+    from autoclaimer.persistence import TaskStateStore
+
+    real_store_close = TaskStateStore.close
+
+    async def _recording_store_close(self: object) -> None:
+        calls.append("store_closed")
+        await real_store_close(self)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SQLiteCredentialStore, "close", _exploding_close)
+    monkeypatch.setattr(TaskStateStore, "close", _recording_store_close)
+    try:
+        # OTHER account has no token → abort AFTER the credential store opened.
+        _write(
+            tmp_path / "accounts.json",
+            _accounts_doc([{"id": ACCOUNT, "tasks": ["roll"]}, {"id": OTHER, "tasks": ["rt"]}]),
+        )
+        with pytest.raises(RuntimeStartupError, match=str(OTHER)):
+            await build_runtime(config, str(tmp_path / "accounts.json"), environ=PRODUCTION_ENV)
+    finally:
+        monkeypatch.setattr(SQLiteCredentialStore, "close", original_close)
+    assert calls == ["store_closed"], (
+        "the state store must still be closed when the credential-store "
+        "close raises during abort cleanup"
+    )

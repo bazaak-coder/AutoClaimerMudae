@@ -51,7 +51,10 @@ python -m autoclaimer --demo [config.json] [accounts.json]
 The historical mock composition: the deterministic mock adapter, a
 `ping` task, no Discord traffic, and credential MANAGEMENT available
 when a valid key is present (a warning — not an abort — when it is not).
-Use it to validate configuration and manage credentials safely.
+Demo divergences from production: it registers only the `ping` task and
+skips the registry preflight (assignments to other task ids simply idle),
+and polls faster (`idle_interval_seconds` 5 vs the production default
+30). Use it to validate configuration and manage credentials safely.
 
 ### Custom composition (library)
 

@@ -234,6 +234,10 @@ class DiscordAdapter:
         self._connect_error = None
         self._started = False
         self._bridges_registered = False
+        # Lifecycle dedupe resets too (review finding 5): a cancelled-
+        # then-restarted connect cycle must not carry a stale CONNECTED
+        # that would swallow the next real transition.
+        self._lifecycle_state = None
 
     # ----- event subscription -----
 
@@ -429,6 +433,8 @@ class DiscordAdapter:
         an awaitable result becomes a tracked task whose exception (if
         any) is logged — a broken observer can never break the adapter.
         Never emits after close() (teardown must not run observer code).
+        A hook that raises SYNCHRONOUSLY consumes its transition (logged,
+        dropped): the state machine advances regardless, by design.
         """
         if self._closed or self._lifecycle_state is transition:
             return
@@ -449,7 +455,18 @@ class DiscordAdapter:
             )
             return
         if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            task: asyncio.Task[None] = asyncio.ensure_future(self._run_lifecycle(result))
+            try:
+                task: asyncio.Task[None] = asyncio.ensure_future(self._run_lifecycle(result))
+            except RuntimeError:  # no running loop (defensive: no such path today)
+                logger.error(
+                    "lifecycle observer could not be scheduled",
+                    extra={
+                        "account_id": self._account_id,
+                        "operation": "discord.lifecycle",
+                        "outcome": "observer_error",
+                    },
+                )
+                return
             self._lifecycle_tasks.add(task)
             task.add_done_callback(self._lifecycle_tasks.discard)
 
@@ -481,9 +498,16 @@ class DiscordAdapter:
         except asyncio.CancelledError:
             for task in pending:
                 task.cancel()
+            if pending:  # reap; never re-raise from inside the sweep
+                await asyncio.wait(pending, timeout=0.5)
             raise
         for task in stragglers:
             task.cancel()
+        # Reap the cancelled stragglers (0.5s best effort) so close()
+        # never returns with pending tasks ("Task was destroyed"
+        # warnings, lost audit writes at loop teardown).
+        if stragglers:
+            await asyncio.wait(stragglers, timeout=0.5)
 
     def _connect_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():

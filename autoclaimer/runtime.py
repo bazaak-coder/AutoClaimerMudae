@@ -111,7 +111,11 @@ def _make_lifecycle_hook(
             health.record_disconnected(account_id)
             return audit.emit(category="account", action="disconnected", account_id=account_id)
         # FATAL: the adapter already refused re-login; mirror the worker's
-        # containment observation (idempotent latch) and audit it.
+        # containment observation (idempotent latch) and audit it. When a
+        # worker IS mid-execution it records the same fatal moments later —
+        # the latch is unchanged and only the failure STATISTICS count
+        # twice (accepted: the hook is the only recorder when the fatal
+        # lands while no execution is in flight).
         health.record_failure(account_id, "gateway connection fatal", fatal=True)
         return audit.emit(category="account", action="fatal", account_id=account_id)
 
@@ -262,9 +266,13 @@ async def build_runtime(
             demo=False,
         )
     except BaseException:
-        # Reverse ownership order; every close is idempotent and guarded.
+        # Reverse ownership order; every close is idempotent and guarded —
+        # cleanup must never fail, never mask the actionable startup error.
         if credential_store is not None:
-            credential_store.close()
+            try:
+                credential_store.close()
+            except Exception:  # pragma: no cover - cleanup best effort
+                logger.exception("credential store close during aborted startup failed")
         if store is not None:
             try:
                 await store.close()

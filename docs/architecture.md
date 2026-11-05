@@ -206,8 +206,13 @@ survives them, so its done-callback alone cannot see them).
 
 Signal → session-task cancel → `CliSession.run()` finally →
 `controller.shutdown()`: workers drained within the shutdown budget →
-adapters closed (each close drains that adapter's lifecycle observers,
-bounded at 5s) → credential store closed → state store closed. Every
+adapters closed (each close drains that adapter's lifecycle observers
+under a 5s deadline, itself bounded by the manager's per-adapter close
+timeout — an operator shutdown budget under ~5s cuts the drain short,
+cancelling straggling observers) → credential store closed → state
+store closed. Teardown emits NO lifecycle transitions (observer code
+never runs during close): an operator-initiated shutdown therefore
+records no final `account.disconnected`. Every
 step is idempotent and exception-guarded; `controller.shutdown()` is
 terminal/one-shot; `WorkerManager.stop()` remains restartable.
 **Cancellation**: an outer cancellation of teardown completes the
@@ -225,4 +230,4 @@ controller) closes components directly in reverse ownership order.
 | Credential store open/preflight | actionable abort; store + db closed | idempotent sync close |
 | Registry/limiter/controller | pure construction; cannot fail open | n/a |
 | DiscordAdapter construction | offline; login deferred to worker | n/a at build time |
-| Lifecycle observers | logged + dropped, adapter unaffected | tracked, drained ≤5s in close |
+| Lifecycle observers | logged + dropped, adapter unaffected; a sync-raising observer consumes its transition (logged) | tracked, drained ≤5s in close (further bounded by the manager's per-adapter close timeout); stragglers cancelled AND reaped |

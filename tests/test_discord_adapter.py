@@ -1033,3 +1033,19 @@ async def test_lifecycle_hook_exceptions_never_break_the_adapter() -> None:
     finally:
         await adapter.close()
     assert alive == ["started"]
+
+
+async def test_no_lifecycle_emissions_after_close() -> None:
+    """The closed-guard: teardown must never run observer code — a
+    post-close bridge event stays suppressed (review finding 7's promised
+    closed-guard test)."""
+    client = FakeClient()
+    events: list[str] = []
+    adapter = make_lifecycle_adapter(client, events)
+    await adapter.start()
+    assert events == ["lifecycle:connected"]
+    await adapter.close()
+    await client.on_disconnect()
+    await client.on_ready()
+    adapter._latch_fatal(AccountFatalError("post-close"))  # noqa: SLF001 — guard under test
+    assert events == ["lifecycle:connected"], "observer code ran after close()"
