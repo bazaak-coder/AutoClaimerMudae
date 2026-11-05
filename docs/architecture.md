@@ -116,16 +116,30 @@ One SQLite database (`state.db`), schema **v7**, migrated step-by-step at open
 (each migration is a single transaction; post-migration shape verification
 catches tampered/foreign schemas):
 
-| Table | Contents |
-|---|---|
-| `task_instances` | One row per (account, task): status, attempts, last outcome, retry time. |
-| `scope_cooldowns` | Active rate-limit cooldowns (survive restarts). |
-| `mudae_state` | Learned Mudae deadlines per account (claim / rt / rolls). |
-| `account_credentials` | Fernet-encrypted account tokens (see [credentials.md](credentials.md)). |
+| Table | Columns | Contents |
+|---|---|---|
+| `task_instances` | `id`, `account_id`, `task_id`, `status`, `attempt_count`, `created_at`, `updated_at`, `last_outcome`, `next_attempt_at`, `cooldown_until`, `cooldown_scope` | One row per (account, task) — `UNIQUE (account_id, task_id)`; status, attempts, last outcome JSON, retry time, vestigial cooldown columns (unused by design; Mudae deadlines live in `mudae_state`). |
+| `task_history` | `id`, `instance_id`, `account_id`, `task_id`, `attempt`, `status`, `message`, `recorded_at` | Bounded execution history (50/instance, redacted at write); the `export` command's source. |
+| `scope_cooldowns` | `scope`, `deadline`, `server_directed` | Active rate-limit cooldowns (PK `scope`; UTC deadlines survive restarts). |
+| `mudae_state` | `account_id`, `kind`, `deadline`, `updated_at` | Learned Mudae deadlines per account (PK `(account_id, kind)`; kinds: claim / rt / rolls). |
+| `account_credentials` | `account_id`, `encrypted_token`, `key_version`, `created_at`, `updated_at` | Fernet-encrypted tokens (PK `account_id`; see [credentials.md](credentials.md)). |
+| `audit_events` | `id`, `timestamp`, `category`, `action`, `account_id`, `task_id`, `detail` | Bounded audit trail (1000 newest, redacted at write). |
 
-Threaded SQLite access is serialized by a per-store connection guard, and
-transaction cancellation always drains and rolls back — cancellation can
-abandon an *await*, never the database's consistency.
+Timestamps are canonical UTC ISO-8601 (`+00:00`, no `Z`), so SQL string
+comparison is chronological. The journal mode is **pinned to DELETE**
+(rollback journal) at every open — an inherited WAL file is converted or
+the store refuses to run; the crash-recovery guarantees describe the
+rollback-journal model only.
+
+Threaded SQLite access is serialized by a per-store connection guard;
+transaction cancellation always drains and rolls back — and while a
+failed transaction's ROLLBACK is pending, a **rollback gate** holds
+every other store call (the guard serializes *statements*, but a
+statement that runs on an open zombie transaction *joins* it; the gate
+closes that window). A cleanup that still cannot complete is reported
+(`cleanup_failed` / `drain_timeout`) and restart recovery applies.
+Censorship can abandon an *await*, never the database's consistency of
+acknowledged writes.
 
 ## Security model
 

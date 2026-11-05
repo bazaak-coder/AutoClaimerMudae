@@ -152,7 +152,7 @@ safety net.
 ### Encrypted account-token storage (Fernet + SQLite)
 
 `autoclaimer/credential_store.py` ships an encrypted token store backed by
-the same `state.db` as task state (schema v5 table `account_credentials`):
+the same `state.db` as task state (the `account_credentials` table, present since schema v5 — now v7):
 
 - Tokens are encrypted with **Fernet** (authenticated encryption from the
   `cryptography` package) **before** they touch SQLite. The database never
@@ -257,9 +257,26 @@ the same `state.db` as task state (schema v5 table `account_credentials`):
   (no persisted monotonic values).
 - **Errors**: `sqlite3` faults map to `PersistenceError` /
   `DatabaseBusyError` (busy timeout) with causes preserved. No credentials
-  are ever stored. Default rollback journal (WAL's shared memory is
-  unreliable under PRoot).
-- **Mudae deadlines** (schema v3, `mudae_state` table): durable
+  are ever stored. The rollback journal is **pinned** (`PRAGMA
+  journal_mode = DELETE` at every open — an inherited WAL file is
+  converted or open refuses), because WAL's shared memory is unreliable
+  under PRoot.
+- **Schema** (v7, migrated transactionally via `PRAGMA user_version`;
+  the authoritative column-level reference is
+  [docs/architecture.md](docs/architecture.md#persistence)): `task_instances`
+  (one row per account+task), `task_history` (bounded, redacted at write —
+  the `export` command's source), `scope_cooldowns`, `mudae_state`
+  (learned deadlines), `account_credentials` (Fernet-encrypted), and
+  `audit_events` (bounded trail).
+- **Cancellation hardening** (PR #8 audit, PR #34): transaction
+  cancellation drains in-flight calls then rolls back; while that
+  rollback is pending, a **rollback gate** holds every other store call —
+  an acknowledged write can never join a zombie transaction and be
+  destroyed by its rollback. Integer columns decode strictly (corrupt
+  rows become typed integrity findings, never silent retry-budget
+  resets), and the integrity diagnostic serializes with every other
+  reader (no findings over uncommitted data).
+- **Mudae deadlines** (`mudae_state` table, added in schema v3): durable
   per-account claim and `$rt` reset deadlines as absolute UTC
   timestamps. A fresh lookup REPLACES the stored deadline (the reply is
   the current truth); corrupt rows are contained per the same policy as
