@@ -293,13 +293,49 @@ class AutoClaimerController:
             raise ValueError(f"refusing to overwrite existing file: {target}")
         rows = await self._store.export_history(account_id=account_id, since=since, until=until)
         payload = "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in rows)
+        # Cancellation-safe publication (review finding, Major): a thread
+        # write cannot be cancelled — abandoning the await leaves it
+        # running. Track it in a shielded task and, on cancellation,
+        # await it BOUNDED: the file either published or it did not, and
+        # if it did, the audit event still lands (an export without its
+        # audit trail is an integrity gap).
+        write_task = asyncio.create_task(asyncio.to_thread(self._atomic_write, target, payload))
         try:
-            await asyncio.to_thread(self._atomic_write, target, payload)
-        except OSError as exc:
-            # Containment (review finding, Major): a filesystem failure —
-            # unwritable directory, full disk — is an operator fix, not a
-            # reason to kill the REPL and every worker with it.
-            raise ValueError(f"export write failed: {exc}") from exc
+            try:
+                await asyncio.shield(write_task)
+            except OSError as exc:
+                # Containment: a filesystem failure — unwritable
+                # directory, full disk — is an operator fix, not a reason
+                # to kill the REPL and every worker with it.
+                raise ValueError(f"export write failed: {exc}") from exc
+        except asyncio.CancelledError:
+            _, pending = await asyncio.wait({write_task}, timeout=5.0)
+            if not pending:
+                # The thread finished despite our cancellation: if it
+                # PUBLISHED (no exception — a ValueError here means the
+                # conditional publish refused), the audit event still
+                # lands — an export without its audit trail is an
+                # integrity gap. Best-effort: audit failures never mask
+                # the cancellation.
+                failed = (
+                    write_task.done() and write_task.exception() is not None
+                ) or write_task.cancelled()
+                if not failed:
+                    with suppress(Exception):
+                        await self._audit.emit(
+                            category="runtime",
+                            action="history_exported",
+                            detail=f"{len(rows)} rows to {target} (caller cancelled)",
+                        )
+            else:
+                # Still writing after the bounded drain: publication is
+                # unknown — report it, never claim the audit trail.
+                logger.warning(
+                    "export write still in flight at cancellation; audit outcome unknown for %s",
+                    target,
+                    extra={"operation": "export", "outcome": "write_unknown"},
+                )
+            raise
         await self._audit.emit(
             category="runtime",
             action="history_exported",

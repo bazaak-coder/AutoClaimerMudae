@@ -241,3 +241,57 @@ async def test_export_while_workers_active(tmp_path: Path) -> None:
     finally:
         await controller.shutdown()
         await store.close()
+
+
+async def test_export_cancellation_still_audits_a_completed_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding (Major): cancelling export_history while the
+    thread-write runs must not strand a PUBLISHED file without its audit
+    event — the write is shield-tracked and drained bounded; a completed
+    publish still audits before the cancellation re-raises."""
+    import autoclaimer.audit as audit_module
+
+    events: list[str] = []
+    original_emit = audit_module.AuditLog.emit
+
+    async def _recording_emit(self: object, **event: object) -> None:
+        if event.get("action") == "history_exported":
+            events.append(str(event.get("detail")))
+        await original_emit(self, **event)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(audit_module.AuditLog, "emit", _recording_emit)
+    controller, store = await _seeded_controller(tmp_path)
+    try:
+        target = tmp_path / "cancel.jsonl"
+
+        async def _cancelling_export() -> None:
+            task = asyncio.create_task(
+                controller.export_history(str(target), account_id=None, since=None, until=None)
+            )
+            await asyncio.sleep(0)  # let it reach the shielded write
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        await _cancelling_export()
+        await asyncio.sleep(0.05)  # the thread publishes; drain completes
+        # Re-run the drain semantics: the file either exists with its
+        # audit event, or the write was still in flight (warned, never
+        # silently un-audited). Assert the invariant that matters:
+        if target.exists():
+            assert any(str(target) in detail for detail in events), (
+                "published export without its history_exported audit event"
+            )
+        # And the contained path still works afterwards.
+        final = tmp_path / "after.jsonl"
+        result = await controller.export_history(
+            str(final), account_id=None, since=None, until=None
+        )
+        assert "history row" in result
+        assert any(str(final) in detail for detail in events)
+    finally:
+        await controller.shutdown()
+        await store.close()
