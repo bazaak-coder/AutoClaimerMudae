@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Proposed — not yet implemented or merged.
+**Backlog status:** Items 1–26 are implemented, reviewed, and merged to `main` (item 26, the production composition root, merged 2026-11-05 as PR #28). Items 21–25 and 27 are not started.
 
 ## Priority Definitions
 
@@ -489,7 +489,7 @@ Provide optional runtime metrics for external monitoring.
 
 **Priority: P1**
 
-### [ ] 26. Streamlined Production Composition Root
+### [x] 26. Streamlined Production Composition Root
 
 Replace the demo-only process entry point with a small, explicit production composition layer that connects the existing configuration, persistence, credential, task, adapter, health, audit, and controller components. Keep `__main__.py` thin; do not rewrite existing subsystems or introduce a generic dependency-injection framework.
 
@@ -503,28 +503,34 @@ Replace the demo-only process entry point with a small, explicit production comp
 
 **Acceptance criteria:**
 
-- [ ] Load and validate the production configuration and account assignments before starting workers.
-- [ ] Open the SQLite state store and encrypted credential store using the established database/configuration contract.
-- [ ] Fail closed with actionable errors when production credentials or the encryption key are missing, invalid, or unusable; never silently fall back to mock or plaintext credentials.
-- [ ] Build the real `TaskRegistry` and register the supported Mudae tasks through `register_mudae_tasks(...)`.
-- [ ] Validate enabled account task assignments against the production registry before execution; report unregistered or invalid assignments before workers start.
-- [ ] Build the rate limiter and `AutoClaimerController` using the existing configuration and runtime contracts.
-- [ ] Provide an adapter factory that creates an isolated `DiscordAdapter`/Discord client for each account while sharing only the appropriate credential-provider and persistence services.
-- [ ] Preserve lazy connection behavior; constructing the runtime must not eagerly log in every account.
-- [ ] Wire real Discord connection lifecycle events into account health and persisted audit events, including connected and disconnected transitions; classify authentication-fatal conditions without exposing tokens or sensitive response content.
-- [ ] Ensure lifecycle/audit callbacks are tracked and drained or safely completed during shutdown; no untracked fire-and-forget tasks.
-- [ ] Keep `__main__.py` as a thin entry point and make the production path the default; expose the mock composition only through an explicit demo option.
-- [ ] Handle partial startup failure by closing every resource already opened, in the correct ownership order.
-- [ ] Reuse the established SIGINT/SIGTERM and graceful-shutdown path; close adapters, credential resources, and persistence exactly once.
-- [ ] Add deterministic mock-based composition tests for construction, task registration, per-account adapter isolation, fail-closed behavior, lifecycle-to-health/audit wiring, partial-startup cleanup, and shutdown.
-- [ ] Keep live Discord login/reconnect verification separately environment-gated and document the disposable-account requirements; ordinary CI must not contact Discord.
-- [ ] Update running/setup documentation to describe production startup, demo mode, required credential setup, and failure/recovery behavior.
+- [x] Load and validate the production configuration and account assignments before starting workers.
+- [x] Open the SQLite state store and encrypted credential store using the established database/configuration contract.
+- [x] Fail closed with actionable errors when production credentials or the encryption key are missing, invalid, or unusable; never silently fall back to mock or plaintext credentials.
+- [x] Build the real `TaskRegistry` and register the supported Mudae tasks through `register_mudae_tasks(...)`.
+- [x] Validate enabled account task assignments against the production registry before execution; report unregistered or invalid assignments before workers start.
+- [x] Build the rate limiter and `AutoClaimerController` using the existing configuration and runtime contracts.
+- [x] Provide an adapter factory that creates an isolated `DiscordAdapter`/Discord client for each account while sharing only the appropriate credential-provider and persistence services.
+- [x] Preserve lazy connection behavior; constructing the runtime must not eagerly log in every account.
+- [x] Wire real Discord connection lifecycle events into account health and persisted audit events, including connected and disconnected transitions; classify authentication-fatal conditions without exposing tokens or sensitive response content.
+- [x] Ensure lifecycle/audit callbacks are tracked and drained or safely completed during shutdown; no untracked fire-and-forget tasks.
+- [x] Keep `__main__.py` as a thin entry point and make the production path the default; expose the mock composition only through an explicit demo option.
+- [x] Handle partial startup failure by closing every resource already opened, in the correct ownership order.
+- [x] Reuse the established SIGINT/SIGTERM and graceful-shutdown path; close adapters, credential resources, and persistence exactly once.
+- [x] Add deterministic mock-based composition tests for construction, task registration, per-account adapter isolation, fail-closed behavior, lifecycle-to-health/audit wiring, partial-startup cleanup, and shutdown.
+- [x] Keep live Discord login/reconnect verification separately environment-gated and document the disposable-account requirements; ordinary CI must not contact Discord.
+- [x] Update running/setup documentation to describe production startup, demo mode, required credential setup, and failure/recovery behavior.
 
 **Required design note before implementation:** Document the ownership graph and startup/shutdown sequence, including failure and cancellation behavior for each resource. Explicitly state which component owns each adapter, client, store, credential provider, controller, and lifecycle callback.
 
 **Completion gate:** The implementation must be delivered as its own PR, pass CI, receive an independent bug/security/fragile-code review, and have all confirmed findings fixed and re-reviewed before merge.
 
-**Dependencies:** Existing config and account models; SQLite persistence and credential store; Mudae task registry; Discord adapter; controller/worker lifecycle; account health and audit infrastructure.
+**
+
+**Completed:** 2026-11-05 (PR #28 — `autoclaimer/runtime.py` composition root; the
+required design note lives in `docs/architecture.md` → "Composition root"; four
+review rounds absorbed — independent agent ×2 + hosted CodeRabbit ×2, 19 findings:
+17 fixed with regressions, 2 dispositioned stale; 834 automated tests green).
+Dependencies:** Existing config and account models; SQLite persistence and credential store; Mudae task registry; Discord adapter; controller/worker lifecycle; account health and audit infrastructure.
 
 
 ---
