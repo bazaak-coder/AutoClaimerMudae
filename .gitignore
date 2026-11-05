@@ -4,7 +4,33 @@ knowledgebase/
 # Local agent skill files (owner instruction 2026-10-28)
 .agents/
 
-# Discord webhook secret — never commit
+# Credential material (agents.md §12 — the credential-exfiltration
+# boundary: no personal credential of any kind may ever be committed or
+# pushed through any channel). Patterns are DELIBERATELY precise: broad
+# globs like *token*/*credential* would hide legitimate source files
+# (autoclaimer/credentials.py is tracked).
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_rsa*
+id_ed25519*
+id_ecdsa*
+fernet.key
+*.fernet
+secrets.json
+secrets.yaml
+secrets.yml
+cookies.txt
+*.kdbx
 webhook.url
 
 # Python
@@ -17,3 +43,7 @@ __pycache__/
 
 # ZCode session artifacts
 .zcode/
+
+# Runtime rotating log (never commit; written next to the CWD at runtime)
+*.log
+autoclaimer.log.*
