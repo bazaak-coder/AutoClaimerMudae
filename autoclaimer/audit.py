@@ -11,7 +11,8 @@ A SEPARATE channel from debug logging:
   rule that emit sites pass secret-free text).
 
 Categories: ``task`` (assigned/started/completed/failed/retried),
-``account`` (enabled/disabled/paused/resumed), ``runtime``
+``account`` (enabled/disabled/paused/resumed/connected/disconnected/fatal
+— the last three from gateway lifecycle wiring, ROADMAP item 26), ``runtime``
 (paused/resumed), ``credential`` (set/deleted/imported/exported/rotated).
 ``configuration.changed`` is reserved for the runtime-reload feature
 (roadmap item 13) — nothing changes configuration at runtime today.

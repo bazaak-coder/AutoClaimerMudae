@@ -180,6 +180,32 @@ class AccountHealthMonitor:
             health.state = AccountHealthState.RATE_LIMITED
         self._log(account_id, health.state)
 
+    def record_connected(self, account_id: int) -> None:
+        """A gateway connection transition to CONNECTED (ROADMAP item 26:
+        lifecycle wiring). Latch-preserving like every other observation:
+        ``AUTH_FAILED``/``DISABLED`` survive a reconnect, and unresolved
+        failure states (``RATE_LIMITED``/``DEGRADED``) are NOT cleared by
+        a mere connection — only a successful task (``record_success``)
+        clears those."""
+        health = self._health(account_id)
+        if health.state in (
+            AccountHealthState.UNKNOWN,
+            AccountHealthState.CONNECTING,
+            AccountHealthState.DISCONNECTED,
+        ):
+            health.state = AccountHealthState.HEALTHY
+        self._log(account_id, health.state)
+
+    def record_disconnected(self, account_id: int) -> None:
+        """A gateway connection transition to DISCONNECTED (recoverable
+        loss — the adapter's reconnect logic owns recovery). Latch-
+        preserving: a dead credential or operator disable is NOT a
+        connectivity observation."""
+        health = self._health(account_id)
+        if health.state not in (AccountHealthState.AUTH_FAILED, AccountHealthState.DISABLED):
+            health.state = AccountHealthState.DISCONNECTED
+        self._log(account_id, health.state)
+
     def record_disabled(self, account_id: int) -> None:
         """The account was disabled by configuration or control command."""
         health = self._health(account_id)

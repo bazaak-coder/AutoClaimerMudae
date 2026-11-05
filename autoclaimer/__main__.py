@@ -1,98 +1,51 @@
-"""Runnable demo entry: ``python -m autoclaimer``.
+"""Process entry point: ``python -m autoclaimer``.
 
-Wires the interactive CLI to the current configuration files with the
-deterministic mock adapter (the real Discord adapter arrives in the next
-phase). Logs go through the rotating, redacting setup.
+PRODUCTION by default (ROADMAP item 26): the composition root in
+``autoclaimer.runtime`` builds the real Discord/Mudae runtime — fail
+closed when credentials, keys, or task registrations are missing.
+``--demo`` selects the historical mock composition (ping task,
+``MockAdapter``, credential management with a warn-and-continue key
+posture). The entry point stays thin: argument parsing, composition,
+session, and the signal path.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import sys
-from pathlib import Path
 
-from .cli import (
-    AutoClaimerController,
-    CliSession,
-    install_termination_handlers,
-    stdin_reader,
-)
-from .config import load_config
-from .logging_setup import setup_logging
-from .mock_adapter import MockAdapter
-from .persistence import TaskStateStore
-from .ratelimit import RateLimiter, resolve_policy
-from .registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus, TaskType
+from .cli import CliSession, install_termination_handlers, stdin_reader
+from .runtime import RuntimeStartupError, build_runtime
+
+logger = logging.getLogger(__name__)
 
 
-def build_demo_registry() -> TaskRegistry:
-    """Placeholder task set exercising the mock adapter."""
-
-    async def ping_handler(context: TaskContext) -> TaskOutcome:
-        sent = await context.adapter.send_message(1, "ping")
-        return TaskOutcome(TaskStatus.SUCCEEDED, data={"message_id": sent.message_id})
-
-    registry = TaskRegistry()
-    registry.register(
-        TaskType(
-            id="ping",
-            description="Send one message through the mock adapter.",
-            validate_config=lambda config: None,
-            handler=ping_handler,
-        )
-    )
-    return registry
-
-
-async def async_main(config_path: str, accounts_path: str) -> int:
-    from .credential_store import CredentialKeyError, SQLiteCredentialStore, load_fernet_keys
-
-    app, accounts = load_config(config_path, accounts_path)
-    logger = setup_logging(app.logging)
-    # State DB lives next to the config (decoupled from log_file so a log
-    # path can never relocate or name the database).
-    db_path = Path(config_path).resolve().parent / "state.db"
-    store = TaskStateStore(db_path)
-    await store.open()
-    # Encrypted credential storage: attached only when a valid Fernet key
-    # is configured (fail closed — never a plaintext fallback). The demo
-    # adapter needs no tokens; the store is attached so `credential`
-    # CLI management works out of the box.
-    credential_store: SQLiteCredentialStore | None = None
+async def async_main(config_path: str, accounts_path: str, *, demo: bool = False) -> int:
     try:
-        credential_store = SQLiteCredentialStore(db_path, load_fernet_keys())
-        await credential_store.open()
-    except CredentialKeyError:
-        logger.warning(
-            "encrypted credential storage disabled: no valid Fernet key "
-            "(set AUTOCLAIMER_FERNET_KEY; see README)",
-            extra={"operation": "cli.start", "outcome": "credential_key_missing"},
-        )
-    limiter = RateLimiter(default_policy=resolve_policy(app.ratelimit), store=store)
-    controller = AutoClaimerController(
-        app_config=app,
-        accounts=accounts,
-        store=store,
-        limiter=limiter,
-        registry=build_demo_registry(),
-        adapter_factory=lambda account_id: MockAdapter(),
-        credentials=credential_store,
-        credential_store=credential_store,
-        idle_interval_seconds=5.0,
-        config_path=config_path,
-        accounts_path=accounts_path,
+        runtime = await build_runtime(config_path, accounts_path, demo=demo)
+    except RuntimeStartupError as exc:
+        # Everything opened has already been closed (reverse ownership
+        # order); the message is the actionable operator fix.
+        print(f"startup failed: {exc}", file=sys.stderr, flush=True)
+        return 2
+    logger.info(
+        "cli session starting (%s)",
+        "demo" if demo else "production",
+        extra={"operation": "cli.start", "outcome": "demo" if demo else "production"},
     )
-    logger.info("cli session starting", extra={"operation": "cli.start"})
     session = CliSession(
-        controller, read_line=stdin_reader, write=lambda line: print(line, flush=True)
+        runtime.controller, read_line=stdin_reader, write=lambda line: print(line, flush=True)
     )
     # Roadmap item 10 (graceful shutdown hardening): SIGINT *and* SIGTERM
     # trigger the SAME graceful path — cancelling the session task runs
     # run()'s finally-block (workers drained within the shutdown budget,
-    # adapters and stores closed). A SECOND signal restores default
-    # handling so an operator can always force-exit. Known limitation: a
-    # blocked interactive stdin read may delay exit until the pending
-    # line arrives (a worker thread cannot be cancelled).
+    # adapters and stores closed — which also drains every lifecycle
+    # observer). A SECOND signal restores default handling so an operator
+    # can always force-exit. Known limitation: a blocked interactive
+    # stdin read may delay exit until the pending line arrives (a worker
+    # thread cannot be cancelled).
     session_task = asyncio.create_task(session.run())
 
     def _request_termination() -> None:
@@ -107,10 +60,25 @@ async def async_main(config_path: str, accounts_path: str) -> int:
 
 
 def main() -> None:
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
-    accounts_path = sys.argv[2] if len(sys.argv) > 2 else "accounts.json"
+    parser = argparse.ArgumentParser(
+        prog="autoclaimer",
+        description=(
+            "AutoClaimer: multi-account Mudae automation. Production runtime "
+            "by default; --demo selects the mock composition (no Discord)."
+        ),
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="run the mock-adapter demo composition instead of the production runtime",
+    )
+    parser.add_argument("config", nargs="?", default="config.json", help="path to config.json")
+    parser.add_argument(
+        "accounts", nargs="?", default="accounts.json", help="path to accounts.json"
+    )
+    args = parser.parse_args()
     try:
-        raise SystemExit(asyncio.run(async_main(config_path, accounts_path)))
+        raise SystemExit(asyncio.run(async_main(args.config, args.accounts, demo=args.demo)))
     except KeyboardInterrupt:
         raise SystemExit(0) from None
 

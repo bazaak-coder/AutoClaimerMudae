@@ -69,6 +69,7 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
 | `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
 | `autoclaimer/mudae_parser/` | implemented (vendored) | LibzentSuite's stdlib-only Mudae parser, byte-identical at revision `41b0775`; rules/locales/settings engine with its 80-test ported suite. See its VENDORED.md. |
+| `autoclaimer/runtime.py` | implemented | Production composition root (ROADMAP item 26): builds and owns every dependency (config, stores, registry, limiter, health, lifecycle wiring, controller) with a fail-closed startup posture; `python -m autoclaimer` is production by default, `--demo` keeps the mock composition. |
 | `autoclaimer/mudae.py` | implemented | Thin interface: `parse_mudae()` (str/ChannelMessage/MessageCreatedEvent/embed shapes), typed `ClaimStatus` ($mu lookups ride the claim-timer rule — no dedicated entry) and `RollsResetStatus` ($rtu replies; perk-dependent 5–20h — always learned, never assumed), and `anchor_deadline()` (relative→absolute UTC at the single persistence boundary). Durations stay relative until anchored. |
 | `autoclaimer/mudae_tasks.py` | implemented | The Mudae workload (milestone 7): reply matching (`await_mudae_reply`/`await_mudae_event` — subscribe-before-send, per-message-id dedup, loss/timeout → bounded re-query) and recurring task handlers `roll`/`rt`/`mu` via `register_mudae_tasks(registry, store=..., clock=...)`. Roll gates on the learned window, claims claimable cards by reacting once (rival pairs ignored; owned "Belongs to" cards never reacted; a lost confirmation is an UNCERTAIN outcome, never retried), learns quota/cooldown deadlines. `$rt` use is followed by the mandatory `$rtu` check. `$mu` lookups clear (available) or set (cooldown) the claim deadline. Recurring rounds reschedule at learned deadlines (fresh attempt windows via `reschedule_success`). |
 
@@ -532,8 +533,8 @@ docstrings; measured values in the knowledgebase.
   house practice. Dependabot keeps `uv.lock` and action references
   current (label `dependencies`).
 
-## Next milestone (composition root / live deployment wiring, not started)
+## Next milestone
 
-The Mudae task handlers shipped (milestone 7); the remaining work is the
-live entry point wiring config + credentials + Discord adapters + the
-mudae task registry together (see knowledgebase audit notes).
+The production composition root shipped (ROADMAP item 26). Remaining
+backlog: ROADMAP Phase 5 future capabilities (simulation mode, history
+export, task discovery, dependencies, metrics) — items 21–25.

@@ -132,6 +132,9 @@ class FakeClient:
         self.closed_flag = False
         self.registered_events: list[str] = []
         self.history_accessed = 0
+        # Lifecycle bridges (set dynamically by Client.event-style setattr).
+        self.on_ready: Any = None
+        self.on_disconnect: Any = None
 
     def event(self, coro: Any) -> Any:
         """Mimics the fork's Client.event: setattr by coroutine name."""
@@ -890,3 +893,143 @@ async def test_missing_encrypted_credential_is_account_fatal_and_safe(
             assert "unrelated-token" not in record.getMessage()
     finally:
         store.close()
+
+
+# --- lifecycle hook (ROADMAP item 26) -------------------------------------------------
+
+
+def make_lifecycle_adapter(
+    client: FakeClient,
+    events: list[str],
+) -> DiscordAdapter:
+    """Adapter whose lifecycle hook records transitions (sync part inline)."""
+
+    def hook(transition: Any) -> None:
+        events.append(f"lifecycle:{transition.value}")
+
+    return DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]  # fake implements the used surface
+        jitter=lambda low, high: 0.0,
+        sleep=lambda seconds: _noop_sleep(),
+        on_lifecycle=hook,
+    )
+
+
+async def _noop_sleep() -> None:
+    return None
+
+
+async def test_lifecycle_connected_on_ready_and_deduplicated() -> None:
+    client = FakeClient()
+    events: list[str] = []
+    adapter = make_lifecycle_adapter(client, events)
+    await adapter.start()
+    try:
+        assert events == ["lifecycle:connected"]  # start() reached READY
+        # A gateway reconnect (on_ready fires again) is NOT a transition.
+        assert client.on_ready is not None
+        await client.on_ready()
+        await client.on_ready()
+        assert events == ["lifecycle:connected"]
+        # on_disconnect observes mid-flight blips the connect task survives.
+        assert client.on_disconnect is not None
+        await client.on_disconnect()
+        await client.on_ready()
+        assert events == ["lifecycle:connected", "lifecycle:disconnected", "lifecycle:connected"]
+    finally:
+        await adapter.close()
+
+
+async def test_lifecycle_no_bridges_registered_without_hook() -> None:
+    client = FakeClient()
+    adapter = make_adapter(client)
+    await adapter.start()
+    try:
+        assert "on_ready" not in client.registered_events
+        assert "on_disconnect" not in client.registered_events
+    finally:
+        await adapter.close()
+
+
+async def test_lifecycle_fatal_emits_once_with_the_latch() -> None:
+    client = FakeClient()
+    events: list[str] = []
+    adapter = make_lifecycle_adapter(client, events)
+    await adapter.start()
+    assert events == ["lifecycle:connected"]
+    # Latch an account-fatal verdict directly (every gateway-fatal path
+    # funnels through _latch_fatal: start, _await_ready, _connect_finished).
+    adapter._latch_fatal(AccountFatalError("ConnectionClosed: authentication failed"))
+    try:
+        await adapter.start()  # fatal latch re-raises
+    except AccountFatalError:
+        pass
+    assert events == ["lifecycle:connected", "lifecycle:fatal"]
+    # A second latch attempt is deduplicated.
+    adapter._latch_fatal(AccountFatalError("again"))
+    assert events.count("lifecycle:fatal") == 1
+    await adapter.close()
+
+
+async def test_lifecycle_awaitable_hook_is_tracked_and_drained_by_close() -> None:
+    client = FakeClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    drained: list[bool] = []
+
+    def hook(transition: Any) -> Any:
+        if transition.value == "connected":
+            started.set()
+            return _gated_observer(release, drained)
+        return None
+
+    async def _gated_observer(gate: asyncio.Event, out: list[bool]) -> None:
+        await gate.wait()
+        out.append(True)
+
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]
+        jitter=lambda low, high: 0.0,
+        sleep=lambda seconds: _noop_sleep(),
+        on_lifecycle=hook,
+    )
+    await adapter.start()
+    assert started.is_set()
+    assert adapter._lifecycle_tasks, "awaitable hook result must be tracked"
+    # Review finding: start close() while the gate is CLOSED — it can
+    # only finish after the bounded drain waits for (and completes) the
+    # gated observer; releasing first would let the assert pass with the
+    # drain removed.
+    closer = asyncio.create_task(adapter.close())
+    done, _ = await asyncio.wait({closer}, timeout=0.5)
+    assert not done, "close() must wait for the gated lifecycle observer"
+    release.set()
+    await closer
+    assert drained == [True], "close() must drain tracked lifecycle observers"
+
+
+async def test_lifecycle_hook_exceptions_never_break_the_adapter() -> None:
+    client = FakeClient()
+    alive: list[str] = []
+
+    def bad_hook(transition: Any) -> None:
+        raise RuntimeError("observer exploded")
+
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=FakeCredentials(),
+        client=client,  # type: ignore[arg-type]
+        jitter=lambda low, high: 0.0,
+        sleep=lambda seconds: _noop_sleep(),
+        on_lifecycle=bad_hook,
+    )
+    await adapter.start()  # must not raise despite the hook exploding
+    try:
+        alive.append("started")
+    finally:
+        await adapter.close()
+    assert alive == ["started"]
