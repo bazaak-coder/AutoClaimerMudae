@@ -688,9 +688,16 @@ async def test_rt_available_after_use_schedules_conservative_recheck() -> None:
     store = TaskStateStore(":memory:")
     await store.open()
     registry = make_registry(store)
+    # reply_timeout is the ONLY scheduler slack for the scripted events
+    # (emitted near-instantly) AND the check mark (delivered ~20ms after
+    # the send): a loaded CI runner (observed: py3.11 matrix leg) can
+    # stall coroutine processing past 1.0s and the round then takes its
+    # designed unconfirmed branch. Generous margin; the property under
+    # test (available-after-use → conservative 300s recheck) is
+    # independent of the reply timeout.
     outcome = await registry.execute(
         context_for(
-            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 1.0}
+            "rt", adapter, {"channel": CHANNEL, "author_id": MUDAE, "reply_timeout_seconds": 5.0}
         )
     )
     await confirmed
