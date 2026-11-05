@@ -455,3 +455,15 @@ def test_lifecycle_transitions_record_and_preserve_latches() -> None:
     assert monitor.snapshot()[third].state is AccountHealthState.RATE_LIMITED
     monitor.record_success(third)
     assert monitor.snapshot()[third].state is AccountHealthState.HEALTHY
+
+    # Review finding: a disconnect→connect blip must not launder failure
+    # states into HEALTHY (DISCONNECTED was an intermediary that cleared
+    # RATE_LIMITED/DEGRADED without any successful task).
+    fourth = 777888999000111222
+    monitor.record_rate_limited(fourth)
+    monitor.record_disconnected(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.RATE_LIMITED
+    monitor.record_connected(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.RATE_LIMITED
+    monitor.record_success(fourth)
+    assert monitor.snapshot()[fourth].state is AccountHealthState.HEALTHY

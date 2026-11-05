@@ -17,6 +17,7 @@ import logging
 import sys
 
 from .cli import CliSession, install_termination_handlers, stdin_reader
+from .models import ConfigValidationError
 from .runtime import RuntimeStartupError, build_runtime
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,11 @@ async def async_main(config_path: str, accounts_path: str, *, demo: bool = False
         # Everything opened has already been closed (reverse ownership
         # order); the message is the actionable operator fix.
         print(f"startup failed: {exc}", file=sys.stderr, flush=True)
+        return 2
+    except ConfigValidationError as exc:
+        # Typed configuration errors carry file/line context — surface
+        # them with the same clean exit instead of a traceback.
+        print(f"configuration invalid: {exc}", file=sys.stderr, flush=True)
         return 2
     logger.info(
         "cli session starting (%s)",

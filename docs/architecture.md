@@ -167,20 +167,27 @@ before it, in reverse order, then raises `RuntimeStartupError` with the
 actionable operator fix
 
 1. `load_config` — validation failure aborts with NOTHING opened (no
-   `state.db` is even created).
+   `state.db` is even created) and surfaces as a typed
+   `ConfigValidationError` (the entry point prints it and exits 2).
 2. `setup_logging`.
 3. **Production**: `load_fernet_keys()` — missing/invalid key aborts
-   with setup instructions. **Demo**: warn and continue (historical
-   posture).
-4. `TaskStateStore.open()`.
+   with setup instructions BEFORE the state store opens (a first-time
+   operator with no key finds no stray `state.db`). **Demo**: warn and
+   continue (historical posture).
+4. `TaskStateStore.open()` — an open failure (busy, permissions) is
+   converted to an actionable `RuntimeStartupError`.
 5. **Production**: `SQLiteCredentialStore.open()` + preflight — every
    ENABLED account must have a stored token (missing ids listed with the
-   `credential set` hint; disabled accounts are exempt).
+   `--demo` + `credential set` hint; disabled accounts are exempt).
 6. Registry: `register_mudae_tasks(registry, store)`.
 7. **Production**: registry preflight — every enabled account's assigned
    task id must be REGISTERED (a task defined in config but with no
    registered type is listed and aborts startup — fail closed, not a
    silently skipped task).
+   Error contract: prerequisite failures raise `RuntimeStartupError`
+   (actionable text, everything opened already closed); configuration
+   failures raise the typed `ConfigValidationError`. Both surface as a
+   one-line message and exit code 2 at the entry point.
 8. `RateLimiter`, `AccountHealthMonitor`, lifecycle wiring, and the
    controller (with `health` injected) — per-account
    `DiscordAdapter(account_id, credentials=store,
@@ -230,4 +237,4 @@ controller) closes components directly in reverse ownership order.
 | Credential store open/preflight | actionable abort; store + db closed | idempotent sync close |
 | Registry/limiter/controller | pure construction; cannot fail open | n/a |
 | DiscordAdapter construction | offline; login deferred to worker | n/a at build time |
-| Lifecycle observers | logged + dropped, adapter unaffected; a sync-raising observer consumes its transition (logged) | tracked, drained ≤5s in close (further bounded by the manager's per-adapter close timeout); stragglers cancelled AND reaped |
+| Lifecycle observers | logged + dropped, adapter unaffected; a sync-raising observer consumes its transition (logged) | tracked, drained ≤5s in close (further bounded by the manager's per-adapter close timeout); stragglers cancelled and reaped best-effort — a cancellation-suppressing observer is reported (`observers_abandoned`) rather than silently dropped |

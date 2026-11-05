@@ -199,10 +199,18 @@ class AccountHealthMonitor:
     def record_disconnected(self, account_id: int) -> None:
         """A gateway connection transition to DISCONNECTED (recoverable
         loss — the adapter's reconnect logic owns recovery). Latch-
-        preserving: a dead credential or operator disable is NOT a
-        connectivity observation."""
+        preserving AND failure-state-preserving: a dead credential or
+        operator disable is not a connectivity observation, and
+        RATE_LIMITED/DEGRADED survive blips too — otherwise a
+        disconnect→connect pair would launder them into HEALTHY without
+        any successful task (review finding).
+        """
         health = self._health(account_id)
-        if health.state not in (AccountHealthState.AUTH_FAILED, AccountHealthState.DISABLED):
+        if health.state in (
+            AccountHealthState.UNKNOWN,
+            AccountHealthState.CONNECTING,
+            AccountHealthState.HEALTHY,
+        ):
             health.state = AccountHealthState.DISCONNECTED
         self._log(account_id, health.state)
 

@@ -1000,13 +1000,21 @@ async def test_lifecycle_awaitable_hook_is_tracked_and_drained_by_close() -> Non
     await adapter.start()
     assert started.is_set()
     assert adapter._lifecycle_tasks, "awaitable hook result must be tracked"
-    # Review finding: start close() while the gate is CLOSED — it can
-    # only finish after the bounded drain waits for (and completes) the
-    # gated observer; releasing first would let the assert pass with the
-    # drain removed.
+    # Review findings (two rounds): start close() while the gate is
+    # CLOSED, and synchronize on the drain BEGINNING (a real event) — a
+    # timed "still pending" probe is itself a flake source under CI
+    # load. The gated observer's 5s drain window dwarfs the release.
+    drain_entered = asyncio.Event()
+    original_drain = adapter._drain_lifecycle_tasks  # noqa: SLF001 — sync hook
+
+    async def _counting_drain() -> None:
+        drain_entered.set()
+        await original_drain()
+
+    adapter._drain_lifecycle_tasks = _counting_drain  # type: ignore[method-assign]  # noqa: SLF001
     closer = asyncio.create_task(adapter.close())
-    done, _ = await asyncio.wait({closer}, timeout=0.5)
-    assert not done, "close() must wait for the gated lifecycle observer"
+    await asyncio.wait_for(drain_entered.wait(), timeout=5.0)
+    assert not closer.done(), "close() must wait for the gated lifecycle observer"
     release.set()
     await closer
     assert drained == [True], "close() must drain tracked lifecycle observers"

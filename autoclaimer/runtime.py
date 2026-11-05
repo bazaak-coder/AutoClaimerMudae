@@ -37,7 +37,7 @@ from .logging_setup import setup_logging
 from .mock_adapter import MockAdapter
 from .models import AccountsConfig, AppConfig
 from .mudae_tasks import register_mudae_tasks
-from .persistence import TaskStateStore
+from .persistence import PersistenceError, TaskStateStore
 from .ratelimit import RateLimiter, resolve_policy
 from .registry import TaskContext, TaskOutcome, TaskRegistry, TaskStatus, TaskType
 
@@ -140,8 +140,27 @@ async def build_runtime(
     store: TaskStateStore | None = None
     credential_store: SQLiteCredentialStore | None = None
     try:
+        if not demo:
+            # Production key check BEFORE the store opens: a first-time
+            # operator with no key must not find a stray state.db created
+            # (review finding — the documented order is now the real one).
+            try:
+                keys = load_fernet_keys(environ)
+            except CredentialKeyError as exc:
+                raise RuntimeStartupError(
+                    "production mode requires encrypted account tokens: set "
+                    "AUTOCLAIMER_FERNET_KEY to a Fernet key (start with --demo and "
+                    "run `credential generate-key` there, or see README), then store "
+                    f"each enabled account's token with `credential set <id>`. ({exc})"
+                ) from exc
         store = TaskStateStore(db_path)
-        await store.open()
+        try:
+            await store.open()
+        except PersistenceError as exc:
+            raise RuntimeStartupError(
+                f"the state database could not be opened ({db_path}): {exc} — "
+                "check the path/permissions and that no other instance is running"
+            ) from exc
 
         if demo:
             # Historical posture: credential MANAGEMENT available when a
@@ -188,17 +207,13 @@ async def build_runtime(
             )
 
         # ----- production: fail closed at every boundary -----
-        try:
-            keys = load_fernet_keys(environ)
-        except CredentialKeyError as exc:
-            raise RuntimeStartupError(
-                "production mode requires encrypted account tokens: set "
-                "AUTOCLAIMER_FERNET_KEY to a Fernet key (generate one in the "
-                "demo CLI with `credential generate-key`), then store each "
-                f"enabled account's token with `credential set <id>`. ({exc})"
-            ) from exc
         credential_store = SQLiteCredentialStore(db_path, keys)
-        await credential_store.open()
+        try:
+            await credential_store.open()
+        except PersistenceError as exc:
+            raise RuntimeStartupError(
+                f"the encrypted credential store could not be opened ({db_path}): {exc}"
+            ) from exc
         provider: SQLiteCredentialStore = credential_store
 
         enabled = [profile for profile in accounts.accounts if profile.enabled]
@@ -208,8 +223,9 @@ async def build_runtime(
             raise RuntimeStartupError(
                 "no stored token for enabled account(s): "
                 + ", ".join(missing_tokens)
-                + " — store each with `credential set <account_id>` "
-                "(or disable the account in accounts.json)"
+                + " — start with --demo and store each with "
+                "`credential set <account_id>` there (the command needs a "
+                "session), or disable the account in accounts.json"
             )
 
         registry = TaskRegistry()

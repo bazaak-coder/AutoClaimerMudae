@@ -255,7 +255,13 @@ async def test_cleanup_failure_does_not_mask_the_startup_error(
     config, accounts = _write_files(tmp_path)
     await _store_token(tmp_path, ACCOUNT, PRODUCTION_ENV)
 
-    def _exploding_close() -> None:
+    def _exploding_close(store: SQLiteCredentialStore) -> None:
+        # Patched onto the class (bound: the instance arrives as the first
+        # argument): delegate to the real close first — no leaked
+        # credential connection — THEN raise the injected error, the
+        # containment path under test (review finding: the missing
+        # parameter raised TypeError before the body ever ran).
+        original_close(store)
         raise RuntimeError("close exploded (injected)")
 
     original_close = SQLiteCredentialStore.close

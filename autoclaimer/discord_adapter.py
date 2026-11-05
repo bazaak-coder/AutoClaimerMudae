@@ -500,14 +500,35 @@ class DiscordAdapter:
                 task.cancel()
             if pending:  # reap; never re-raise from inside the sweep
                 await asyncio.wait(pending, timeout=0.5)
+            self._report_unreaped(pending)
             raise
         for task in stragglers:
             task.cancel()
         # Reap the cancelled stragglers (0.5s best effort) so close()
         # never returns with pending tasks ("Task was destroyed"
-        # warnings, lost audit writes at loop teardown).
+        # warnings, lost audit writes at loop teardown). Best effort: a
+        # cancellation-SUPPRESSING observer may outlive the reap — it is
+        # reported (below), never silently abandoned.
         if stragglers:
             await asyncio.wait(stragglers, timeout=0.5)
+        self._report_unreaped(pending)
+
+    def _report_unreaped(self, tasks: set[asyncio.Task[None]]) -> None:
+        """Log observers still alive after the bounded reap (review
+        finding): the shutdown contract is bounded and best-effort, and
+        an abandoned observer is reported rather than silent."""
+        abandoned = [t for t in tasks if not t.done()]
+        if abandoned:
+            logger.error(
+                "%d lifecycle observer(s) ignored cancellation and were "
+                "abandoned at close (bounded shutdown)",
+                len(abandoned),
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.close",
+                    "outcome": "observers_abandoned",
+                },
+            )
 
     def _connect_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():

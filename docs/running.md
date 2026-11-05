@@ -30,8 +30,10 @@ message when any is missing — nothing half-starts, nothing leaks):
 1. A Fernet key in `AUTOCLAIMER_FERNET_KEY` (generate one with
    `credential generate-key` in `--demo` mode, or see
    [credentials.md](credentials.md)).
-2. A stored token for every **enabled** account:
-   `credential set <account_id>` (disabled accounts are exempt).
+2. A stored token for every **enabled** account — the `credential`
+   commands need a running session, so use `--demo` mode for first-time
+   setup: `python -m autoclaimer --demo`, then `credential set
+   <account_id>` (disabled accounts are exempt).
 3. Every task assigned to an enabled account must have a registered
    task type — a task defined in `config.json` but not registered is
    reported and aborts startup.
