@@ -29,11 +29,15 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import json
 import logging
 import os
 import shlex
 import signal
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from .adapters import AdapterError, PlatformAdapter
@@ -49,6 +53,13 @@ from .registry import TaskRegistry
 from .workers import WorkerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _retrieve_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve a finished task's exception (never an unretrieved warning)."""
+    if not task.cancelled():
+        task.exception()
+
 
 LineReader = Callable[[str], Awaitable[str]]
 LineWriter = Callable[[str], None]
@@ -267,6 +278,117 @@ class AutoClaimerController:
             suffix = f" — {message}" if message else ""
             lines.append(f"  #{attempt} {status} at {recorded_at}{suffix}")
         return lines
+
+    async def export_history(
+        self,
+        path: str,
+        *,
+        account_id: int | None,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> str:
+        """Write the execution-history export (ROADMAP item 22).
+
+        JSON Lines (one object per line — streamable, append-friendly),
+        written ATOMICALLY (temp file + os.replace, off-loop) and never
+        over an existing target. Rows were redacted at write; the export
+        is a read-only snapshot ride on the store's serialized
+        connection — active workers queue briefly, never interrupt.
+        """
+        target = Path(path)
+        if target.exists():
+            raise ValueError(f"refusing to overwrite existing file: {target}")
+        rows = await self._store.export_history(account_id=account_id, since=since, until=until)
+        payload = "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in rows)
+        # Cancellation-safe publication (review finding, Major): a thread
+        # write cannot be cancelled — abandoning the await leaves it
+        # running. Track it in a shielded task and, on cancellation,
+        # await it BOUNDED: the file either published or it did not, and
+        # if it did, the audit event still lands (an export without its
+        # audit trail is an integrity gap).
+        write_task = asyncio.create_task(asyncio.to_thread(self._atomic_write, target, payload))
+        try:
+            try:
+                await asyncio.shield(write_task)
+            except OSError as exc:
+                # Containment: a filesystem failure — unwritable
+                # directory, full disk — is an operator fix, not a reason
+                # to kill the REPL and every worker with it.
+                raise ValueError(f"export write failed: {exc}") from exc
+        except asyncio.CancelledError:
+            _, pending = await asyncio.wait({write_task}, timeout=5.0)
+            # Review finding: a straggler write task's later exception
+            # must be retrieved — never an unretrieved-task warning.
+            if pending:
+                for task in pending:
+                    task.add_done_callback(_retrieve_exception)
+            cancelled_task = write_task.cancelled()
+            failed = (
+                write_task.done() and not cancelled_task and (write_task.exception() is not None)
+            )
+            if not pending and not failed:
+                # The thread finished despite our cancellation and it
+                # PUBLISHED (a ValueError here means the conditional
+                # publish refused): the audit event still lands — an
+                # export without its audit trail is an integrity gap.
+                # Review finding: the audit await is BOUNDED (a blocked
+                # store must not hang the cancelled caller past the
+                # drain) and best-effort — failures never mask the
+                # cancellation.
+                with suppress(Exception):
+                    async with asyncio.timeout(5.0):
+                        await self._audit.emit(
+                            category="runtime",
+                            action="history_exported",
+                            detail=f"{len(rows)} rows to {target} (caller cancelled)",
+                        )
+            elif pending:
+                # Still writing after the bounded drain: publication is
+                # unknown — report it, never claim the audit trail.
+                logger.warning(
+                    "export write still in flight at cancellation; audit outcome unknown for %s",
+                    target,
+                    extra={"operation": "export", "outcome": "write_unknown"},
+                )
+            raise
+        await self._audit.emit(
+            category="runtime",
+            action="history_exported",
+            detail=f"{len(rows)} rows to {target}",
+        )
+        return f"exported {len(rows)} history row(s) to {target}"
+
+    @staticmethod
+    def _atomic_write(target: Path, payload: str) -> None:
+        """Temp-file + CONDITIONAL publish (review finding: os.replace
+        overwrites unconditionally — a file appearing between the
+        exists() check and the publish would be silently lost).
+        ``os.link(tmp, target)`` fails with FileExistsError when the
+        target exists, making the no-overwrite guarantee atomic with the
+        publish. Hard links are unsupported on some filesystems
+        (PRoot/Android mounts) — those OSErrors fail closed with a clear
+        message rather than risking an overwrite."""
+        import tempfile
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            try:
+                os.link(tmp, target)  # conditional publish: FileExistsError wins
+            except FileExistsError:
+                raise ValueError(f"refusing to overwrite existing file: {target}") from None
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot safely publish {target} on this filesystem "
+                    f"(hard links unsupported: {exc})"
+                ) from exc
+            os.unlink(tmp)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     @property
     def default_config_path(self) -> str:
@@ -876,6 +998,61 @@ class CliSession:
         self._exact_args(args, 1)
         return await self._controller.backup_database(args[0])
 
+    async def _cmd_export(self, args: list[str]) -> str:
+        """Execution-history export (JSON Lines; refuses to overwrite).
+
+        usage: export <path> [account <id>] [since <date>] [until <date>]
+        Dates are UTC (YYYY-MM-DD or full ISO); until is exclusive.
+        """
+        if not args:
+            raise ValueError("usage: export <path> [account <id>] [since <date>] [until <date>]")
+        path = args[0]
+        rest = args[1:]
+        if len(rest) % 2 != 0:
+            raise ValueError("filters come in key/value pairs: account|since|until <value>")
+        account_id: int | None = None
+        since: datetime | None = None
+        until: datetime | None = None
+        for key, value in zip(rest[::2], rest[1::2], strict=True):
+            if key == "account":
+                # Any snowflake: history may outlive a deconfigured
+                # account, so the filter must not require known accounts.
+                try:
+                    account_id = int(value)
+                except ValueError:
+                    raise ValueError(f"account id must be an integer, got {value!r}") from None
+                if account_id <= 0:
+                    raise ValueError(f"account id must be positive, got {value!r}")
+            elif key == "since":
+                since = self._parse_export_date(value, inclusive_start=True)
+            elif key == "until":
+                until = self._parse_export_date(value, inclusive_start=False)
+            else:
+                raise ValueError(f"unknown export filter {key!r} (account|since|until)")
+        return await self._controller.export_history(
+            path, account_id=account_id, since=since, until=until
+        )
+
+    @staticmethod
+    def _parse_export_date(value: str, *, inclusive_start: bool) -> datetime:
+        """UTC date or full ISO timestamp; bare dates get the day's
+        inclusive start (since) or exclusive end (until)."""
+        for fmt in ("%Y-%m-%d",):
+            try:
+                day = datetime.strptime(value, fmt).replace(tzinfo=UTC)
+                return day if inclusive_start else day + timedelta(days=1)
+            except ValueError:
+                continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid date {value!r}: use YYYY-MM-DD or a full ISO timestamp"
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
     async def _cmd_dbstats(self, args: list[str]) -> list[str]:
         """Database growth snapshot (sizes, pages, row counts)."""
         self._exact_args(args, 0)
@@ -938,6 +1115,7 @@ class CliSession:
         "audit": _cmd_audit,
         "reload": _cmd_reload,
         "backup": _cmd_backup,
+        "export": _cmd_export,
         "dbstats": _cmd_dbstats,
         "doctor": _cmd_doctor,
     }
