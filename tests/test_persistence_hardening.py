@@ -553,11 +553,12 @@ async def test_double_cancel_preserves_innocent_acknowledged_write(
     tmp_path: Path,
 ) -> None:
     """BUG-001 (PR #8 audit): a SECOND cancellation of a transaction-
-    owning task breaks the shielded drain — the store lock is released
-    while the failed transaction is still open, an innocent concurrent
-    write's statements silently JOIN the zombie transaction, and the
-    delayed ROLLBACK destroys the already-acknowledged write. Cleanup
-    must survive repeated cancellation."""
+    owning task broke the shielded drain — the store lock was released
+    while the failed transaction was still open, an innocent concurrent
+    write's statements silently JOINED the zombie transaction, and the
+    delayed ROLLBACK destroyed the already-acknowledged write. With the
+    rollback GATE the write BLOCKS while the rollback is pending
+    (asserted deterministically), then survives it."""
     store = await open_store(tmp_path)
     try:
         record = await store.create_instance(ACCOUNT, "probe")
@@ -582,20 +583,21 @@ async def test_double_cancel_preserves_innocent_acknowledged_write(
         await asyncio.sleep(0.3)  # BEGIN + claim landed
         task_a.cancel()  # 1st cancel: the drain starts, parks on the staller
         await asyncio.sleep(0.15)
-        task_a.cancel()  # 2nd cancel: breaks the one-shot shield today
+        task_a.cancel()  # 2nd cancel: broke the one-shot shield pre-fix
         with contextlib.suppress(asyncio.CancelledError):
             await task_a
 
-        # The innocent bystander: the lock is free, so its acknowledged
-        # autocommit write proceeds — and must NOT join the zombie txn.
-        innocent = await store.create_instance(ACCOUNT, "innocent")
-        release.set()  # the drain proceeds; the ROLLBACK lands
-        await asyncio.sleep(0.3)
+        # The innocent bystander: with the rollback pending, its write
+        # must BLOCK at the gate (deterministic — no timing dependence).
+        innocent_task = asyncio.create_task(store.create_instance(ACCOUNT, "innocent"))
+        await asyncio.sleep(0.2)
+        assert not innocent_task.done(), "the write ran while a rollback was pending (no gate)"
+        release.set()  # the drain completes; the ROLLBACK lands; the gate opens
+        innocent = await asyncio.wait_for(innocent_task, timeout=5.0)
 
         probe = await store.get_instance(innocent.id)
         assert probe is not None and probe.task_id == "innocent", (
             f"acknowledged write destroyed by the delayed rollback: {probe}"
         )
-        assert probe.status is not None
     finally:
         await store.close()

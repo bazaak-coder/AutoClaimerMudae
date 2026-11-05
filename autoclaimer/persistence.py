@@ -628,6 +628,17 @@ class TaskStateStore:
 
         def _landed(done: asyncio.Task[None]) -> None:
             self._rollback_tasks.discard(done)
+            # Review finding: retrieve a failed cleanup's exception (never
+            # an unretrieved-task warning) and report it — the gate opens
+            # on completion either way (waiters must never deadlock on a
+            # broken cleanup), with the connection state marked uncertain.
+            if not done.cancelled() and done.exception() is not None:
+                logger.error(
+                    "transaction cleanup failed; gate opening on best-effort "
+                    "completion (connection state uncertain — restart "
+                    "recovery applies)",
+                    extra={"operation": "store.cleanup", "outcome": "cleanup_failed"},
+                )
             if not self._rollback_tasks:
                 self._rollback_pending = False
                 self._rollback_landed.set()

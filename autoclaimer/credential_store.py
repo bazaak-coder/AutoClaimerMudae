@@ -178,6 +178,7 @@ class SQLiteCredentialStore:
         self._guard = threading.RLock()
         self._close_watcher: threading.Thread | None = None
         self._closed = False
+        self._open_generation = 0
 
     # ----- lifecycle -----
 
@@ -196,14 +197,27 @@ class SQLiteCredentialStore:
                 conn.execute(_CREDENTIALS_DDL)
             return conn
 
+        # Review finding + BUG-007 combined: a close() racing this open
+        # previously saw no connection and returned, then the open
+        # PUBLISHED its connection — a store left open after shutdown.
+        # A generation counter closes that race: close() bumps it under
+        # the guard; an open whose generation went stale discards its
+        # connection and stays closed. Reopen-after-close (BUG-007)
+        # still works: open() clears _closed FIRST under the guard.
+        with self._guard:
+            self._closed = False
+            generation = self._open_generation
         try:
-            self._conn = await asyncio.to_thread(_connect)
+            conn = await asyncio.to_thread(_connect)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
-        # BUG-007 (PR #8 audit): close() latched _closed forever — a
-        # reopen left the store permanently "not open" (latent trap for
-        # tooling/embedders; production constructs fresh stores).
-        self._closed = False
+        with self._guard:
+            if generation != self._open_generation or self._closed:
+                conn.close()
+                raise CredentialProviderError(
+                    "credential store was closed while opening; open aborted"
+                )
+            self._conn = conn
 
     def close(self) -> None:
         """Close the connection; safe to call more than once.
@@ -219,6 +233,7 @@ class SQLiteCredentialStore:
         stays bounded; the connection stays safe.
         """
         self._closed = True
+        self._open_generation += 1
         conn, self._conn = self._conn, None
         if conn is None:
             return
@@ -648,6 +663,16 @@ class SQLiteCredentialStore:
                     handle.flush()
                     os.fsync(fd)
                 os.replace(tmp, target)
+                # Review finding: fsync(fd) persists the CONTENTS, not the
+                # directory ENTRY the rename created — after power loss
+                # the export could revert or vanish despite success. Sync
+                # the parent directory on POSIX (unsupported on Windows).
+                if os.name == "posix":
+                    dir_fd = os.open(str(target.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
             except BaseException:
                 try:
                     tmp.unlink(missing_ok=True)

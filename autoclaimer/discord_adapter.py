@@ -296,6 +296,11 @@ class DiscordAdapter:
                 fatal = AccountFatalError(f"credential provider: {exc}")
                 self._latch_fatal(fatal)  # is_healthy flips; account stops
                 raise fatal from exc
+            if self._closed:
+                # Review finding: a close() completing while the token
+                # fetch was off-loop previously resumed into login() on
+                # the closed client.
+                raise AdapterError("adapter closed during startup")
             try:
                 await self._client.login(token)
             except discord.DiscordException as exc:
