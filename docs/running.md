@@ -34,7 +34,10 @@ message when any is missing — nothing half-starts, nothing leaks):
    [credentials.md](credentials.md)).
 2. A stored token for every **enabled** account — the `credential`
    commands need a running session, so use `--demo` mode for first-time
-   setup: `python -m autoclaimer --demo`, then `credential set
+   setup: `python -m autoclaimer --demo <config> <accounts>` with the
+   SAME config/accounts paths your production invocation uses (the
+   tokens live in the `state.db` next to that config — the wrong paths
+   store them in a different database), then `credential set
    <account_id>` (disabled accounts are exempt).
 3. Every task assigned to an enabled account must have a registered
    task type — a task defined in `config.json` but not registered is
@@ -56,9 +59,16 @@ The historical mock composition: the deterministic mock adapter, a
 `ping` task, no Discord traffic, and credential MANAGEMENT available
 when a valid key is present (a warning — not an abort — when it is not).
 Demo divergences from production: it registers only the `ping` task and
-skips the registry preflight (assignments to other task ids simply idle),
-and polls faster (`idle_interval_seconds` 5 vs the production default
-30). Use it to validate configuration and manage credentials safely.
+skips the registry preflight, and polls faster (`idle_interval_seconds`
+5 vs the production default 30).
+
+**Warning — never enter `start` in demo mode against your production
+config directory.** Due `roll`/`mu`/`rt` rows in the production
+`state.db` are NOT idle for the demo registry: the worker treats their
+task types as unregistered and **retires them terminally** (each would
+need a manual `retry` afterwards; production does not recreate them on
+restart). For anything beyond credential setup, point `--demo` at a
+separate config directory with its own `state.db`.
 
 ### Custom composition (library)
 

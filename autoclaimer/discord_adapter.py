@@ -483,6 +483,24 @@ class DiscordAdapter:
                 },
             )
 
+    async def _reap_connect_task(self, task: asyncio.Task[None]) -> None:
+        """Bounded reap of a cancelled connect task (review finding:
+        EVERY post-cancel await must be bounded — the previous bare
+        ``await task`` hung close() forever on a cancellation-suppressing
+        connect loop). A task still pending after the reap is reported,
+        never silently abandoned."""
+        await asyncio.wait({task}, timeout=5.0)
+        if not task.done():
+            logger.error(
+                "connection task ignored cancellation and was abandoned "
+                "at close (bounded shutdown)",
+                extra={
+                    "account_id": self._account_id,
+                    "operation": "discord.close",
+                    "outcome": "connect_task_abandoned",
+                },
+            )
+
     async def _drain_lifecycle_tasks(self) -> None:
         """Complete tracked observer tasks under ONE shared 5-second
         deadline (N stalled observers cost 5s total, not 5s each), so
@@ -599,16 +617,10 @@ class DiscordAdapter:
                         except asyncio.CancelledError:
                             cancelled = True
                             task.cancel()
-                            try:
-                                await asyncio.shield(task)
-                            except (asyncio.CancelledError, discord.DiscordException):
-                                pass
+                            await self._reap_connect_task(task)
                         except TimeoutError:
                             task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, discord.DiscordException):
-                                pass
+                            await self._reap_connect_task(task)
                 finally:
                     # Review finding: the drain must run on EVERY teardown
                     # exit path — an exception or cancellation in the steps
