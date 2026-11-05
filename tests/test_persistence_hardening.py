@@ -574,16 +574,24 @@ async def test_double_cancel_preserves_innocent_acknowledged_write(
         store._in_flight.add(fake)  # noqa: SLF001 — the widened window
         fake.add_done_callback(store._in_flight.discard)  # noqa: SLF001
 
+        setup_done = asyncio.Event()  # claim landed — no timing assumption
+
         async def txn_body() -> None:
             async with store.transaction():
                 await store.claim(record.id)
+                setup_done.set()
                 await asyncio.sleep(30)  # park; the first cancel lands here
 
         task_a = asyncio.create_task(txn_body())
-        await asyncio.sleep(0.3)  # BEGIN + claim landed
+        await asyncio.wait_for(setup_done.wait(), timeout=5.0)
         task_a.cancel()  # 1st cancel: the drain starts, parks on the staller
-        await asyncio.sleep(0.15)
-        task_a.cancel()  # 2nd cancel: broke the one-shot shield pre-fix
+        # 2nd cancel (broke the one-shot shield pre-fix) only once the
+        # cleanup is actually pending — event-driven, not a fixed sleep.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not store._rollback_pending and asyncio.get_running_loop().time() < deadline:  # noqa: SLF001 — the latch under test
+            await asyncio.sleep(0.01)
+        assert store._rollback_pending, "cleanup never became pending"  # noqa: SLF001
+        task_a.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task_a
 
