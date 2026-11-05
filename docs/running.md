@@ -21,7 +21,9 @@ Discord adapters (one isolated client per account, logged in lazily by
 the worker on first execution), the Mudae task registry
 (`roll`/`mu`/`rt`), the central rate limiter, durable SQLite state next
 to the config file, and gateway-lifecycle wiring into account health and
-the audit trail. The interactive CLI is the control surface; SIGINT/
+the audit trail. The interactive CLI is the control surface — nothing
+runs until you enter `start` (booting is inert: no logins, no claims);
+SIGINT/
 SIGTERM run the established graceful path.
 
 **Prerequisites** (startup FAILS CLOSED with the fix in the error

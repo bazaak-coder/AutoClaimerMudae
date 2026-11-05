@@ -10,10 +10,13 @@ scheduling tasks across multiple Discord accounts, targeting the Mudae bot:
 configurable per-account task schedules (`$wa`-style rolling with one-shot
 claim reactions, `$mu` cooldown lookups, `$rt`/`$rtu` reset-window learning),
 a central rate limiter, durable SQLite state, and Fernet-encrypted token
-storage. The single runtime dependency is `discord.py-self` (owner-selected);
-the interactive CLI (`python -m autoclaimer`) ships with a mock-adapter demo,
-and the Mudae handlers are implemented (milestone 7) — see the package table
-below and [`docs/index.md`](docs/index.md).
+storage. The single runtime dependency is `discord.py-self` (owner-selected).
+`python -m autoclaimer` boots the **production Discord/Mudae runtime** by
+default (`--demo` selects the mock-adapter demo); the interactive CLI is the
+control surface, and real account work begins only when the operator enters
+the `start` command — booting alone logs nobody in and claims nothing. The
+Mudae handlers are implemented (milestone 7) — see the package table below
+and [`docs/index.md`](docs/index.md).
 
 ## Requirements
 
@@ -326,11 +329,14 @@ it contains no evasion, probing, or rotation logic.
 
 ## Phase 6: interactive CLI and logging
 
-- **CLI** (`python -m autoclaimer`, mock-adapter demo): an interactive
-  command loop — lifecycle and account controls, queue/status/cooldown/
-  error views, dead-letter `retry` + `history`, `audit`, runtime `reload`,
+- **CLI** (`python -m autoclaimer` — production runtime by default,
+  `--demo` for the mock composition): an interactive command loop —
+  lifecycle and account controls, queue/status/cooldown/ error views,
+  dead-letter `retry` + `history`, `audit`, runtime `reload`,
   `integrity`/`doctor` diagnostics, `dbstats`, and `backup`. The full
-  command table lives in [`docs/running.md`](docs/running.md). The
+  command table lives in [`docs/running.md`](docs/running.md). Workers
+  (and therefore all real account work) start only at the explicit
+  `start` command; booting the session alone is inert. The
   controller owns components and delegates every action to the worker
   manager, store, and limiter — no orchestration logic in the CLI. Input
   is validated (snowflake ids, known accounts, task states, argument
