@@ -1057,3 +1057,53 @@ async def test_no_lifecycle_emissions_after_close() -> None:
     await client.on_ready()
     adapter._latch_fatal(AccountFatalError("post-close"))  # noqa: SLF001 — guard under test
     assert events == ["lifecycle:connected"], "observer code ran after close()"
+
+
+async def test_get_token_stall_does_not_freeze_the_event_loop() -> None:
+    """BUG-006 (PR #8 audit): the credential protocol is sync, and the
+    store-backed provider can park on its guard for up to busy_timeout
+    behind an import/export/rotate — the old on-loop call froze the
+    whole runtime (every account, every heartbeat) for the duration."""
+    import time
+
+    release = asyncio.Event()
+
+    class StallingCredentials(CredentialProvider):
+        def get_token(self, account_id: int) -> str:
+            deadline = time.monotonic() + 5.0
+            while not release.is_set() and time.monotonic() < deadline:
+                time.sleep(0.005)  # thread-side stall (guard-like)
+            return "fake-token"
+
+        def close(self) -> None:
+            return None
+
+    client = FakeClient()
+    beats = 0
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        while True:
+            beats += 1
+            await asyncio.sleep(0.02)
+
+    ticker = asyncio.create_task(heartbeat())
+    adapter = DiscordAdapter(
+        account_id=ACCOUNT,
+        credentials=StallingCredentials(),
+        client=client,  # type: ignore[arg-type]
+        jitter=lambda low, high: 0.0,
+        sleep=lambda seconds: _noop_sleep(),
+    )
+    start_task = asyncio.create_task(adapter.start())
+    await asyncio.sleep(0.5)  # start() is inside the stalled get_token
+    assert not start_task.done()
+    beats_before = beats
+    await asyncio.sleep(0.3)  # the loop must keep beating during the stall
+    assert beats > beats_before, (
+        f"event loop froze during a stalled sync get_token ({beats - beats_before} beats in 0.3s)"
+    )
+    release.set()
+    await asyncio.wait_for(start_task, timeout=5.0)
+    ticker.cancel()
+    await adapter.close()

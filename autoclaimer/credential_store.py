@@ -200,6 +200,10 @@ class SQLiteCredentialStore:
             self._conn = await asyncio.to_thread(_connect)
         except sqlite3.Error as exc:
             raise _map_sqlite_error(exc) from exc
+        # BUG-007 (PR #8 audit): close() latched _closed forever — a
+        # reopen left the store permanently "not open" (latent trap for
+        # tooling/embedders; production constructs fresh stores).
+        self._closed = False
 
     def close(self) -> None:
         """Close the connection; safe to call more than once.
@@ -636,6 +640,13 @@ class SQLiteCredentialStore:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     handle.write(_json.dumps(payload, indent=2))
+                    # BUG-008 (PR #8 audit): flush + fsync BEFORE the
+                    # rename — the bundle is the designated recovery
+                    # artifact, and on delayed-allocation filesystems a
+                    # crash right after export could previously leave it
+                    # empty/partial despite the atomic rename.
+                    handle.flush()
+                    os.fsync(fd)
                 os.replace(tmp, target)
             except BaseException:
                 try:
