@@ -6,7 +6,7 @@
 
 > Also codified in `agents.md` §17.1 as a mandatory development standard.
 
-**Backlog status:** Items 1–26 are implemented, reviewed, and merged to `main` (item 26, the production composition root, merged 2026-11-05 as PR #28). Item 22 (history export) is complete on this branch; items 21, 23, 24, 25, and 27 are not started.
+**Backlog status:** Items 1–22 and 26 are implemented, reviewed, and merged to `main` (most recently item 22, the execution-history export, merged 2026-11-05 as PR #32). Items 21, 23, 24, 25, and 27 are not started.
 
 ## Priority Definitions
 
