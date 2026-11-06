@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from autoclaimer.adapters import (
+    ButtonInfo,
     ChannelMessage,
     EmbedText,
     MessageCreatedEvent,
@@ -1800,4 +1801,126 @@ async def test_claim_accepts_confirmation_after_reaction_dispatch() -> None:
     registry = make_registry(store)
     outcome = await registry.execute(context_for("roll", adapter))
     assert outcome.message == "claimed"
+    await store.close()
+
+
+# --- Button-claim servers (live-verified shapes, 2026-11-06) -------------------
+# A real Mudae server may mark claimability with a 💗 claim BUTTON component
+# instead of the "React with any emoji to claim!" description marker: the
+# embed then has NO footer and NO marker text, and the vendored parser
+# (correctly) yields claimable=None ("no textual evidence"). The handler must
+# resolve None from the message's own components and claim by PRESSING the
+# heart button; owned cards carry a kakeraY button instead and are vetoed by
+# the "Belongs to" footer exactly as on react servers.
+
+BUTTON_CARD_EMBED = EmbedText(
+    author_name="Nina (OCF)",
+    description=(
+        "Oceanfalls\nClaims: #111,105\nLikes: #133,676\n**447**<:kakera:469835869059153940>"
+    ),
+)
+CLAIM_BUTTON = ButtonInfo(custom_id="1568206537506160732p1255784522998354021p0", emoji="💗")
+OWNED_BUTTON_CARD_EMBED = EmbedText(
+    author_name="Umineko",
+    description=("InuYasha\nClaims: #25,771\nLikes: #71,258\n**519**<:kakera:469835869059153940>"),
+    footer="Belongs to alice",
+)
+KAKERA_BUTTON = ButtonInfo(custom_id="1568206551351689267k1255784522998354021k0", emoji="kakeraY")
+BUTTON_CARD_CONFIRMATION = (
+    "「**ExampleUser**」added「**Nina (OCF)**」into the collection. "
+    "**+447** <:kakera:469835869059153940>"
+)
+
+
+def button_reply_event(
+    message_id: int,
+    embed: EmbedText,
+    buttons: tuple[ButtonInfo, ...],
+) -> MessageCreatedEvent:
+    event = reply_event(message_id, "", embeds=(embed,))
+    return MessageCreatedEvent(
+        account_id=event.account_id,
+        received_at=event.received_at,
+        message=dataclasses.replace(event.message, buttons=buttons),
+    )
+
+
+async def emit_after_press(
+    adapter: MockAdapter, *events: Any, deadline_seconds: float = 5.0
+) -> None:
+    """Deterministic orchestration: follow-ups land after the button
+    press is recorded (the confirmation answers the press). Events are
+    re-stamped at emit time — the waiter's temporal correlation rejects
+    pre-send timestamps (same contract as emit_after_send). The wait is
+    DEADLINE-BOUNDED (CodeRabbit review): a handler that never presses
+    fails the test instead of hanging CI until the job timeout."""
+    deadline = asyncio.get_running_loop().time() + deadline_seconds
+    while not adapter.interactions:
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail("button press never happened (deadline exceeded)")
+        await asyncio.sleep(0.005)
+    for event in events:
+        await adapter.emit(dataclasses.replace(event, received_at=datetime.now(UTC)))
+
+
+async def test_roll_presses_claim_button_on_button_server() -> None:
+    """Live-verified shape: no marker text, no footer — the claimable
+    signal is the 💗 button. The handler must PRESS it (not react) and
+    complete the confirmation dialogue."""
+    adapter = MockAdapter()
+    card = button_reply_event(71, BUTTON_CARD_EMBED, (CLAIM_BUTTON,))
+    confirmation = reply_event(72, BUTTON_CARD_CONFIRMATION)
+    Emitter(adapter).on_send(card)
+    follow = asyncio.create_task(emit_after_press(adapter, confirmation))
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    await follow
+    assert outcome.message == "claimed"
+    assert len(adapter.interactions) == 1  # exactly ONE press
+    assert adapter.interactions[0].component_id == CLAIM_BUTTON.custom_id
+    assert adapter.interactions[0].message_id == 71
+    assert adapter.reactions == []  # a button claim never reacts
+    await store.close()
+
+
+@pytest.mark.parametrize(
+    "buttons",
+    [(KAKERA_BUTTON,), (CLAIM_BUTTON,)],
+    ids=["kakera_button_live_shape", "heart_button_plus_owned_footer"],
+)
+async def test_owned_card_footer_vetoes_button_press(
+    buttons: tuple[ButtonInfo, ...],
+) -> None:
+    """The ownership footer ("Belongs to X") vetoes claiming regardless
+    of components — including the CONTESTED live shape where a heart
+    button is present alongside the footer (the button alone must never
+    override the parser's footer veto)."""
+    adapter = MockAdapter()
+    card = button_reply_event(73, OWNED_BUTTON_CARD_EMBED, buttons)
+    Emitter(adapter).on_send(card)
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.message == "rolled"
+    assert adapter.interactions == []
+    assert adapter.reactions == []
+    await store.close()
+
+
+async def test_unmarked_card_without_button_is_never_claimed() -> None:
+    """claimable=None with NO button stays unclaimed (unknown server
+    style — conservative, never a blind reaction)."""
+    adapter = MockAdapter()
+    card = button_reply_event(74, BUTTON_CARD_EMBED, ())
+    Emitter(adapter).on_send(card)
+    store = TaskStateStore(":memory:")
+    await store.open()
+    registry = make_registry(store)
+    outcome = await registry.execute(context_for("roll", adapter))
+    assert outcome.message == "rolled"
+    assert adapter.interactions == []
+    assert adapter.reactions == []
     await store.close()

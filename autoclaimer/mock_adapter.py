@@ -156,7 +156,12 @@ class MockAdapter:
             on_dispatch()
 
     async def press_component(
-        self, channel_id: int, message_id: int, component_id: str
+        self,
+        channel_id: int,
+        message_id: int,
+        component_id: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> InteractionResult:
         self._record(
             "press_component",
@@ -171,6 +176,10 @@ class MockAdapter:
             )
         )
         self.interactions.append(result)
+        # Wire boundary (mirrors add_reaction): traffic from here on
+        # genuinely answers THIS press.
+        if on_dispatch is not None:
+            on_dispatch()
         return result
 
     async def close(self) -> None:
