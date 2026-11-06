@@ -94,6 +94,7 @@ import discord
 from .adapters import (
     AccountFatalError,
     AdapterError,
+    ButtonInfo,
     ChannelInfo,
     ChannelMessage,
     CooldownError,
@@ -738,7 +739,12 @@ class DiscordAdapter:
             raise _translate(exc, mutating=True) from exc
 
     async def press_component(
-        self, channel_id: int, message_id: int, component_id: str
+        self,
+        channel_id: int,
+        message_id: int,
+        component_id: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> InteractionResult:
         await self._ensure_ready()
         await self._pace()
@@ -754,6 +760,12 @@ class DiscordAdapter:
             raise PermanentAdapterError(
                 f"component {component_id!r} not found on message {message_id}"
             )
+        # Wire boundary (CodeRabbit MAJOR, mirroring add_reaction): the
+        # dispatch gate opens immediately BEFORE the interaction — a
+        # confirmation racing the click's await is matched, never
+        # rejected as pre-dispatch.
+        if on_dispatch is not None:
+            on_dispatch()
         try:
             result = await button.click()
         except discord.DiscordException as exc:
@@ -911,7 +923,30 @@ def _to_channel_message(message: Any) -> ChannelMessage:
         has_components=bool(getattr(message, "components", None)),
         created_at=getattr(message, "created_at", None),
         embeds=_embed_texts(getattr(message, "embeds", None)),
+        buttons=_button_infos(getattr(message, "components", None)),
     )
+
+
+def _button_infos(rows: Any) -> tuple[ButtonInfo, ...]:
+    """Normalize component rows to button text forms (custom id, emoji
+    name, label). BUTTON-claim Mudae servers attach a 💗 claim button —
+    the claimable signal lives HERE, not in the embed text."""
+
+    buttons: list[ButtonInfo] = []
+    for row in rows or ():
+        for child in getattr(row, "children", ()) or ():
+            custom_id = getattr(child, "custom_id", None)
+            if not custom_id:
+                continue
+            emoji = getattr(child, "emoji", None)
+            buttons.append(
+                ButtonInfo(
+                    custom_id=str(custom_id),
+                    emoji=_emoji_name(emoji) if emoji is not None else "",
+                    label=str(getattr(child, "label", "") or ""),
+                )
+            )
+    return tuple(buttons)
 
 
 def _embed_texts(embeds: Any) -> tuple[EmbedText, ...]:

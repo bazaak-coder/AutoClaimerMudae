@@ -32,9 +32,10 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from .adapters import (
+    ButtonInfo,
     MessageCreatedEvent,
     PlatformAdapter,
     RawReactionAddedEvent,
@@ -761,6 +762,30 @@ def _make_rt_handler(
     return validate, handler
 
 
+#: Heart-family emoji Mudae uses for claim BUTTONS on button-claim
+#: servers (live-verified: the rolled claimable card carries a 💗 button
+#: component; owned cards carry a kakeraY button instead).
+_HEART_CLAIM_EMOJIS = frozenset(
+    {"❤️", "💗", "💙", "💚", "💛", "💜", "🧡", "🖤", "🤍", "🤎", "❣️", "💕"}
+)
+
+
+def _claim_button(message: Any) -> ButtonInfo | None:
+    """The heart claim button on a Mudae card message, if any.
+
+    Button-claim servers put the claimable signal in the COMPONENTS (a
+    💗 button), not the embed text — the vendored parser (correctly)
+    yields ``claimable=None`` there ("no textual evidence"), and this
+    resolves it from the message itself. Owned cards never carry a
+    heart button (kakera buttons instead) — the footer veto stays
+    authoritative.
+    """
+    for button in getattr(message, "buttons", ()) or ():
+        if button.emoji in _HEART_CLAIM_EMOJIS:
+            return cast(ButtonInfo, button)
+    return None
+
+
 def _make_roll_handler(
     store: TaskStateStore, clock: Callable[[], datetime]
 ) -> tuple[Callable[[Any], None], Callable[[TaskContext], Any]]:
@@ -817,10 +842,19 @@ def _make_roll_handler(
         if reply.result.family is MessageFamily.CHARACTER:
             card = reply.result.character
             interval = clock() + timedelta(seconds=cfg.round_interval)
+            # Button-claim servers (live-verified 2026-11-06): the
+            # claimable signal is a 💗 button COMPONENT, not embed text —
+            # the parser yields claimable=None ("no textual evidence")
+            # and the message's own button resolves it. The ownership
+            # footer veto stays authoritative either way.
+            button = _claim_button(reply.message)
+            claimable: bool | None = card.claimable if card is not None else None
+            if claimable is None and button is not None:
+                claimable = True
             may_claim = (
                 cfg.claim
                 and card is not None
-                and card.claimable
+                and claimable
                 # Audit fix: the ownership footer ("Belongs to X") vetoes
                 # the claimable marker — an owned card is never reacted to.
                 and card.claimed_by is None
@@ -845,12 +879,25 @@ def _make_roll_handler(
                 )
                 confirmation.begin()
                 try:
-                    await context.adapter.add_reaction(
-                        cfg.channel,
-                        reply.message.id,
-                        cfg.claim_emoji,
-                        on_dispatch=confirmation.mark_dispatched,
-                    )
+                    if button is not None:
+                        # Button-claim server: PRESS the heart (a mutation
+                        # like the reaction); the adapter fires the
+                        # dispatch gate at the wire boundary, immediately
+                        # before the interaction (CodeRabbit MAJOR — a
+                        # confirmation racing the press await is matched).
+                        await context.adapter.press_component(
+                            cfg.channel,
+                            reply.message.id,
+                            button.custom_id,
+                            on_dispatch=confirmation.mark_dispatched,
+                        )
+                    else:
+                        await context.adapter.add_reaction(
+                            cfg.channel,
+                            reply.message.id,
+                            cfg.claim_emoji,
+                            on_dispatch=confirmation.mark_dispatched,
+                        )
                     # Owner semantics (2026-10-29): a claim confirmation is
                     # a username/character pair — the CHARACTER must match
                     # our card (another claimer's pair is not our

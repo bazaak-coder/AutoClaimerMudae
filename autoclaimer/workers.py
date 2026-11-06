@@ -199,11 +199,18 @@ class RateLimitedAdapter:
         )
 
     async def press_component(
-        self, channel_id: int, message_id: int, component_id: str
+        self,
+        channel_id: int,
+        message_id: int,
+        component_id: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> InteractionResult:
         return await self._run(
             "press_component",
-            lambda: self._inner.press_component(channel_id, message_id, component_id),
+            lambda: self._inner.press_component(
+                channel_id, message_id, component_id, on_dispatch=on_dispatch
+            ),
         )
 
     async def close(self) -> None:

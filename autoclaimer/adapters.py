@@ -122,6 +122,23 @@ class EmbedText:
 
 
 @dataclass(frozen=True)
+class ButtonInfo:
+    """One message component button in normalized text form.
+
+    Mudae's claim affordance varies by server style: react-to-claim
+    servers mark the embed description; BUTTON-claim servers (live
+    verified 2026-11-06) attach a 💗 button component and leave the
+    embed without marker text or footer. Carrying the buttons through
+    the boundary lets the task layer resolve claimability from the
+    message itself; no component objects cross the adapter.
+    """
+
+    custom_id: str
+    emoji: str = ""  # normalized emoji name (unicode heart or custom name)
+    label: str = ""
+
+
+@dataclass(frozen=True)
 class ChannelMessage:
     """A message observed on the platform."""
 
@@ -132,6 +149,7 @@ class ChannelMessage:
     has_components: bool = False
     created_at: datetime | None = None
     embeds: tuple[EmbedText, ...] = ()
+    buttons: tuple[ButtonInfo, ...] = ()
 
 
 # ----- normalized inbound events -----
@@ -616,9 +634,20 @@ class PlatformAdapter(Protocol):
         ...
 
     async def press_component(
-        self, channel_id: int, message_id: int, component_id: str
+        self,
+        channel_id: int,
+        message_id: int,
+        component_id: str,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> InteractionResult:
-        """Press a component (button) attached to a message."""
+        """Press a component (button) attached to a message.
+
+        ``on_dispatch`` fires at the wire boundary (immediately before
+        the interaction is sent) — the same dispatch-gating contract as
+        ``add_reaction``: follow-up traffic matching begins at the
+        mutation point, so a confirmation racing the press await is
+        matched, never rejected as pre-dispatch."""
         ...
 
     def subscribe(
