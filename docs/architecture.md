@@ -140,12 +140,14 @@ closes that window). The gate opens when cleanup completes — including
 a failed cleanup. `cleanup_failed` means the connection state is
 uncertain: restart before further writes, which could otherwise join a
 still-open zombie transaction and be lost when the connection closes.
-`drain_timeout` is an uncertain outcome, not a failure: the ROLLBACK
-still runs, but a call abandoned before the drain expired may land
-after it — treat it the same way and restart before trusting
-subsequent writes. Cancellation can abandon an *await*; through a
-completed cleanup it never costs the consistency of acknowledged
-writes.
+`drain_timeout` is an uncertain outcome, not a failure: the ROLLBACK is
+still attempted, but an in-flight call that never settled may hold the
+connection guard, delaying the rollback without bound — it is not
+guaranteed to run promptly or complete — and a call abandoned before
+the drain expired may land after it. Treat it the same way: restart
+before trusting subsequent writes. Cancellation can abandon an
+*await*; through a completed cleanup it never costs the consistency of
+acknowledged writes.
 
 ## Security model
 
