@@ -123,7 +123,7 @@ catches tampered/foreign schemas):
 | `scope_cooldowns` | `scope`, `deadline`, `server_directed` | Active rate-limit cooldowns (PK `scope`; UTC deadlines survive restarts). |
 | `mudae_state` | `account_id`, `kind`, `deadline`, `updated_at` | Learned Mudae deadlines per account (PK `(account_id, kind)`; kinds: claim / rt / rolls). |
 | `account_credentials` | `account_id`, `encrypted_token`, `key_version`, `created_at`, `updated_at` | Fernet-encrypted tokens (PK `account_id`; see [credentials.md](credentials.md)). |
-| `audit_events` | `id`, `timestamp`, `category`, `action`, `account_id`, `task_id`, `detail` | Bounded audit trail (1000 newest, redacted at write). |
+| `audit_events` | `id`, `timestamp`, `category`, `action`, `account_id`, `task_id`, `detail` | Bounded audit trail (1000 newest); `AuditLog.emit` filters `detail`. Callers must supply secret-free `detail` — direct calls to `TaskStateStore.record_audit_event` do not redact it (the filter is defense in depth). |
 
 Timestamps are canonical UTC ISO-8601 (`+00:00`, no `Z`), so SQL string
 comparison is chronological. The journal mode is **pinned to DELETE**
@@ -136,10 +136,16 @@ transaction cancellation always drains and rolls back — and while a
 failed transaction's ROLLBACK is pending, a **rollback gate** holds
 every other store call (the guard serializes *statements*, but a
 statement that runs on an open zombie transaction *joins* it; the gate
-closes that window). A cleanup that still cannot complete is reported
-(`cleanup_failed` / `drain_timeout`) and restart recovery applies.
-Censorship can abandon an *await*, never the database's consistency of
-acknowledged writes.
+closes that window). The gate opens when cleanup completes — including
+a failed cleanup. `cleanup_failed` means the connection state is
+uncertain: restart before further writes, which could otherwise join a
+still-open zombie transaction and be lost when the connection closes.
+`drain_timeout` is an uncertain outcome, not a failure: the ROLLBACK
+still runs, but a call abandoned before the drain expired may land
+after it — treat it the same way and restart before trusting
+subsequent writes. Cancellation can abandon an *await*; through a
+completed cleanup it never costs the consistency of acknowledged
+writes.
 
 ## Security model
 
