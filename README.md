@@ -62,12 +62,15 @@ python -c "from autoclaimer.config import load_config; a, p = load_config('confi
 | `autoclaimer/models.py` | implemented | Typed, frozen dataclass models and `ConfigValidationError`. |
 | `autoclaimer/config.py` | implemented | JSON loading, structural validation, cross-file checks, precedence resolution. |
 | `autoclaimer/credentials.py` | implemented (interface only) | `CredentialProvider` protocol; secure backends provide implementations. |
+| `autoclaimer/credential_store.py` | implemented | Fernet-encrypted account-token store on SQLite (schema v5+): fail-closed key handling, rotation with retired keys, authenticated ciphertext backup/restore (format v2). |
 | `autoclaimer/registry.py` | implemented | Task type registry: stable ids, descriptions, config schemas, async handlers. |
 | `autoclaimer/adapters.py` | implemented | `PlatformAdapter` protocol, typed results, recoverable/permanent/cooldown errors. |
 | `autoclaimer/discord_adapter.py` | implemented | Concrete discord.py-self adapter (one client per account; verified against 2.1.0). |
 | `autoclaimer/mock_adapter.py` | implemented | Script-driven deterministic mock; no Discord connection, no credentials. |
 | `autoclaimer/ratelimit.py` | implemented | Central async rate limiter: scopes, pacing, permits, cooldowns, retries. |
 | `autoclaimer/workers.py` | implemented | Worker manager: concurrent account workers, ordered scheduling, controls. |
+| `autoclaimer/health.py` | implemented | Account health monitoring: 8-state observation model (healthy/disconnected/degraded/auth_failed/rate_limited/disabled/connecting/unknown) fed by worker outcomes; redacted, bounded error text; visibility only — enforcement stays with the fatal-stop/enabled/limiter paths. |
+| `autoclaimer/audit.py` | implemented | Structured audit events (schema v7 `audit_events`, bounded 1000): task lifecycle, account/runtime controls, credential operations; auxiliary contract — an emit failure never breaks the audited operation; detail redacted at the emit site. |
 | `autoclaimer/persistence.py` | implemented | Async SQLite task-instance state store, migrations, recovery. |
 | `autoclaimer/cli.py` | implemented | Interactive command session + controller (thin delegation, no orchestration). |
 | `autoclaimer/logging_setup.py` | implemented | Rotating log files, structured context, credential redaction on every path. |
@@ -152,7 +155,7 @@ safety net.
 ### Encrypted account-token storage (Fernet + SQLite)
 
 `autoclaimer/credential_store.py` ships an encrypted token store backed by
-the same `state.db` as task state (schema v5 table `account_credentials`):
+the same `state.db` as task state (the `account_credentials` table, present since schema v5 — now v7):
 
 - Tokens are encrypted with **Fernet** (authenticated encryption from the
   `cryptography` package) **before** they touch SQLite. The database never
@@ -257,9 +260,26 @@ the same `state.db` as task state (schema v5 table `account_credentials`):
   (no persisted monotonic values).
 - **Errors**: `sqlite3` faults map to `PersistenceError` /
   `DatabaseBusyError` (busy timeout) with causes preserved. No credentials
-  are ever stored. Default rollback journal (WAL's shared memory is
-  unreliable under PRoot).
-- **Mudae deadlines** (schema v3, `mudae_state` table): durable
+  are ever stored. The rollback journal is **pinned** (`PRAGMA
+  journal_mode = DELETE` at every open — an inherited WAL file is
+  converted or open refuses), because WAL's shared memory is unreliable
+  under PRoot.
+- **Schema** (v7, migrated transactionally via `PRAGMA user_version`;
+  the authoritative column-level reference is
+  [docs/architecture.md](docs/architecture.md#persistence)): `task_instances`
+  (one row per account+task), `task_history` (bounded, redacted at write —
+  the `export` command's source), `scope_cooldowns`, `mudae_state`
+  (learned deadlines), `account_credentials` (Fernet-encrypted), and
+  `audit_events` (bounded trail).
+- **Cancellation hardening** (PR #8 audit, PR #34): transaction
+  cancellation drains in-flight calls then rolls back; while that
+  rollback is pending, a **rollback gate** holds every other store call —
+  an acknowledged write can never join a zombie transaction and be
+  destroyed by its rollback. Integer columns decode strictly (corrupt
+  rows become typed integrity findings, never silent retry-budget
+  resets), and the integrity diagnostic serializes with every other
+  reader (no findings over uncommitted data).
+- **Mudae deadlines** (`mudae_state` table, added in schema v3): durable
   per-account claim and `$rt` reset deadlines as absolute UTC
   timestamps. A fresh lookup REPLACES the stored deadline (the reply is
   the current truth); corrupt rows are contained per the same policy as
@@ -333,8 +353,10 @@ it contains no evasion, probing, or rotation logic.
   `--demo` for the mock composition): an interactive command loop —
   lifecycle and account controls, queue/status/cooldown/ error views,
   dead-letter `retry` + `history`, `audit`, runtime `reload`,
-  `integrity`/`doctor` diagnostics, `dbstats`, and `backup`. The full
-  command table lives in [`docs/running.md`](docs/running.md). Workers
+  `integrity`/`doctor` diagnostics, `dbstats`, `backup`, and
+  execution-history `export` (JSON Lines; account/date filters,
+  refuses to overwrite). The full command table lives in
+  [`docs/running.md`](docs/running.md). Workers
   (and therefore all real account work) start only at the explicit
   `start` command; booting the session alone is inert. The
   controller owns components and delegates every action to the worker
@@ -500,9 +522,9 @@ disable/queue controls → clean shutdown → restart recovery. See
   to `pending` at startup with attempt counts preserved — at-least-once
   semantics; task handlers must tolerate duplicate side effects.
   Persisted UTC cooldowns survive restarts (remaining = deadline − now).
-- Known limitations: per-account concurrency permits only; limiter
-  default policy governs adapter operations (per-task policies not yet
-  wired per-operation); `reaction_add` rich events fire only for cached
+- Known limitations: per-account concurrency permits only (permit scope
+  is the account; per-task `max_concurrency` policies apply to that
+  shared scope); `reaction_add` rich events fire only for cached
   messages (raw events cover the rest); CAPTCHA/auth-fatal errors stop
   the account permanently (never bypassed, never retried — re-enable is
   the explicit revive path after the credential is fixed); user-account
@@ -541,6 +563,8 @@ docstrings; measured values in the knowledgebase.
 
 ## Next milestone
 
-The production composition root shipped (ROADMAP item 26). Remaining
-backlog: ROADMAP Phase 5 future capabilities (simulation mode, history
-export, task discovery, dependencies, metrics) — items 21–25.
+The production composition root shipped (ROADMAP item 26), and ROADMAP
+Phase 5 is under way: item 22 (execution-history export — the `export`
+command) is complete. Remaining backlog: items 21 (simulation mode,
+next up), 23 (task discovery), 24 (task dependencies), and 25 (metrics
+endpoint).
