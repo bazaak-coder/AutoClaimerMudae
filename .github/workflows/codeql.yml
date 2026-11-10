@@ -41,12 +41,12 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.39.2
+        uses: github/codeql-action/init@v4.39.3
         with:
           languages: python
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4.39.2
+        uses: github/codeql-action/analyze@v4.39.3
         # v4.39.3 deliberately NOT pinned: released hours before this
         # workflow was written (gh actions-lock flagged it); the settled
         # previous patch is pinned instead — let fresh releases breathe.
